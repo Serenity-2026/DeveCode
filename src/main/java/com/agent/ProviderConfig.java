@@ -51,12 +51,6 @@ public class ProviderConfig {
 
     public int getMaxOutputTokens() { return maxOutputTokens; }
     public void setMaxOutputTokens(int maxOutputTokens) { this.maxOutputTokens = maxOutputTokens; }
-
-    /**
-     * Records the context window auto-fetched from the provider (layer 2).
-     * Pass a value &gt; 0 to cache it; anything else is ignored so a failed
-     * fetch never poisons the cache. Called once at client-construction time.
-     */
     public void setFetchedContextWindow(int window) {
         if (window > 0) this.fetchedContextWindow = window;
     }
