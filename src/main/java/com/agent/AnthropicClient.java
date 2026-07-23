@@ -2,6 +2,7 @@ package com.agent;
 
 import com.anthropic.errors.*;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
@@ -74,7 +75,20 @@ public class AnthropicClient implements LlmClient{
     }
 
     private void doStream(ConversationManager conv, List<Map<String, Object>> tools, LinkedBlockingQueue<StreamEvent> streamEvents) {
-
+        //拼接Anthropic需要的JSON请求体
+        var body = new LinkedHashMap<String, Object>();
+        body.put("model", model);
+        body.put("max_tokens", maxOutputTokens);
+        body.put("stream", true);
+        body.put("system", List.of(Map.of("type", "text", "text", systemPrompt)));
+        //新模型（4.6 系列）支持 adaptive 类型的思考，budget 可以设满；旧模型只支持 enabled ，budget 必须比 max_tokens 少 1，否则 API 会报错。这个减 1 的细节是 Anthropic API 的硬性要求。
+        if (thinking) {
+            if (ModelResolver.supportsAdaptiveThinking(model)) {
+                body.put("thinking", Map.of("type", "adaptive", "budget_tokens", maxOutputTokens));
+            } else {
+                body.put("thinking", Map.of("type", "enabled", "budget_tokens", maxOutputTokens - 1));
+            }
+        }
     }
 
     @Override
