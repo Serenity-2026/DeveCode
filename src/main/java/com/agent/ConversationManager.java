@@ -2,6 +2,7 @@ package com.agent;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 对话状态的核心管理器
@@ -93,6 +94,20 @@ public class ConversationManager {
             history.subList(index, history.size()).clear();
         }
     }
+    public List<Map<String, Object>> serialize(String protocol) {
+        return "anthropic".equals(protocol)
+                ? serializeAnthropic()
+                : serializeOpenAI();
+    }
+    //将历史消息history转为Anthropic标准
+    private List<Map<String, Object>> serializeOpenAI() {
+        return null;
+    }
+    //将历史消息history转为OpenAI标准
+    private List<Map<String, Object>> serializeAnthropic() {
+        return null;
+    }
+
 
 }
 
