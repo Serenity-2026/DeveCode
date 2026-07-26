@@ -15,6 +15,15 @@ public class Message {
         this.role = role;
         this.content = content;
     }
+
+    public Message(String role, String content, List<ThinkingBlock> thinkingBlocks, List<ToolUseBlock> toolUses, List<ToolResultBlock> toolResults) {
+        this.role = role;
+        this.content = content;
+        this.thinkingBlocks = thinkingBlocks;
+        this.toolUses = toolUses;
+        this.toolResults = toolResults;
+    }
+
     //getter and setter
     public String getContent() {
         return content;
