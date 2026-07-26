@@ -35,6 +35,10 @@ public class Message {
     public List<ThinkingBlock> getThinkingBlocks() {
         return thinkingBlocks;
     }
+    //判断是否有thinking块
+    public boolean hasThinking(){
+        return thinkingBlocks!=null&& !thinkingBlocks.isEmpty();
+    }
 
     public void setThinkingBlocks(List<ThinkingBlock> thinkingBlocks) {
         this.thinkingBlocks = thinkingBlocks;
@@ -54,5 +58,9 @@ public class Message {
 
     public void setToolResults(List<ToolResultBlock> toolResults) {
         this.toolResults = toolResults;
+    }
+
+    public boolean hasToolUses() {
+        return toolUses!=null&& !toolUses.isEmpty();
     }
 }

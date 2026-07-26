@@ -1,8 +1,6 @@
 package com.agent;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 /**
  * 对话状态的核心管理器
@@ -99,12 +97,44 @@ public class ConversationManager {
                 ? serializeAnthropic()
                 : serializeOpenAI();
     }
-    //将历史消息history转为Anthropic标准
+    //将历史消息history转为OpenAI标准
     private List<Map<String, Object>> serializeOpenAI() {
         return null;
     }
-    //将历史消息history转为OpenAI标准
+    //将历史消息history转为Anthropic标准,按顺序放 thinking、text、tool_use 块。
     private List<Map<String, Object>> serializeAnthropic() {
+        var content=new ArrayList<Map<String,Object>>();
+        for (Message msg : history) {
+            if(msg.hasThinking()){
+                //1.添加thinking块
+            for (var tb : msg.getThinkingBlocks()) {
+                    content.add(Map.of(
+                            "type", "thinking",
+                            "thinking", tb.thinking(),
+                            "signature", tb.signature()));
+            }
+            }
+            //2.添加text
+            if(msg.getContent()!=null&&!msg.getContent().isEmpty()){
+                content.add(Map.of(
+                        "type", "text",
+                        "text", msg.getContent()));
+            }
+            //3.添加tool_use,有可能存在发起函数调用但无参数的情况，因此用LinkedHashMap单独构建
+            if (msg.hasToolUses()) {
+                for (var tu : msg.getToolUses()) {
+                    var block = new LinkedHashMap<String, Object>();
+                    block.put("type", "tool_use");
+                    block.put("id", tu.toolUseId());
+                    block.put("name", tu.toolName());
+                    block.put("input", tu.arguments());
+                    content.add(block);
+                }
+            }
+
+        }
+
+
         return null;
     }
 
