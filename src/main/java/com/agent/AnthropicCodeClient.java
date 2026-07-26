@@ -1,27 +1,42 @@
 package com.agent;
 
+import com.anthropic.client.AnthropicClient;
+import com.anthropic.client.okhttp.AnthropicOkHttpClient;
 import com.anthropic.errors.*;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 
-public class AnthropicClient implements LlmClient{
+public class AnthropicCodeClient implements LlmClient{
 
     private final String model;
     private final boolean thinking;
     private final int maxOutputTokens;
     private volatile String systemPrompt;
+    private static final ObjectMapper MAPPER=new ObjectMapper();
+    private final AnthropicClient sdkClient;
 
-    public AnthropicClient(ProviderConfig cfg, String systemPrompt) {
+    public AnthropicCodeClient(ProviderConfig cfg, String systemPrompt) {
         String apiKey = cfg.resolvedApiKey();
         //fail-fast
         if (apiKey.isEmpty()) {
             throw new LlmException.AuthenticationException(
                     "Anthropic API key not found.");
         }
+        this.sdkClient= AnthropicOkHttpClient.builder()
+                        .apiKey(apiKey)
+                        .baseUrl(cfg.getBaseUrl())
+                .build();
         this.model = ModelResolver.resolve(cfg.getModel());
         this.thinking = cfg.isThinking();
         this.maxOutputTokens = cfg.resolvedMaxOutputTokens();
@@ -73,8 +88,8 @@ public class AnthropicClient implements LlmClient{
         //序列化、IO异常等意料之外的错误,包装成LlmException
         return new LlmException("Unexpected error: " + e.getMessage(), e);
     }
-
-    private void doStream(ConversationManager conv, List<Map<String, Object>> tools, LinkedBlockingQueue<StreamEvent> streamEvents) {
+    //在虚拟线程中进行,需注意线程安全
+    private void doStream(ConversationManager conv, List<Map<String, Object>> tools, LinkedBlockingQueue<StreamEvent> streamEvents) throws IOException, InterruptedException {
         //拼接Anthropic需要的JSON请求体
         var body = new LinkedHashMap<String, Object>();
         body.put("model", model);
@@ -89,7 +104,19 @@ public class AnthropicClient implements LlmClient{
                 body.put("thinking", Map.of("type", "enabled", "budget_tokens", maxOutputTokens - 1));
             }
         }
+        var httpClient = HttpClient.newHttpClient();
+        var request = HttpRequest.newBuilder()
+                .uri(URI.create("https://api.deepseek.com/anthropic"))
+                .header("Content-Type", "application/json")
+                .header("x-api-key", "sk-c39ba4ff31ac42ae8fa5d6a20451c66f")
+                .header("anthropic-version","2023-06-01")
+                .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(body)))
+                .build();
+        //send会在响应头到达时就返回,把响应体留作InputStream供后续逐行读取,而不是一次性读进内存
+        var response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
+
     }
+
 
     @Override
     public void setSystemPrompt(String prompt) {
