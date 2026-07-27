@@ -24,7 +24,7 @@ public class AnthropicCodeClient implements LlmClient{
 
     private final String model;
     private final boolean thinking;
-    private final int maxOutputTokens;
+    private volatile int maxOutputTokens;
     private volatile String systemPrompt;
     private static final ObjectMapper MAPPER=new ObjectMapper();
     private final AnthropicClient sdkClient;
@@ -38,6 +38,10 @@ public class AnthropicCodeClient implements LlmClient{
     private String currentToolId = "";
     //StringBuilder.append() 的性能在这里很重要。一个工具调用的参数可能被拆成几十个 JSON 片段推过来，每次 append() 的复杂度是 O(1) 均摊。如果改成字符串拼接（ str += fragment ），每次都要创建新的 String 对象，性能会差很多。
     private final StringBuilder jsonAccum = new StringBuilder();
+    private String stopReason = "";
+    private int inputTokens=0;
+    private int outputTokens=0;
+
     public AnthropicCodeClient(ProviderConfig cfg, String systemPrompt) {
         String apiKey = cfg.resolvedApiKey();
         //fail-fast
@@ -140,10 +144,6 @@ public class AnthropicCodeClient implements LlmClient{
                 if (data.equals("[DONE]")) break;
                 //Anthropic 用标准 SSE（Server-Sent Events）。每个事件由两行组成:一行 event: <类型>，一行 data: <JSON>，事件之间用空行分隔。
                 /*
-                event: content_block_start
-                data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
-                */
-                /*
                 * event: message_start
                 data: {"type":"message_start","message":{"id":"msg_01...","role":"assistant","content":[],"model":"claude-...","usage":{"input_tokens":25,"output_tokens":1}}}
 
@@ -212,11 +212,10 @@ public class AnthropicCodeClient implements LlmClient{
                             thinkingAccum.append(t);
                             queue.add(new StreamEvent.ThinkingDelta(t));
                         }
-                        case "signature_delta" -> {
+                        case "signature_delta" ->
                             thinkingSignature = (String) delta.getOrDefault("signature", "");
-                        }
                         case "text_delta" ->
-                                queue.add(new StreamEvent.TextDelta((String) delta.getOrDefault("text", "")));
+                            queue.add(new StreamEvent.TextDelta((String) delta.getOrDefault("text", "")));
                         case "input_json_delta" -> {
                             //input_json_delta 也是双重处理，因为工具参数需要等全部 JSON 片段到齐后才能反序列化成 Map。
                             String pj = (String) delta.getOrDefault("partial_json", "");
@@ -230,7 +229,7 @@ public class AnthropicCodeClient implements LlmClient{
                         queue.add(new StreamEvent.ThinkingComplete(thinkingAccum.toString(), thinkingSignature));
                         inThinking = false;
                     }
-                    if (!currentToolName.isEmpty()) {
+                    else if (!currentToolName.isEmpty()) {
                         Map<String, Object> args;
                         try { args = MAPPER.readValue(jsonAccum.toString(), Map.class); }
                         catch (Exception e) { args = new HashMap<>(); }
@@ -240,13 +239,29 @@ public class AnthropicCodeClient implements LlmClient{
                         jsonAccum.setLength(0);
                     }
                 }
-
+                //SSE 流的末尾会推 message_start 和 message_delta 事件，携带 token 消耗信息：
+                case "message_delta" ->{
+                    var delta = (Map<String, Object>) event.get("delta");
+                    if (delta != null && delta.containsKey("stop_reason"))
+                        //end_turn 表示 LLM 自然结束， tool_use 表示 LLM 想调用工具。Agent Loop 根据这个字段决定是否进入下一轮迭代。
+                        stopReason = (String) delta.get("stop_reason");
+                    var usage = (Map<String, Object>) event.get("usage");
+                    if (usage != null) {
+                        int di = ((Number) usage.getOrDefault("input_tokens", 0)).intValue();
+                        int do_ = ((Number) usage.getOrDefault("output_tokens", 0)).intValue();
+                        if (di > 0) inputTokens = di;
+                        if (do_ > 0) outputTokens = do_;
+                    }
+                }
+                case "message_stop" ->
+                    queue.add(new StreamEvent.StreamEnd(stopReason,inputTokens,outputTokens));
             }
         }
     }
+
     }
     @Override
     public void setSystemPrompt(String prompt) {
-
+           this.systemPrompt=prompt;
     }
 }
