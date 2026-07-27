@@ -6,11 +6,14 @@ import com.anthropic.errors.*;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -25,7 +28,16 @@ public class AnthropicCodeClient implements LlmClient{
     private volatile String systemPrompt;
     private static final ObjectMapper MAPPER=new ObjectMapper();
     private final AnthropicClient sdkClient;
-
+    //线程安全的消费队列
+    private final BlockingQueue<StreamEvent> queue=new LinkedBlockingQueue<>();
+    //是否在thinking块内
+    private boolean inThinking = false;
+    private final StringBuilder thinkingAccum = new StringBuilder();
+    private String thinkingSignature = "";
+    private String currentToolName = "";
+    private String currentToolId = "";
+    //StringBuilder.append() 的性能在这里很重要。一个工具调用的参数可能被拆成几十个 JSON 片段推过来，每次 append() 的复杂度是 O(1) 均摊。如果改成字符串拼接（ str += fragment ），每次都要创建新的 String 对象，性能会差很多。
+    private final StringBuilder jsonAccum = new StringBuilder();
     public AnthropicCodeClient(ProviderConfig cfg, String systemPrompt) {
         String apiKey = cfg.resolvedApiKey();
         //fail-fast
@@ -109,15 +121,130 @@ public class AnthropicCodeClient implements LlmClient{
                 .uri(URI.create("https://api.deepseek.com/anthropic"))
                 .header("Content-Type", "application/json")
                 .header("x-api-key", "sk-c39ba4ff31ac42ae8fa5d6a20451c66f")
-                .header("anthropic-version","2023-06-01")
+                .header("anthropic-version", "2023-06-01")
                 .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(body)))
                 .build();
         //send会在响应头到达时就返回,把响应体留作InputStream供后续逐行读取,而不是一次性读进内存
         var response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
+        //流式响应,try-with-resource,确保 reader 和底层的 InputStream 在结束时自动关闭
+        try (var reader = new BufferedReader(new InputStreamReader(response.body()))) {
+            String line;
+            String eventType = null;
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("event: ")) {
+                    eventType = line.substring(7).trim();
+                    continue;
+                }
+                if (!line.startsWith("data: ")) continue;
+                String data = line.substring(6).trim();
+                if (data.equals("[DONE]")) break;
+                //Anthropic 用标准 SSE（Server-Sent Events）。每个事件由两行组成:一行 event: <类型>，一行 data: <JSON>，事件之间用空行分隔。
+                /*
+                event: content_block_start
+                data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+                */
+                /*
+                * event: message_start
+                data: {"type":"message_start","message":{"id":"msg_01...","role":"assistant","content":[],"model":"claude-...","usage":{"input_tokens":25,"output_tokens":1}}}
 
+                event: content_block_start
+                data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+                event: content_block_delta
+                data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先分析一下"}}
+
+                event: content_block_delta
+                data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EuYBC..."}}
+
+                event: content_block_stop
+                data: {"type":"content_block_stop","index":0}
+
+                event: content_block_start
+                data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+                event: content_block_delta
+                data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"你好"}}
+
+                event: content_block_stop
+                data: {"type":"content_block_stop","index":1}
+
+                event: content_block_start
+                data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_01...","name":"get_weather","input":{}}}
+
+                event: content_block_delta
+                data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}
+
+                event: content_block_delta
+                data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"北京\"}"}}
+
+                event: content_block_stop
+                data: {"type":"content_block_stop","index":2}
+
+                event: message_delta
+                data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":42}}
+
+                event: message_stop
+                data: {"type":"message_stop"}*/
+                Map<String, Object> event = MAPPER.readValue(data, Map.class);
+                switch (eventType){
+                case "content_block_start" -> {
+                    var block = (Map<String, Object>) event.get("content_block");
+                    //block!=null则get("type"),block为null则type为空
+                    String type = block != null ? (String) block.get("type") : "";
+                    if ("thinking".equals(type)) {
+                        inThinking = true;
+                        thinkingAccum.setLength(0);
+                    } else if ("tool_use".equals(type)) {
+                        currentToolName = (String) block.getOrDefault("name", "");
+                        currentToolId = (String) block.getOrDefault("id", "");
+                        jsonAccum.setLength(0);
+                        queue.add(new StreamEvent.ToolCallStart(currentToolId, currentToolName));
+                    }
+                }
+                case "content_block_delta"->{
+                    var delta = (Map<String, Object>) event.get("delta");
+                    if (delta == null) continue;
+                    String deltaType = (String) delta.getOrDefault("type", "");
+                    switch (deltaType){
+                        case "thinking_delta" -> {
+                            //thinking_delta 既推事件（给 UI 实时展示）又累积（block 结束时要拼成完整的思考文本）
+                            String t = (String) delta.getOrDefault("thinking", "");
+                            thinkingAccum.append(t);
+                            queue.add(new StreamEvent.ThinkingDelta(t));
+                        }
+                        case "signature_delta" -> {
+                            thinkingSignature = (String) delta.getOrDefault("signature", "");
+                        }
+                        case "text_delta" ->
+                                queue.add(new StreamEvent.TextDelta((String) delta.getOrDefault("text", "")));
+                        case "input_json_delta" -> {
+                            //input_json_delta 也是双重处理，因为工具参数需要等全部 JSON 片段到齐后才能反序列化成 Map。
+                            String pj = (String) delta.getOrDefault("partial_json", "");
+                            jsonAccum.append(pj);
+                            queue.add(new StreamEvent.ToolCallDelta(pj));
+                        }
+                    }
+                }
+                case "content_block_stop" -> {
+                    if (inThinking) {
+                        queue.add(new StreamEvent.ThinkingComplete(thinkingAccum.toString(), thinkingSignature));
+                        inThinking = false;
+                    }
+                    if (!currentToolName.isEmpty()) {
+                        Map<String, Object> args;
+                        try { args = MAPPER.readValue(jsonAccum.toString(), Map.class); }
+                        catch (Exception e) { args = new HashMap<>(); }
+                        queue.add(new StreamEvent.ToolCallComplete(currentToolId, currentToolName, args));
+                        currentToolName = "";
+                        currentToolId = "";
+                        jsonAccum.setLength(0);
+                    }
+                }
+
+            }
+        }
     }
-
-
+    }
     @Override
     public void setSystemPrompt(String prompt) {
 
