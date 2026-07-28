@@ -28,19 +28,7 @@ public class AnthropicCodeClient implements LlmClient{
     private volatile String systemPrompt;
     private static final ObjectMapper MAPPER=new ObjectMapper();
     private final AnthropicClient sdkClient;
-    //线程安全的消费队列
-    private final BlockingQueue<StreamEvent> queue=new LinkedBlockingQueue<>();
-    //是否在thinking块内
-    private boolean inThinking = false;
-    private final StringBuilder thinkingAccum = new StringBuilder();
-    private String thinkingSignature = "";
-    private String currentToolName = "";
-    private String currentToolId = "";
-    //StringBuilder.append() 的性能在这里很重要。一个工具调用的参数可能被拆成几十个 JSON 片段推过来，每次 append() 的复杂度是 O(1) 均摊。如果改成字符串拼接（ str += fragment ），每次都要创建新的 String 对象，性能会差很多。
-    private final StringBuilder jsonAccum = new StringBuilder();
-    private String stopReason = "";
-    private int inputTokens=0;
-    private int outputTokens=0;
+
 
     public AnthropicCodeClient(ProviderConfig cfg, String systemPrompt) {
         String apiKey = cfg.resolvedApiKey();
@@ -105,7 +93,7 @@ public class AnthropicCodeClient implements LlmClient{
         return new LlmException("Unexpected error: " + e.getMessage(), e);
     }
     //在虚拟线程中进行,需注意线程安全
-    private void doStream(ConversationManager conv, List<Map<String, Object>> tools, LinkedBlockingQueue<StreamEvent> streamEvents) throws IOException, InterruptedException {
+    private void doStream(ConversationManager conv, List<Map<String, Object>> tools, LinkedBlockingQueue<StreamEvent> streamQueue) throws IOException, InterruptedException {
         //拼接Anthropic需要的JSON请求体
         var body = new LinkedHashMap<String, Object>();
         body.put("model", model);
@@ -120,9 +108,10 @@ public class AnthropicCodeClient implements LlmClient{
                 body.put("thinking", Map.of("type", "enabled", "budget_tokens", maxOutputTokens - 1));
             }
         }
+        body.put("messages",conv.serializeAnthropic());
         var httpClient = HttpClient.newHttpClient();
         var request = HttpRequest.newBuilder()
-                .uri(URI.create("https://api.deepseek.com/anthropic"))
+                .uri(URI.create("https://api.deepseek.com/anthropic/v1/messages"))
                 .header("Content-Type", "application/json")
                 .header("x-api-key", "sk-c39ba4ff31ac42ae8fa5d6a20451c66f")
                 .header("anthropic-version", "2023-06-01")
@@ -130,6 +119,17 @@ public class AnthropicCodeClient implements LlmClient{
                 .build();
         //send会在响应头到达时就返回,把响应体留作InputStream供后续逐行读取,而不是一次性读进内存
         var response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
+        //是否在thinking块内
+        boolean inThinking = false;
+        StringBuilder thinkingAccum = new StringBuilder();
+        String thinkingSignature = "";
+        String currentToolName = "";
+        String currentToolId = "";
+        //StringBuilder.append() 的性能在这里很重要。一个工具调用的参数可能被拆成几十个 JSON 片段推过来，每次 append() 的复杂度是 O(1) 均摊。如果改成字符串拼接（ str += fragment ），每次都要创建新的 String 对象，性能会差很多。
+        StringBuilder jsonAccum = new StringBuilder();
+        String stopReason = "";
+        int inputTokens=0;
+        int outputTokens=0;
         //流式响应,try-with-resource,确保 reader 和底层的 InputStream 在结束时自动关闭
         try (var reader = new BufferedReader(new InputStreamReader(response.body()))) {
             String line;
@@ -194,11 +194,12 @@ public class AnthropicCodeClient implements LlmClient{
                     if ("thinking".equals(type)) {
                         inThinking = true;
                         thinkingAccum.setLength(0);
-                    } else if ("tool_use".equals(type)) {
+                    }
+                    else if ("tool_use".equals(type)) {
                         currentToolName = (String) block.getOrDefault("name", "");
                         currentToolId = (String) block.getOrDefault("id", "");
                         jsonAccum.setLength(0);
-                        queue.add(new StreamEvent.ToolCallStart(currentToolId, currentToolName));
+                        streamQueue.add(new StreamEvent.ToolCallStart(currentToolId, currentToolName));
                     }
                 }
                 case "content_block_delta"->{
@@ -210,30 +211,30 @@ public class AnthropicCodeClient implements LlmClient{
                             //thinking_delta 既推事件（给 UI 实时展示）又累积（block 结束时要拼成完整的思考文本）
                             String t = (String) delta.getOrDefault("thinking", "");
                             thinkingAccum.append(t);
-                            queue.add(new StreamEvent.ThinkingDelta(t));
+                            streamQueue.add(new StreamEvent.ThinkingDelta(t));
                         }
                         case "signature_delta" ->
                             thinkingSignature = (String) delta.getOrDefault("signature", "");
                         case "text_delta" ->
-                            queue.add(new StreamEvent.TextDelta((String) delta.getOrDefault("text", "")));
+                            streamQueue.add(new StreamEvent.TextDelta((String) delta.getOrDefault("text", "")));
                         case "input_json_delta" -> {
                             //input_json_delta 也是双重处理，因为工具参数需要等全部 JSON 片段到齐后才能反序列化成 Map。
                             String pj = (String) delta.getOrDefault("partial_json", "");
                             jsonAccum.append(pj);
-                            queue.add(new StreamEvent.ToolCallDelta(pj));
+                            streamQueue.add(new StreamEvent.ToolCallDelta(pj));
                         }
                     }
                 }
                 case "content_block_stop" -> {
                     if (inThinking) {
-                        queue.add(new StreamEvent.ThinkingComplete(thinkingAccum.toString(), thinkingSignature));
+                        streamQueue.add(new StreamEvent.ThinkingComplete(thinkingAccum.toString(), thinkingSignature));
                         inThinking = false;
                     }
                     else if (!currentToolName.isEmpty()) {
                         Map<String, Object> args;
                         try { args = MAPPER.readValue(jsonAccum.toString(), Map.class); }
                         catch (Exception e) { args = new HashMap<>(); }
-                        queue.add(new StreamEvent.ToolCallComplete(currentToolId, currentToolName, args));
+                        streamQueue.add(new StreamEvent.ToolCallComplete(currentToolId, currentToolName, args));
                         currentToolName = "";
                         currentToolId = "";
                         jsonAccum.setLength(0);
@@ -254,7 +255,7 @@ public class AnthropicCodeClient implements LlmClient{
                     }
                 }
                 case "message_stop" ->
-                    queue.add(new StreamEvent.StreamEnd(stopReason,inputTokens,outputTokens));
+                    streamQueue.add(new StreamEvent.StreamEnd(stopReason,inputTokens,outputTokens));
             }
         }
     }

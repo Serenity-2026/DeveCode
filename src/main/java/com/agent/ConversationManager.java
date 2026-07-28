@@ -18,7 +18,8 @@ public class ConversationManager {
     private static final ObjectMapper MAPPER=new ObjectMapper();
 
     public void addUserMessage(String content) {
-        history.add(new Message("user", content));
+        Message msg = new Message("user", content);
+        history.add(msg);
     }
 
     public void addAssistantMessage(String content) {
@@ -76,8 +77,21 @@ public class ConversationManager {
     public void resetLtmInjected() {
         ltmInjected = false;
     }
-
+    //动态状态 -> 包成 system-reminder，贴在最新 user 消息末尾，每轮刷新
     public void addSystemReminder(String content) {
+        //需要合并system-reminder和前面一条消息
+        if (!history.isEmpty()) {
+            var prev = history.getLast();
+            var prevRole = (String) prev.getRole();
+            //如果是相同角色
+            if (prevRole != null && prevRole.equals("user")) {
+                var prevContent = prev.getContent();
+                if (prevContent instanceof String s) {
+                    var merged = new Message(prev.getRole(),s + "\n\n" + prev.getContent(),prev.getThinkingBlocks(),prev.getToolUses(),prev.getToolResults());
+                    history.set(history.size() - 1, merged);
+                }
+            }
+        }
         history.add(new Message("user", "<system-reminder>\n" + content + "\n</system-reminder>"));
     }
 
@@ -104,7 +118,7 @@ public class ConversationManager {
                 : serializeOpenAI();
     }
     //将历史消息history转为OpenAI标准
-    private List<Map<String, Object>> serializeOpenAI() {
+    public List<Map<String, Object>> serializeOpenAI() {
         var content=new ArrayList<Map<String,Object>>();
         for (Message msg : history) {
             if(msg.hasThinking()){
@@ -145,9 +159,25 @@ public class ConversationManager {
         return content;
     }
     //将历史消息history转为Anthropic标准,按顺序放 thinking、text、tool_use 块。
-    private List<Map<String, Object>> serializeAnthropic() {
-        var content=new ArrayList<Map<String,Object>>();
+    /*
+    *  messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Hi, how are you?"
+                }
+            ]
+        }
+    ]
+    * */
+    public List<Map<String, Object>> serializeAnthropic() {
+        var messages = new ArrayList<Map<String, Object>>();
         for (Message msg : history) {
+            var message = new LinkedHashMap<String, Object>();
+            message.put("role", msg.getRole());
+            var content = new ArrayList<Map<String, Object>>();
             if(msg.hasThinking()){
                 //1.添加thinking块
             for (var tb : msg.getThinkingBlocks()) {
@@ -174,10 +204,11 @@ public class ConversationManager {
                     content.add(block);
                 }
             }
-
+            message.put("content", content);
+            messages.add(message);
 
         }
-        return content;
+        return messages;
     }
     //添加消息时要注意：AnthropicAPI要求消息严格按user/assistant交替（user→assistant→user→…），连续两条同角色消息会直接报错。
     // 但在用户消息后追加的system-reminder也是 user 角色，于是出现连续两条 user。在把消息塞进结果列表前，先看上一条是不是同角色，是的话就并成一条。

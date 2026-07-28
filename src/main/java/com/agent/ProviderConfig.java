@@ -20,10 +20,19 @@ public class ProviderConfig {
     private int contextWindow;
     private int maxOutputTokens;
 
+    public ProviderConfig(String name, String protocol, String baseUrl, String model, String apiKey, boolean thinking) {
+        this.name = name;
+        this.protocol = protocol;
+        this.baseUrl = baseUrl;
+        this.model = model;
+        this.apiKey = apiKey;
+        this.thinking = thinking;
+    }
+
     /*
-    从模型 API 动态查询到的上下文窗口（二级缓存）,用Integer（包装类型）而非 int，因为需要用 null 表示"还没查询过/查询失败"。
-    volatile 关键字保证多线程可见性--这个值由客户端构造线程写入，可能被其他线程读取，需要内存屏障防止读到过期值。
-     */
+        从模型 API 动态查询到的上下文窗口（二级缓存）,用Integer（包装类型）而非 int，因为需要用 null 表示"还没查询过/查询失败"。
+        volatile 关键字保证多线程可见性--这个值由客户端构造线程写入，可能被其他线程读取，需要内存屏障防止读到过期值。
+         */
     private volatile Integer fetchedContextWindow;
 
     public String getName() { return name; }
@@ -86,7 +95,7 @@ public class ProviderConfig {
         if (maxOutputTokens > 0) return maxOutputTokens;
         return thinking ? 64_000 : 8192;
     }
-
+    //先拿代码中配置好的api_key,如果没有再去环境变量中取
     public String resolvedApiKey() {
         if (apiKey != null && !apiKey.isEmpty()) return apiKey;
         String envVar = ENV_KEY_MAP.get(protocol);
