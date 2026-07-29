@@ -63,6 +63,9 @@ public class TerminalUI {
     private int selAnchorLine = -1;
     private int selCurrentLine = -1;
 
+    // --- Scrollbar drag state ---
+    private boolean draggingScrollbar = false;
+
     // ── 流式状态 ──
     private volatile boolean streaming = false;
     private final StringBuilder streamAccum = new StringBuilder();
@@ -685,7 +688,12 @@ public class TerminalUI {
         if (convEnd - convStart < 3) convEnd = convStart + 3;
         int convY = y - 1;
         if (convY < convStart || convY > convEnd) return;
-        if (x == cols) { handleScrollbarClick(convY, convStart, convEnd); return; }
+        if (x == cols) {
+            // 点击滚动条：进入拖拽状态，并立即跳到对应位置
+            draggingScrollbar = true;
+            handleScrollbarClick(convY, convStart, convEnd);
+            return;
+        }
         handleSelectionStart(convY, convStart);
     }
     private void handleScrollbarClick(int convY, int convStart, int convEnd) {
@@ -716,6 +724,20 @@ public class TerminalUI {
         needsRedraw = true;
     }
     private void handleMouseDrag(int x, int y) {
+        // 滚动条拖拽：跟随鼠标 Y 位置更新 scrollOffset
+        if (draggingScrollbar) {
+            int rows = termHeight;
+            int inputHeight = Math.max(countInputLines() + 1, 3);
+            int sep2Row = rows - inputHeight - 2;
+            int convStart = 2, convEnd = sep2Row - 1;
+            if (convEnd - convStart < 3) convEnd = convStart + 3;
+            int convY = y - 1;
+            // 拖出对话区时夹紧到边界，便于拉到最顶/最底
+            if (convY < convStart) convY = convStart;
+            if (convY > convEnd) convY = convEnd;
+            handleScrollbarClick(convY, convStart, convEnd);
+            return;
+        }
         if (!selecting) return;
         int rows = termHeight;
         int inputHeight = Math.max(countInputLines() + 1, 3);
@@ -734,6 +756,10 @@ public class TerminalUI {
         }
     }
     private void handleMouseRelease() {
+        if (draggingScrollbar) {
+            draggingScrollbar = false;
+            return;
+        }
         if (!selecting) return;
         selecting = false;
         copySelectionToClipboard();
