@@ -30,6 +30,7 @@ public class Main {
             switch (event) {
                 case StreamEvent.TextDelta td        -> {
                     System.out.print(td.text());
+
                     s.append(td.text());
                 }
                 case StreamEvent.ThinkingDelta td    -> {}  // 忽略思想过程

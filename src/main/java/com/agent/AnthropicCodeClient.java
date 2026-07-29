@@ -78,7 +78,7 @@ public class AnthropicCodeClient implements LlmClient{
             if (msg.contains("prompt is too long") || msg.contains("too many tokens")) {
                 return new LlmException.ContextTooLongException("Context too long: " + bre.getMessage());
             }
-            return new LlmException("Bad request: " + bre.getMessage(), bre);
+            return new LlmException("Bad request.md: " + bre.getMessage(), bre);
         }
         if (e instanceof AnthropicServiceException se) {
             if (se.statusCode() == 413) {

@@ -1,0 +1,23 @@
+# DeveCode Provider Configuration
+# 放置路径: src/main/resources/providers.yaml
+
+providers:
+  - name: "deepseek"
+    protocol: "anthropic"
+    base_url: "https://api.deepseek.com/anthropic/v1/messages"
+    model: "deepseek-v4-flash"
+    api_key: "sk-c39ba4ff31ac42ae8fa5d6a20451c66f"
+    thinking: true
+
+  - name: "openai"
+    protocol: "openai"
+    model: "gpt-4o"
+    api_key: "sk-your-openai-key"
+    thinking: false
+
+  - name: "deepseek-openai"
+    protocol: "openai"
+    base_url: "https://api.deepseek.com/v1"
+    model: "deepseek-chat"
+    api_key: "sk-your-deepseek-key"
+    thinking: false
