@@ -93,6 +93,9 @@ public class AnthropicCodeClient implements LlmClient{
         return new LlmException("Unexpected error: " + e.getMessage(), e);
     }
     //在虚拟线程中进行,需注意线程安全
+    //将原始类型强制转换为泛型类型。Java 编译器无法在编译期验证这种转换的安全性，所以报了"unchecked"。运行时泛型被擦除，实际类型是正确的，程序不受影响，纯粹是编译器告警。
+    //加了 @SuppressWarnings("unchecked") 注解告诉编译器："我知道这里无法静态证明类型安全，但运行时没问题，别再警告了。" 这是处理 JSON 反序列化的标准做法。
+    @SuppressWarnings("unchecked")
     private void doStream(ConversationManager conv, List<Map<String, Object>> tools, LinkedBlockingQueue<StreamEvent> streamQueue) throws IOException, InterruptedException {
         //拼接Anthropic需要的JSON请求体
         var body = new LinkedHashMap<String, Object>();
