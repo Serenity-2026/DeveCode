@@ -34,7 +34,7 @@ import java.util.concurrent.TimeUnit;
 public class TerminalUI {
 
     private static final String APP_NAME    = "DeveCode";
-    private static final String APP_VERSION = "v0.1.0";
+    private static final String APP_VERSION = "v1.0.0";
 
     // ── 终端 ──
     private final Terminal terminal;
@@ -111,6 +111,11 @@ public class TerminalUI {
                 .system(true)
                 .signalHandler(Terminal.SignalHandler.SIG_IGN)
                 .build();
+        // 信号处理器：捕获 Ctrl+C (SIGINT)，确保跨平台可靠退出
+        this.terminal.handle(Terminal.Signal.INT, s -> {
+            running = false;
+            eventQueue.add(new UIEvent.Exit());
+        });
         this.writer = terminal.writer();
         this.client = LlmClient.create(provider,
                 "You are a helpful coding assistant. Respond concisely.");
@@ -167,6 +172,8 @@ public class TerminalUI {
 
     private void cleanup() {
         writer.print(CURSOR_SHOW);
+        writer.println();
+        writer.flush();
         try { terminal.close(); } catch (Exception ignored) {}
     }
 
@@ -732,7 +739,7 @@ public class TerminalUI {
             buf.append(BOLD).append("> ").append(RESET);
 
             if (inputBuffer.isEmpty() && !streaming) {
-                buf.append(DIM).append("Send a message...").append(RESET);
+                buf.append(DIM).append("Send a message, or ctrl + c to quit").append(RESET);
                 moveTo(buf, topRow + 1, 3);
                 buf.append(CURSOR_SHOW);
             } else {
