@@ -58,14 +58,6 @@ public class TerminalUI {
     private int historyIdx = -1;
     private String savedInput = null; // 浏览历史时暂存当前输入
 
-    // --- Text selection state ---
-    private boolean selecting = false;
-    private int selAnchorLine = -1;
-    private int selCurrentLine = -1;
-
-    // --- Scrollbar drag state ---
-    private boolean draggingScrollbar = false;
-
     // ── 流式状态 ──
     private volatile boolean streaming = false;
     private final StringBuilder streamAccum = new StringBuilder();
@@ -132,14 +124,8 @@ public class TerminalUI {
     private void run() {
         terminal.enterRawMode();
         readTerminalSize();
-        // Windows 上 AbstractWindowsTerminal.trackMouse() 重写后不检查 hasMouseSupport()，
-        // 直接设置 ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS（关闭 QuickEdit），
-        // 并把鼠标事件转成 X10 序列喂给 reader()。必须显式调用才会生效。
-        debugLog("run: terminalClass=" + terminal.getClass().getName()
-                + " hasMouseSupport=" + terminal.hasMouseSupport()
-                + " termWidth=" + termWidth + " termHeight=" + termHeight);
-        boolean tracked = terminal.trackMouse(Terminal.MouseTracking.Any);
-        debugLog("run: trackMouse(Any) returned=" + tracked);
+        // 不开启 trackMouse：保留终端原生 QuickEdit / 文本选区 / I-beam 光标。
+        // 滚动改用键盘（PageUp/PageDown/↑/↓）。
 
         // 输入线程：阻塞读取按键 → 事件队列
         Thread inputThread = Thread.startVirtualThread(this::inputLoop);
@@ -181,7 +167,6 @@ public class TerminalUI {
 
     private void cleanup() {
         writer.print(CURSOR_SHOW);
-        terminal.trackMouse(Terminal.MouseTracking.Off);
         try { terminal.close(); } catch (Exception ignored) {}
     }
 
@@ -413,7 +398,7 @@ public class TerminalUI {
                 int ch = reader.read();
                 if (ch == -1) { running = false; break; }
 
-                // --- ESC sequences (mouse + function keys) ---
+                // --- ESC sequences (function keys) ---
                 if (ch == 0x1B) {
                     int c2 = reader.read();
                     if (c2 == -1) break;
@@ -421,46 +406,6 @@ public class TerminalUI {
                     if (c2 == '[') {
                         int c3 = reader.read();
                         if (c3 == -1) break;
-
-                        // SGR mouse: ESC [ < button ; x ; y M/m
-                        if (c3 == '<') {
-                            StringBuilder sb = new StringBuilder("\033[<");
-                            int mc;
-                            while ((mc = reader.read()) != -1) {
-                                sb.append((char) mc);
-                                if (mc == 'M' || mc == 'm') break;
-                            }
-                            parseMouseEvent(sb.toString());
-                            needsRedraw = true;
-                            continue;
-                        }
-
-                        // X10 mouse: ESC [ M button x y (3 extra bytes)
-                        if (c3 == 'M') {
-                            int btn = reader.read();
-                            int mx  = reader.read();
-                            int my  = reader.read();
-                            if (btn == -1 || mx == -1 || my == -1) break;
-                            int button = btn - 32;
-                            // X10/X11 鼠标坐标是 1-indexed：点击左上角时 mx=33, my=33
-                            int x = mx - 32;   // 1-indexed
-                            int y = my - 32;   // 1-indexed
-                            debugLog("X10MouseEvent: btn=" + btn + " button=" + button + " mx=" + mx + " my=" + my + " x=" + x + " y=" + y + " termWidth=" + termWidth);
-                            // 注意：JLine 在 Windows 上不设 motion 位（cb 不带 0x20），
-                            // 拖动事件的 button 与按下相同（左键=0），释放 button=3，滚轮 64/65。
-                            // 因此当处于 draggingScrollbar 或 selecting 状态时，button==0 视为拖动。
-                            if (button == 64) { scrollOffset++; needsRedraw = true; }
-                            else if (button == 65) { scrollOffset = Math.max(0, scrollOffset - 1); needsRedraw = true; }
-                            else if (button == 3) { handleMouseRelease(); }
-                            else if (button == 0 || button == 1 || button == 2) {
-                                if (draggingScrollbar || selecting) {
-                                    handleMouseDrag(x, y);
-                                } else {
-                                    handleMousePress(x, y);
-                                }
-                            }
-                            continue;
-                        }
 
                         // Read rest of CSI parameter bytes
                         StringBuilder csiParams = new StringBuilder();
@@ -481,9 +426,11 @@ public class TerminalUI {
                             case "H" -> handleHome();
                             case "F" -> handleEnd();
                             case "3~" -> handleDelete();
+                            case "5~" -> { if (!streaming) { scrollOffset += pageScrollAmount(); needsRedraw = true; } }
+                            case "6~" -> { if (!streaming) { scrollOffset = Math.max(0, scrollOffset - pageScrollAmount()); needsRedraw = true; } }
                             default -> {} // ignore unknown CSI
                         }
-                        if (!csi.equals("A") && !csi.equals("B")) needsRedraw = true;
+                        if (!csi.equals("A") && !csi.equals("B") && !csi.equals("5~") && !csi.equals("6~")) needsRedraw = true;
                         continue;
                     }
 
@@ -632,157 +579,10 @@ public class TerminalUI {
     //  渲染
     // ═══════════════════════════════════════════════════════════════
 
-    /**
-     * Handle JLine native mouse event, dispatching to scroll/select handlers.
-     */
-    private void handleMouseNativeEvent(org.jline.terminal.MouseEvent me) {
-        org.jline.terminal.MouseEvent.Type type = me.getType();
-        org.jline.terminal.MouseEvent.Button btn = me.getButton();
-        int x = me.getX();
-        int y = me.getY();
-        switch (type) {
-            case Wheel -> {
-                if (btn == org.jline.terminal.MouseEvent.Button.WheelUp) {
-                    scrollOffset++;
-                } else if (btn == org.jline.terminal.MouseEvent.Button.WheelDown) {
-                    scrollOffset = Math.max(0, scrollOffset - 1);
-                }
-                needsRedraw = true;
-            }
-            case Pressed -> {
-                if (btn == org.jline.terminal.MouseEvent.Button.Button1) {
-                    handleMousePress(x, y);
-                }
-            }
-            case Dragged -> {
-                if (btn == org.jline.terminal.MouseEvent.Button.Button1) {
-                    handleMouseDrag(x, y);
-                }
-            }
-            case Released -> {
-                if (btn == org.jline.terminal.MouseEvent.Button.Button1) {
-                    handleMouseRelease();
-                }
-            }
-            default -> {}
-        }
-    }
-
-    private void parseMouseEvent(String seq) {
-        // SGR extended mouse format: ESC[<button;x;y{M,m}
-        if (!seq.endsWith("M") && !seq.endsWith("m")) return;
-        boolean isPress = seq.endsWith("M");
-        String inner = seq.substring(3, seq.length() - 1);
-        String[] parts = inner.split(";");
-        if (parts.length < 3) return;
-        try {
-            int button = Integer.parseInt(parts[0]);
-            int x = Integer.parseInt(parts[1]);
-            int y = Integer.parseInt(parts[2]);
-            debugLog("parseMouseEvent: button=" + button + " x=" + x + " y=" + y + " isPress=" + isPress + " termWidth=" + termWidth + " termHeight=" + termHeight);
-            if (button == 64) { scrollOffset++; needsRedraw = true; return; }
-            if (button == 65) { scrollOffset = Math.max(0, scrollOffset - 1); needsRedraw = true; return; }
-            if (button == 0 || button == 32) {
-                if (isPress) {
-                    if (button == 32) { handleMouseDrag(x, y); }
-                    else { handleMousePress(x, y); }
-                } else {
-                    handleMouseRelease();
-                }
-            }
-        } catch (NumberFormatException e) {}
-    }
-    private void handleMousePress(int x, int y) {
-        int rows = termHeight, cols = termWidth;
-        int inputHeight = Math.max(countInputLines() + 1, 3);
-        int sep2Row = rows - inputHeight - 2;
-        int convStart = 2, convEnd = sep2Row - 1;
-        if (convEnd - convStart < 3) convEnd = convStart + 3;
-        int convY = y - 1;
-        debugLog("handleMousePress: x=" + x + " y=" + y + " cols=" + cols + " convY=" + convY + " convStart=" + convStart + " convEnd=" + convEnd);
-        if (convY < convStart || convY > convEnd) return;
-        if (x == cols) {
-            // 点击滚动条：进入拖拽状态，并立即跳到对应位置
-            draggingScrollbar = true;
-            handleScrollbarClick(convY, convStart, convEnd);
-            return;
-        }
-        handleSelectionStart(convY, convStart);
-    }
-    /** 调试日志：写入文件，便于排查鼠标问题 */
-    private void debugLog(String msg) {
-        try (var fw = new java.io.FileWriter("devecode_debug.log", true)) {
-            fw.write(msg + "\n");
-        } catch (java.io.IOException ignored) {}
-    }
-    private void handleScrollbarClick(int convY, int convStart, int convEnd) {
-        int availRows = convEnd - convStart + 1;
-        List<RenderLine> allLines = buildAllRenderLines();
-        int totalLines = allLines.size();
-        if (totalLines <= availRows) return;
-        int maxScroll = totalLines - availRows;
-        int trackHeight = availRows;
-        int yInTrack = convY - convStart;
-        double fraction = (double) yInTrack / Math.max(1, trackHeight - 1);
-        fraction = Math.max(0, Math.min(1, fraction));
-        scrollOffset = (int) Math.round((1 - fraction) * maxScroll);
-        needsRedraw = true;
-    }
-    private void handleSelectionStart(int convY, int convStart) {
-        List<RenderLine> allLines = buildAllRenderLines();
-        int totalLines = allLines.size();
-        int convAvailRows = estimateConvAvailRows();
-        int maxScroll = Math.max(0, totalLines - convAvailRows);
-        if (scrollOffset > maxScroll) scrollOffset = maxScroll;
-        int visibleStart = Math.max(0, totalLines - convAvailRows - scrollOffset);
-        int absLine = visibleStart + (convY - convStart);
-        if (absLine < 0 || absLine >= totalLines) return;
-        selecting = true;
-        selAnchorLine = absLine;
-        selCurrentLine = absLine;
-        needsRedraw = true;
-    }
-    private void handleMouseDrag(int x, int y) {
-        // 滚动条拖拽：跟随鼠标 Y 位置更新 scrollOffset
-        if (draggingScrollbar) {
-            int rows = termHeight;
-            int inputHeight = Math.max(countInputLines() + 1, 3);
-            int sep2Row = rows - inputHeight - 2;
-            int convStart = 2, convEnd = sep2Row - 1;
-            if (convEnd - convStart < 3) convEnd = convStart + 3;
-            int convY = y - 1;
-            // 拖出对话区时夹紧到边界，便于拉到最顶/最底
-            if (convY < convStart) convY = convStart;
-            if (convY > convEnd) convY = convEnd;
-            handleScrollbarClick(convY, convStart, convEnd);
-            return;
-        }
-        if (!selecting) return;
-        int rows = termHeight;
-        int inputHeight = Math.max(countInputLines() + 1, 3);
-        int sep2Row = rows - inputHeight - 2;
-        int convStart = 2, convEnd = sep2Row - 1;
-        int convY = y - 1;
-        if (convY < convStart || convY > convEnd) return;
-        List<RenderLine> allLines = buildAllRenderLines();
-        int convAvailRows = estimateConvAvailRows();
-        int maxScroll = Math.max(0, allLines.size() - convAvailRows);
-        int visibleStart = Math.max(0, allLines.size() - convAvailRows - scrollOffset);
-        int absLine = visibleStart + (convY - convStart);
-        if (absLine >= 0 && absLine < allLines.size()) {
-            selCurrentLine = absLine;
-            needsRedraw = true;
-        }
-    }
-    private void handleMouseRelease() {
-        if (draggingScrollbar) {
-            draggingScrollbar = false;
-            return;
-        }
-        if (!selecting) return;
-        selecting = false;
-        copySelectionToClipboard();
-        needsRedraw = true;
+    /** PageUp/PageDown 每次滚动的行数（对话区可见行数 - 1，至少 1）。 */
+    private int pageScrollAmount() {
+        int n = estimateConvAvailRows() - 1;
+        return Math.max(1, n);
     }
 
     private void render() {
@@ -883,7 +683,6 @@ public class TerminalUI {
             if (i < allLines.size()) {
                 RenderLine rl = allLines.get(i);
                 String text = truncate(rl.text(), textWidth);
-                if (selecting && isLineInSelection(i)) buf.append(REVERSE);
                 buf.append(rl.style()).append(text).append(RESET);
                 int vl = visibleLength(text);
                 if (vl < textWidth) buf.append(repeat(' ', textWidth - vl));
@@ -892,11 +691,6 @@ public class TerminalUI {
             y++;
         }
         for (; y <= endRow; y++) { moveTo(buf, y, 0); buf.append("\033[K"); }
-    }
-    private boolean isLineInSelection(int lineIdx) {
-        int s = Math.min(selAnchorLine, selCurrentLine);
-        int e = Math.max(selAnchorLine, selCurrentLine);
-        return lineIdx >= s && lineIdx <= e;
     }
     private void drawScrollbarCell(StringBuilder buf, int row, int termCols, int lineIdx, int visibleStart, int totalLines, int availRows) {
         if (totalLines <= availRows) return;
@@ -1047,23 +841,6 @@ public class TerminalUI {
         int len = 0;
         for (int i = 0; i < stripped.length(); i++) len += displayCharWidth(stripped.charAt(i));
         return len;
-    }
-    private void copySelectionToClipboard() {
-        if (selAnchorLine < 0 || selCurrentLine < 0) return;
-        List<RenderLine> allLines = buildAllRenderLines();
-        int start = Math.min(selAnchorLine, selCurrentLine);
-        int end = Math.max(selAnchorLine, selCurrentLine);
-        StringBuilder selText = new StringBuilder();
-        for (int i = start; i <= end && i < allLines.size(); i++) {
-            String plain = allLines.get(i).text().replaceAll("\u001b\\[[0-9;]*[a-zA-Z]", "");
-            if (plain.startsWith("  ")) plain = plain.substring(2);
-            if (!selText.isEmpty()) selText.append("\n");
-            selText.append(plain);
-        }
-        if (selText.isEmpty()) return;
-        String base64 = java.util.Base64.getEncoder().encodeToString(selText.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        writer.print("\033]52;c;" + base64 + "\033\\");
-        writer.flush();
     }
     private record UIMessage(String role, String content, String timeLabel, boolean streaming, boolean error) {
         private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
