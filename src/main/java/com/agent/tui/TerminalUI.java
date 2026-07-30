@@ -132,10 +132,14 @@ public class TerminalUI {
     private void run() {
         terminal.enterRawMode();
         readTerminalSize();
-        // Enable JLine native mouse tracking
-        if (terminal.hasMouseSupport()) {
-            terminal.trackMouse(Terminal.MouseTracking.Any);
-        }
+        // Windows 上 AbstractWindowsTerminal.trackMouse() 重写后不检查 hasMouseSupport()，
+        // 直接设置 ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS（关闭 QuickEdit），
+        // 并把鼠标事件转成 X10 序列喂给 reader()。必须显式调用才会生效。
+        debugLog("run: terminalClass=" + terminal.getClass().getName()
+                + " hasMouseSupport=" + terminal.hasMouseSupport()
+                + " termWidth=" + termWidth + " termHeight=" + termHeight);
+        boolean tracked = terminal.trackMouse(Terminal.MouseTracking.Any);
+        debugLog("run: trackMouse(Any) returned=" + tracked);
 
         // 输入线程：阻塞读取按键 → 事件队列
         Thread inputThread = Thread.startVirtualThread(this::inputLoop);
@@ -177,9 +181,7 @@ public class TerminalUI {
 
     private void cleanup() {
         writer.print(CURSOR_SHOW);
-        if (terminal.hasMouseSupport()) {
-            terminal.trackMouse(Terminal.MouseTracking.Off);
-        }
+        terminal.trackMouse(Terminal.MouseTracking.Off);
         try { terminal.close(); } catch (Exception ignored) {}
     }
 
@@ -440,14 +442,23 @@ public class TerminalUI {
                             int my  = reader.read();
                             if (btn == -1 || mx == -1 || my == -1) break;
                             int button = btn - 32;
-                            int x = mx - 32;
-                            int y = my - 32;
-                            if (button == 0) { handleMousePress(x + 1, y + 1); }
-                            else if (button == 32) { handleMouseDrag(x + 1, y + 1); }
-                            else if (button == 3) { handleMouseRelease(); }
-                            // wheel in X10: btn 64/65
+                            // X10/X11 鼠标坐标是 1-indexed：点击左上角时 mx=33, my=33
+                            int x = mx - 32;   // 1-indexed
+                            int y = my - 32;   // 1-indexed
+                            debugLog("X10MouseEvent: btn=" + btn + " button=" + button + " mx=" + mx + " my=" + my + " x=" + x + " y=" + y + " termWidth=" + termWidth);
+                            // 注意：JLine 在 Windows 上不设 motion 位（cb 不带 0x20），
+                            // 拖动事件的 button 与按下相同（左键=0），释放 button=3，滚轮 64/65。
+                            // 因此当处于 draggingScrollbar 或 selecting 状态时，button==0 视为拖动。
                             if (button == 64) { scrollOffset++; needsRedraw = true; }
-                            if (button == 65) { scrollOffset = Math.max(0, scrollOffset - 1); needsRedraw = true; }
+                            else if (button == 65) { scrollOffset = Math.max(0, scrollOffset - 1); needsRedraw = true; }
+                            else if (button == 3) { handleMouseRelease(); }
+                            else if (button == 0 || button == 1 || button == 2) {
+                                if (draggingScrollbar || selecting) {
+                                    handleMouseDrag(x, y);
+                                } else {
+                                    handleMousePress(x, y);
+                                }
+                            }
                             continue;
                         }
 
@@ -668,6 +679,7 @@ public class TerminalUI {
             int button = Integer.parseInt(parts[0]);
             int x = Integer.parseInt(parts[1]);
             int y = Integer.parseInt(parts[2]);
+            debugLog("parseMouseEvent: button=" + button + " x=" + x + " y=" + y + " isPress=" + isPress + " termWidth=" + termWidth + " termHeight=" + termHeight);
             if (button == 64) { scrollOffset++; needsRedraw = true; return; }
             if (button == 65) { scrollOffset = Math.max(0, scrollOffset - 1); needsRedraw = true; return; }
             if (button == 0 || button == 32) {
@@ -687,6 +699,7 @@ public class TerminalUI {
         int convStart = 2, convEnd = sep2Row - 1;
         if (convEnd - convStart < 3) convEnd = convStart + 3;
         int convY = y - 1;
+        debugLog("handleMousePress: x=" + x + " y=" + y + " cols=" + cols + " convY=" + convY + " convStart=" + convStart + " convEnd=" + convEnd);
         if (convY < convStart || convY > convEnd) return;
         if (x == cols) {
             // 点击滚动条：进入拖拽状态，并立即跳到对应位置
@@ -695,6 +708,12 @@ public class TerminalUI {
             return;
         }
         handleSelectionStart(convY, convStart);
+    }
+    /** 调试日志：写入文件，便于排查鼠标问题 */
+    private void debugLog(String msg) {
+        try (var fw = new java.io.FileWriter("devecode_debug.log", true)) {
+            fw.write(msg + "\n");
+        } catch (java.io.IOException ignored) {}
     }
     private void handleScrollbarClick(int convY, int convStart, int convEnd) {
         int availRows = convEnd - convStart + 1;

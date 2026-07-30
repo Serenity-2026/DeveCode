@@ -30,6 +30,18 @@
         <artifactId>jline</artifactId>
         <version>3.30.0</version>
     </dependency>
+    <!-- JNA：jline 把 jna 标为 optional 不传递，需显式声明，
+         否则 Windows 上 .jna(true) 会失败回退到非原生终端，导致鼠标不可用 -->
+    <dependency>
+        <groupId>net.java.dev.jna</groupId>
+        <artifactId>jna</artifactId>
+        <version>5.17.0</version>
+    </dependency>
+    <dependency>
+        <groupId>net.java.dev.jna</groupId>
+        <artifactId>jna-platform</artifactId>
+        <version>5.17.0</version>
+    </dependency>
 
     <!-- SnakeYAML -->
     <dependency>
