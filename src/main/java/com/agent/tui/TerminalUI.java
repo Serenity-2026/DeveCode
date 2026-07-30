@@ -827,6 +827,7 @@ public class TerminalUI {
         } else {
             statusLine = BOLD + "DeveCode: " + GREEN + "Ready" + RESET;
         }
+        buf.append("\033[K");
         buf.append(truncate(statusLine, cols));
 
         // ── 分隔线1 ──
