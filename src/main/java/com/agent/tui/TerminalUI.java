@@ -76,6 +76,7 @@ public class TerminalUI {
     private volatile boolean running = true;
     private volatile boolean needsRedraw = true;
     private volatile boolean terminalResized = false;
+    private volatile boolean panelVisible = true;  // 右侧状态面板开关 (Ctrl+P 切换)
 
     // ── 系统监控 ──
     private final OperatingSystemMXBean osBean =
@@ -168,9 +169,21 @@ public class TerminalUI {
                     lastRenderMs = now;
                 }
 
-                // 流式模式下每秒刷新一次计时器
+                // 流式模式下定时刷新计时器
                 if (streaming && !firstTokenReceived) {
                     if (now - lastRenderMs >= 500) {
+                        long elapsed = (System.currentTimeMillis() - streamStartMs) / 1000;
+                        if (!messages.isEmpty() && messages.getLast().streaming()) {
+                            String think = thinkingAccum.toString();
+                            if (think.isEmpty()) {
+                                messages.set(messages.size() - 1,
+                                    UIMessage.streaming("Imagining… (" + elapsed + "s)"));
+                            } else {
+                                // thinking 阶段也更新计时器
+                                messages.set(messages.size() - 1,
+                                    UIMessage.streamingThinking(think, elapsed));
+                            }
+                        }
                         needsRedraw = true;
                     }
                 }
@@ -322,14 +335,20 @@ public class TerminalUI {
                             if (!messages.isEmpty()) {
                                 var msg = messages.getLast();
                                 if (msg.streaming()) {
+                                    long elapsed = (System.currentTimeMillis() - streamStartMs) / 1000;
                                     messages.set(messages.size() - 1,
-                                        UIMessage.streamingThinking(thinkingAccum.toString()));
+                                        UIMessage.streamingThinking(thinkingAccum.toString(), elapsed));
                                 }
                             }
                             needsRedraw = true;
                         }
                         case StreamEvent.ThinkingComplete ignored -> {
-                            // 思考完成，继续等待正文
+                            // 思考完成，显示结束标记
+                            if (!messages.isEmpty() && messages.getLast().streaming()) {
+                                messages.set(messages.size() - 1,
+                                    UIMessage.streamingThinkingDone(thinkingAccum.toString()));
+                            }
+                            needsRedraw = true;
                         }
                         case StreamEvent.TextDelta td -> {
                             if (!firstTokenReceived) {
@@ -376,8 +395,9 @@ public class TerminalUI {
                             }
                             // 如有思考内容，拼接在正文前
                             if (!thinkText.isEmpty()) {
-                                String thinkBlock = DIM + ITALIC + "✻ Thinking…\n"
-                                    + thinkText + RESET + "\n\n";
+                                String thinkBlock = GRAY + "✻ Thinking…" + RESET + "\n"
+                                    + UIMessage.grayLines(thinkText) + "\n"
+                                    + GRAY + "✻ Done" + RESET + "\n\n";
                                 rendered = thinkBlock + rendered;
                             }
                             replaceLastStreamingWithFinal(rendered, secs);
@@ -530,6 +550,11 @@ public class TerminalUI {
                     eventQueue.add(new UIEvent.Exit());
                     continue;
                 }
+                if (ch == 16) {                   // Ctrl+P → 切换右侧面板
+                    panelVisible = !panelVisible;
+                    needsRedraw = true;
+                    continue;
+                }
 
                 // --- Printable characters (incl. CJK) ---
                 if (ch >= 32 || ch == '\t') {
@@ -649,7 +674,7 @@ public class TerminalUI {
         int cols = termWidth;
 
         // 右侧状态面板：终端足够宽时显示
-        boolean showPanel = cols >= PANEL_MIN_COLS;
+        boolean showPanel = cols >= PANEL_MIN_COLS && panelVisible;
         int panelW = showPanel ? PANEL_WIDTH : 0;
         int leftCols = showPanel ? cols - panelW - 1 : cols;  // -1 给竖线分隔
         int panelX = showPanel ? cols - panelW : 0;            // 面板起始列
@@ -728,7 +753,7 @@ public class TerminalUI {
     /** 左侧可用宽度（扣除右侧面板和竖线） */
     private int leftContentWidth() {
         int cols = termWidth;
-        boolean showPanel = cols >= PANEL_MIN_COLS;
+        boolean showPanel = cols >= PANEL_MIN_COLS && panelVisible;
         return showPanel ? cols - PANEL_WIDTH - 1 - 1 : cols - 1;
     }
 
@@ -812,7 +837,7 @@ public class TerminalUI {
             buf.append(BOLD).append("> ").append(RESET);
 
             if (inputBuffer.isEmpty() && !streaming) {
-                buf.append(DIM).append("Send a message, or ctrl + c to quit").append(RESET);
+                buf.append(DIM).append("Send a message, or ctrl + c to quit, ctrl + p to toggle panel").append(RESET);
                 moveTo(buf, topRow + 1, 3);
                 buf.append(CURSOR_SHOW);
             } else {
@@ -867,7 +892,7 @@ public class TerminalUI {
         if (modelName.length() > 18) modelName = modelName.substring(0, 17) + "…";
 
         int cpuThreads = osBean.getAvailableProcessors();
-        double cpuLoad = osBean.getSystemCpuLoad() * 100;
+        double cpuLoad = osBean.getCpuLoad() * 100;
         if (cpuLoad < 0) cpuLoad = 0;
 
         // ── 逐行渲染 ──
@@ -1108,21 +1133,44 @@ public class TerminalUI {
                     null, true, false);
         }
 
-        /** 流式显示思考过程（暗色斜体） */
-        static UIMessage streamingThinking(String thinkText) {
+        /** 流式显示思考过程（每行浅灰色，带计时器） */
+        static UIMessage streamingThinking(String thinkText, long elapsed) {
             return new UIMessage("assistant",
                     BOLD + CYAN + "DeveCode" + RESET + "\n" +
-                    DIM + ITALIC + "✻ Thinking…\n" + thinkText + RESET,
+                    GRAY + "✻ Thinking… (" + elapsed + "s)" + RESET + "\n" +
+                    grayLines(thinkText),
                     null, true, false);
         }
 
-        /** 流式显示思考过程 + 正文 */
+        /** 思考完成，显示结束标记 */
+        static UIMessage streamingThinkingDone(String thinkText) {
+            return new UIMessage("assistant",
+                    BOLD + CYAN + "DeveCode" + RESET + "\n" +
+                    GRAY + "✻ Thinking…\n" + grayLines(thinkText) + "\n" +
+                    GRAY + "✻ Done" + RESET,
+                    null, true, false);
+        }
+
+        /** 流式显示思考过程（含结束标记）+ 正文 */
         static UIMessage streamingWithThinking(String thinkText, String responseText) {
             return new UIMessage("assistant",
                     BOLD + CYAN + "DeveCode" + RESET + "\n" +
-                    DIM + ITALIC + "✻ Thinking…\n" + thinkText + RESET + "\n\n" +
+                    GRAY + "✻ Thinking…\n" + grayLines(thinkText) + "\n" +
+                    GRAY + "✻ Done" + RESET + "\n\n" +
                     responseText,
                     null, true, false);
+        }
+
+        /** 将多行文本逐行包裹 GRAY 颜色（防止 \n 分割后丢失颜色） */
+        private static String grayLines(String text) {
+            if (text == null || text.isEmpty()) return "";
+            String[] lines = text.split("\n", -1);
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < lines.length; i++) {
+                if (i > 0) sb.append("\n");
+                sb.append(GRAY).append(lines[i]).append(RESET);
+            }
+            return sb.toString();
         }
 
         static UIMessage error(String text) {
@@ -1171,8 +1219,12 @@ public class TerminalUI {
                 char c = plainText.charAt(plainPos);
                 int cw = displayCharWidth(c);
                 if (currentLineWidth + cw > width && !currentLine.isEmpty()) {
+                    // 换行时传递 ANSI 颜色状态
+                    String ansiState = extractAnsiState(currentLine.toString());
+                    if (!ansiState.isEmpty()) currentLine.append(RESET);
                     result.add(currentLine.toString());
                     currentLine.setLength(0);
+                    if (!ansiState.isEmpty()) currentLine.append(ansiState);
                     currentLineWidth = 0;
                 }
                 while (origPos < text.length()) {
@@ -1195,6 +1247,29 @@ public class TerminalUI {
             if (!currentLine.isEmpty()) result.add(currentLine.toString());
             if (result.isEmpty()) result.add("");
             return result;
+        }
+
+        /** 提取文本末尾活跃的 ANSI 颜色码（遇 RESET 清空，遇设置码追加） */
+        private static String extractAnsiState(String text) {
+            StringBuilder state = new StringBuilder();
+            int i = 0;
+            while (i < text.length()) {
+                if (text.charAt(i) == '\u001b') {
+                    int start = i;
+                    i++;
+                    while (i < text.length() && !Character.isLetter(text.charAt(i))) i++;
+                    if (i < text.length()) i++;
+                    String code = text.substring(start, i);
+                    if (code.equals(RESET)) {
+                        state.setLength(0);
+                    } else {
+                        state.append(code);
+                    }
+                } else {
+                    i++;
+                }
+            }
+            return state.toString();
         }
 
     }
