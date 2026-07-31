@@ -67,6 +67,7 @@ public class TerminalUI {
     // ── 流式状态 ──
     private volatile boolean streaming = false;
     private final StringBuilder streamAccum = new StringBuilder();
+    private final StringBuilder thinkingAccum = new StringBuilder();
     private volatile boolean firstTokenReceived = false;
     private long streamStartMs;
     private long firstTokenMs;
@@ -96,6 +97,7 @@ public class TerminalUI {
     private static final String RESET   = ESC + "[0m";
     private static final String BOLD    = ESC + "[1m";
     private static final String DIM     = ESC + "[2m";
+    private static final String ITALIC  = ESC + "[3m";
     private static final String RED     = ESC + "[31m";
     private static final String GREEN   = ESC + "[32m";
     private static final String YELLOW  = ESC + "[33m";
@@ -304,6 +306,7 @@ public class TerminalUI {
         streaming = true;
         firstTokenReceived = false;
         streamAccum.setLength(0);
+        thinkingAccum.setLength(0);
         streamStartMs = System.currentTimeMillis();
 
         // 异步启动请求
@@ -313,28 +316,56 @@ public class TerminalUI {
                 while (true) {
                     StreamEvent evt = events.take();
                     switch (evt) {
+                        case StreamEvent.ThinkingDelta td -> {
+                            thinkingAccum.append(td.text());
+                            // 流式显示思考过程
+                            if (!messages.isEmpty()) {
+                                var msg = messages.getLast();
+                                if (msg.streaming()) {
+                                    messages.set(messages.size() - 1,
+                                        UIMessage.streamingThinking(thinkingAccum.toString()));
+                                }
+                            }
+                            needsRedraw = true;
+                        }
+                        case StreamEvent.ThinkingComplete ignored -> {
+                            // 思考完成，继续等待正文
+                        }
                         case StreamEvent.TextDelta td -> {
                             if (!firstTokenReceived) {
                                 firstTokenReceived = true;
                                 firstTokenMs = System.currentTimeMillis();
-                                // 替换过渡消息为正文
-                                replaceLastStreaming(td.text());
+                                // 替换过渡消息为正文（如有思考内容则保留）
+                                String think = thinkingAccum.toString();
+                                if (!think.isEmpty()) {
+                                    streamAccum.append(td.text());
+                                    messages.set(messages.size() - 1,
+                                        UIMessage.streamingWithThinking(think, streamAccum.toString()));
+                                } else {
+                                    replaceLastStreaming(td.text());
+                                }
                             } else {
                                 streamAccum.append(td.text());
                                 if (!messages.isEmpty()) {
                                     var msg = messages.getLast();
                                     if (msg.streaming()) {
-                                        messages.set(messages.size() - 1,
-                                            UIMessage.streaming(streamAccum.toString()));
+                                        String think = thinkingAccum.toString();
+                                        if (!think.isEmpty()) {
+                                            messages.set(messages.size() - 1,
+                                                UIMessage.streamingWithThinking(think, streamAccum.toString()));
+                                        } else {
+                                            messages.set(messages.size() - 1,
+                                                UIMessage.streaming(streamAccum.toString()));
+                                        }
                                     }
                                 }
                             }
                             needsRedraw = true;
                         }
-                        case StreamEvent.ThinkingDelta ignored -> {} // 丢弃
                         case StreamEvent.StreamEnd se -> {
                             // 流式结束，用 Markdown 重新渲染
                             String finalText = streamAccum.toString();
+                            String thinkText = thinkingAccum.toString();
                             long elapsed = (firstTokenReceived ? firstTokenMs : System.currentTimeMillis()) - streamStartMs;
                             double secs = Math.max(elapsed, 0) / 1000.0;
                             String rendered;
@@ -342,6 +373,12 @@ public class TerminalUI {
                                 rendered = MarkdownRenderer.render(finalText);
                             } catch (Exception e) {
                                 rendered = finalText;
+                            }
+                            // 如有思考内容，拼接在正文前
+                            if (!thinkText.isEmpty()) {
+                                String thinkBlock = DIM + ITALIC + "✻ Thinking…\n"
+                                    + thinkText + RESET + "\n\n";
+                                rendered = thinkBlock + rendered;
                             }
                             replaceLastStreamingWithFinal(rendered, secs);
                             conversation.addAssistantMessage(finalText);
@@ -856,7 +893,6 @@ public class TerminalUI {
 
         // 区块三：Compact（柱状图）
         y = panelHeader(buf, y, padX, maxW, "Compact");
-        y++;  // 标题和柱状图之间空一行
         y = panelBar(buf, y, padX, maxW, pct);
         y++;  // 柱状图和图例之间空一行
         // 图例
@@ -1069,6 +1105,23 @@ public class TerminalUI {
         static UIMessage streaming(String text) {
             return new UIMessage("assistant",
                     BOLD + CYAN + "DeveCode" + RESET + "\n" + text,
+                    null, true, false);
+        }
+
+        /** 流式显示思考过程（暗色斜体） */
+        static UIMessage streamingThinking(String thinkText) {
+            return new UIMessage("assistant",
+                    BOLD + CYAN + "DeveCode" + RESET + "\n" +
+                    DIM + ITALIC + "✻ Thinking…\n" + thinkText + RESET,
+                    null, true, false);
+        }
+
+        /** 流式显示思考过程 + 正文 */
+        static UIMessage streamingWithThinking(String thinkText, String responseText) {
+            return new UIMessage("assistant",
+                    BOLD + CYAN + "DeveCode" + RESET + "\n" +
+                    DIM + ITALIC + "✻ Thinking…\n" + thinkText + RESET + "\n\n" +
+                    responseText,
                     null, true, false);
         }
 
