@@ -17,6 +17,7 @@ import static org.jline.keymap.KeyMap.del;
 
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.lang.management.ManagementFactory;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -24,6 +25,7 @@ import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import com.sun.management.OperatingSystemMXBean;
 
 /**
  * 全功能终端 UI，承载输入、流式输出、多轮对话与状态展示。
@@ -35,6 +37,10 @@ public class TerminalUI {
 
     private static final String APP_NAME    = "DeveCode";
     private static final String APP_VERSION = "v1.0.0";
+
+    // ── 右侧状态面板 ──
+    private static final int PANEL_WIDTH = 36;
+    private static final int PANEL_MIN_COLS = 100;  // 终端宽度 >= 此值才显示面板
 
     // ── 终端 ──
     private final Terminal terminal;
@@ -70,6 +76,10 @@ public class TerminalUI {
     private volatile boolean needsRedraw = true;
     private volatile boolean terminalResized = false;
 
+    // ── 系统监控 ──
+    private final OperatingSystemMXBean osBean =
+            ManagementFactory.getPlatformMXBean(OperatingSystemMXBean.class);
+
     // --- UTF-8 multi-byte accumulator for Chinese/CJK input ---
     private int termWidth = 80;
     private int termHeight = 24;
@@ -91,6 +101,7 @@ public class TerminalUI {
     private static final String YELLOW  = ESC + "[33m";
     private static final String CYAN    = ESC + "[36m";
     private static final String GRAY    = ESC + "[90m";
+    private static final String WHITE   = ESC + "[97m";
     private static final String REVERSE = ESC + "[7m";
 
     // ── 入口 ──
@@ -600,7 +611,13 @@ public class TerminalUI {
         int rows = termHeight;
         int cols = termWidth;
 
-        // 布局：状态行(1) | 分隔(1) | 对话区 | 分隔(1) | 输入区 | 状态栏(1)
+        // 右侧状态面板：终端足够宽时显示
+        boolean showPanel = cols >= PANEL_MIN_COLS;
+        int panelW = showPanel ? PANEL_WIDTH : 0;
+        int leftCols = showPanel ? cols - panelW - 1 : cols;  // -1 给竖线分隔
+        int panelX = showPanel ? cols - panelW : 0;            // 面板起始列
+
+        // 布局：状态行(1) | 分隔(1) | {对话区 | 分隔(1) | 输入区} + 状态面板 | 状态栏(1)
         int statusRow = 0;
         int sep1Row = 1;
         int convStart = 2;
@@ -621,7 +638,7 @@ public class TerminalUI {
             }
         }
 
-        // ── 状态行 ──
+        // ── 状态行（全宽）──
         moveTo(buf, statusRow, 0);
         String statusLine;
         if (streaming) {
@@ -637,32 +654,50 @@ public class TerminalUI {
         buf.append("\033[K");
         buf.append(truncate(statusLine, cols));
 
-        // ── 分隔线1 ──
+        // ── 分隔线1（全宽）──
         moveTo(buf, sep1Row, 0);
         buf.append(GRAY).append(repeat('-', cols)).append(RESET);
 
-        // ── 对话区 ──
-        int convWidth = cols - 1;
-        renderConversation(buf, convStart, convEnd, convWidth, cols);
+        // ── 对话区（左侧）──
+        int convWidth = leftCols - 1;
+        renderConversation(buf, convStart, convEnd, convWidth, leftCols);
 
-        // ── 分隔线2 ──
+        // ── 分隔线2（仅左侧）──
         moveTo(buf, sep2Row, 0);
-        buf.append(GRAY).append(repeat('-', cols)).append(RESET);
+        buf.append("\033[K");
+        buf.append(GRAY).append(repeat('-', leftCols)).append(RESET);
 
-        // ── 输入区 ──
+        // ── 右侧状态面板 ──
+        if (showPanel) {
+            // 竖线分隔（从 convStart 到 statusBarRow-1）
+            for (int y = convStart; y < statusBarRow; y++) {
+                moveTo(buf, y, leftCols);
+                buf.append(GRAY).append('│').append(RESET);
+            }
+            renderStatusPanel(buf, convStart, statusBarRow - 1, leftCols + 1, panelW);
+        }
+
+        // ── 状态栏（全宽）──
         renderStatusBar(buf, statusBarRow, cols);
 
-        // ── 状态栏 ──
-        renderInputArea(buf, inputTop, inputHeight, cols);
+        // ── 输入区（仅左侧）── 最后渲染，确保光标定位在输入框
+        renderInputArea(buf, inputTop, inputHeight, leftCols);
 
         // 写入终端
         writer.print(buf.toString());
         writer.flush();
     }
 
+    /** 左侧可用宽度（扣除右侧面板和竖线） */
+    private int leftContentWidth() {
+        int cols = termWidth;
+        boolean showPanel = cols >= PANEL_MIN_COLS;
+        return showPanel ? cols - PANEL_WIDTH - 1 - 1 : cols - 1;
+    }
+
     private List<RenderLine> buildAllRenderLines() {
         List<RenderLine> allLines = new ArrayList<>();
-        int textWidth = Math.max(1, termWidth - 1);
+        int textWidth = Math.max(1, leftContentWidth());
         for (UIMessage msg : messages) { allLines.addAll(msg.toRenderLines(textWidth)); }
         return allLines;
     }
@@ -716,9 +751,10 @@ public class TerminalUI {
 
 
     private void renderInputArea(StringBuilder buf, int topRow, int height, int cols) {
+        // 只清空左侧区域，不擦掉右侧竖线和面板
         for (int y = topRow; y < topRow + height; y++) {
             moveTo(buf, y, 0);
-            buf.append("\033[K");
+            buf.append(repeat(' ', cols));
         }
 
         // ASCII border
@@ -769,6 +805,146 @@ public class TerminalUI {
             }
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  右侧状态面板
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * 渲染右侧系统状态监控面板。
+     * 区块化垂直堆叠，每块左侧有灰色竖线，用 ▰ 图标和颜色区隔。
+     */
+    private void renderStatusPanel(StringBuilder buf, int startRow, int endRow, int x, int width) {
+        // 先清空面板区域
+        for (int y = startRow; y <= endRow; y++) {
+            moveTo(buf, y, x);
+            buf.append("\033[K");
+        }
+
+        // ── 收集数据 ──
+        int usedTokens = estimateTokens();
+        int contextWindow = provider.resolvedContextWindow();
+        double pct = contextWindow > 0 ? usedTokens * 100.0 / contextWindow : 0;
+        double freePct = 100.0 - pct;
+        String modelName = provider.getModel();
+        if (modelName.length() > 18) modelName = modelName.substring(0, 17) + "…";
+
+        int cpuThreads = osBean.getAvailableProcessors();
+        double cpuLoad = osBean.getSystemCpuLoad() * 100;
+        if (cpuLoad < 0) cpuLoad = 0;
+
+        // ── 逐行渲染 ──
+        int y = startRow;
+        int padX = x + 1;    // 竖线位置
+        int maxW = width - 2; // 内容最大宽度
+
+        // 区块一：Context
+        y = panelHeader(buf, y, padX, maxW, "Context");
+        y = panelLine(buf, y, padX, maxW,
+                WHITE + BOLD + formatTokens(usedTokens) + RESET +
+                YELLOW + " (" + String.format("%.1f%%", pct) + ")" + RESET);
+        y++;
+
+        // 区块二：Context Detail
+        y = panelHeader(buf, y, padX, maxW, "Context Detail");
+        y = panelKV(buf, y, padX, maxW, "Context window:", formatTokens(contextWindow) + " (" + String.format("%.1f%%", pct) + ")");
+        y = panelKV(buf, y, padX, maxW, "Model:", modelName);
+        y = panelKV(buf, y, padX, maxW, "Mode:", "default");
+        y = panelKV(buf, y, padX, maxW, "MCP tools:", "0");
+        y = panelKV(buf, y, padX, maxW, "Free Space:", String.format("%.1f%%", freePct));
+        y++;
+
+        // 区块三：Compact（柱状图）
+        y = panelHeader(buf, y, padX, maxW, "Compact");
+        y++;  // 标题和柱状图之间空一行
+        y = panelBar(buf, y, padX, maxW, pct);
+        y++;  // 柱状图和图例之间空一行
+        // 图例
+        String usageColor = pct > 80 ? RED : (pct > 50 ? YELLOW : GREEN);
+        y = panelLine(buf, y, padX, maxW,
+                usageColor + "█" + RESET + GRAY + " usage  " + RESET +
+                GRAY + "░" + RESET + GRAY + " usable" + RESET);
+        y++;
+
+        // 区块四：Sandbox
+        y = panelHeader(buf, y, padX, maxW, "Sandbox");
+        y = panelKV(buf, y, padX, maxW, "Sandbox ID:", "212aab8b");
+        y = panelKV(buf, y, padX, maxW, "Status:", GREEN + "●" + RESET + WHITE + " active" + RESET);
+        y++;
+
+        // 区块五：MCP
+        y = panelHeader(buf, y, padX, maxW, "MCP");
+        y = panelKV(buf, y, padX, maxW, "servers:", "none");
+        y++;
+
+        // 区块六：CPU
+        y = panelHeader(buf, y, padX, maxW, "CPU");
+        y = panelKV(buf, y, padX, maxW, "Threads:", String.valueOf(cpuThreads));
+        y = panelKV(buf, y, padX, maxW, "Usage:", String.format("%.1f%%", cpuLoad));
+
+        // 页脚（固定在面板底部）
+        panelFooter(buf, endRow, padX, maxW, DIM + APP_NAME.toLowerCase() + " " + APP_VERSION + RESET);
+    }
+
+    /** 区块标题：│ ▰ Title（竖线 + 青色粗体） */
+    private int panelHeader(StringBuilder buf, int y, int x, int maxW, String title) {
+        moveTo(buf, y, x);
+        buf.append("\033[K");
+        buf.append(truncate(GRAY + "│ " + RESET + CYAN + BOLD + "▰ " + title + RESET, maxW));
+        return y + 1;
+    }
+
+    /** 水平柱状图：│ ████████░░░░░░ 22.2% */
+    private int panelBar(StringBuilder buf, int y, int x, int maxW, double pct) {
+        moveTo(buf, y, x);
+        buf.append("\033[K");
+
+        int barW = maxW - 10;  // 留给 │ + 空格 + 百分比
+        if (barW < 8) barW = 8;
+        int filled = (int) Math.round(pct * barW / 100.0);
+        if (filled > barW) filled = barW;
+        if (filled == 0 && pct > 0) filled = 1;  // 至少 1 格
+        int empty = barW - filled;
+
+        String usageColor = pct > 80 ? RED : (pct > 50 ? YELLOW : GREEN);
+        StringBuilder bar = new StringBuilder();
+        bar.append(GRAY).append("│ ").append(RESET);
+        bar.append(usageColor);
+        for (int i = 0; i < filled; i++) bar.append('█');
+        bar.append(RESET);
+        bar.append(GRAY);
+        for (int i = 0; i < empty; i++) bar.append('░');
+        bar.append(RESET);
+        bar.append(" ").append(YELLOW).append(String.format("%.1f%%", pct)).append(RESET);
+
+        buf.append(truncate(bar.toString(), maxW));
+        return y + 1;
+    }
+
+    /** 渲染面板中一行纯文本（带竖线前缀） */
+    private int panelLine(StringBuilder buf, int y, int x, int maxW, String content) {
+        moveTo(buf, y, x);
+        buf.append("\033[K");
+        buf.append(truncate(GRAY + "│ " + RESET + content, maxW));
+        return y + 1;
+    }
+
+    /** 渲染面板中一行键值对：│ · label: value */
+    private int panelKV(StringBuilder buf, int y, int x, int maxW, String label, String value) {
+        moveTo(buf, y, x);
+        buf.append("\033[K");
+        String line = GRAY + "│ · " + label + " " + RESET + WHITE + value + RESET;
+        buf.append(truncate(line, maxW));
+        return y + 1;
+    }
+
+    /** 渲染页脚（无竖线前缀，固定底部） */
+    private void panelFooter(StringBuilder buf, int y, int x, int maxW, String content) {
+        moveTo(buf, y, x);
+        buf.append("\033[K");
+        buf.append(truncate(content, maxW));
+    }
+
     private void renderStatusBar(StringBuilder buf, int row, int cols) {
         moveTo(buf, row, 0);
         buf.append("\033[K");
@@ -792,6 +968,26 @@ public class TerminalUI {
     private int countInputLines() {
         if (inputBuffer.isEmpty()) return 1;
         return inputBuffer.toString().split("\n", -1).length;
+    }
+
+    // ── Token 估算 ──
+    /** 粗略估算当前对话已消耗的 token 数（~4 字符/token） */
+    private int estimateTokens() {
+        int totalChars = 0;
+        for (var msg : conversation.getMessages()) {
+            String content = msg.getContent();
+            if (content != null) totalChars += content.length();
+        }
+        // 加上流式累积中的文本
+        if (streaming) totalChars += streamAccum.length();
+        return totalChars / 4;
+    }
+
+    /** 格式化 token 数为紧凑形式：1234 → "1.2K"，1000000 → "1.0M" */
+    private static String formatTokens(int tokens) {
+        if (tokens >= 1_000_000) return String.format("%.1fM", tokens / 1_000_000.0);
+        if (tokens >= 1_000) return String.format("%.1fK", tokens / 1_000.0);
+        return String.valueOf(tokens);
     }
 
     private static String repeat(char c, int n) {
