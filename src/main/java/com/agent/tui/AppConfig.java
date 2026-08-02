@@ -50,14 +50,14 @@ public class AppConfig {
     public static AppConfig load() {
         String yamlContent = null;
 
-        // 1. 尝试当前工作目录
+        // Step 1：定位 providers.yaml——优先当前工作目录，找不到再回退到 classpath
         Path cwdPath = Paths.get("providers.yaml");
         if (Files.exists(cwdPath)) {
             try { yamlContent = Files.readString(cwdPath); }
             catch (IOException e) { /* fall through */ }
         }
 
-        // 2. 尝试 classpath
+        // classpath 回退（打包成 jar 后从资源里读）
         if (yamlContent == null) {
             try (InputStream in = AppConfig.class.getClassLoader().getResourceAsStream("providers.yaml")) {
                 if (in != null) {
@@ -72,6 +72,7 @@ public class AppConfig {
             System.exit(1);
         }
 
+        // Step 2：用 SnakeYAML 把文本解析成 Map<String,Object> 根结构
         Yaml yaml = new Yaml();
         Map<String, Object> root;
         try {
@@ -82,6 +83,7 @@ public class AppConfig {
             return null; // unreachable
         }
 
+        // Step 3：校验顶层 "providers" 键存在且为非空列表
         if (root == null || !root.containsKey("providers")) {
             System.err.println("Error: providers.yaml must contain a top-level 'providers' key.");
             System.exit(1);
@@ -94,6 +96,7 @@ public class AppConfig {
             System.exit(1);
         }
 
+        // Step 4：逐条解析 provider，交由 parseProvider() 校验并构造 ProviderConfig
         List<ProviderConfig> parsed = new ArrayList<>();
         for (int i = 0; i < rawList.size(); i++) {
             Map<String, Object> item = rawList.get(i);
@@ -108,6 +111,15 @@ public class AppConfig {
         return new AppConfig(parsed);
     }
 
+    /**
+     * 解析单个 provider 条目并执行校验。
+     * 校验规则：
+     *   - name / protocol / model 必填（getString 第 3 参 required=true）
+     *   - protocol 取值只能是 "anthropic" 或 "openai"
+     *   - api_key 非必填于 yaml，但最终必须能解析到：来自 yaml 的 api_key，
+     *     或对应环境变量（ANTHROPIC_API_KEY / OPENAI_API_KEY），否则报错
+     *   - base_url / thinking 可选
+     */
     private static ProviderConfig parseProvider(int index, Map<String, Object> item) {
         String name = getString(item, "name", true);
         String protocol = getString(item, "protocol", true);
@@ -121,9 +133,11 @@ public class AppConfig {
             throw new ConfigException("protocol must be 'anthropic' or 'openai', got: " + protocol);
         }
 
+        // 构造 ProviderConfig：参数顺序 = (name, protocol, baseUrl, model, apiKey, thinking)；
+        // ProviderConfig 内部只做存储，resolvedApiKey() 负责按优先级解析真实密钥
         ProviderConfig cfg = new ProviderConfig(name, protocol, baseUrl, model, apiKey, thinking);
 
-        // 校验密钥存在
+        // 校验密钥存在：resolvedApiKey() 优先用 yaml 的 api_key，为空则回退到环境变量
         if (cfg.resolvedApiKey().isEmpty()) {
             throw new ConfigException(
                 "No API key found. Set api_key in yaml or via environment variable " +

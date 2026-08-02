@@ -1,11 +1,3 @@
-/*
- * @Author: lv jiang er hao devedmc@163.com
- * @Date: 2026-07-29 11:13:21
- * @LastEditors: lv jiang er hao devedmc@163.com
- * @LastEditTime: 2026-07-30 20:48:58
- * @FilePath: \tui\MarkdownRenderer.java
- * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
- */
 package com.agent.tui;
 
 import java.util.ArrayList;
@@ -68,6 +60,7 @@ public class MarkdownRenderer {
 
     public static String render(String markdown) {
         if (markdown == null || markdown.isEmpty()) return "";
+        // Step 1：按行切分 markdown（保留空行，limit=-1 避免丢弃尾部空行）
         String[] rawLines = markdown.split("\n", -1);
         List<String> out = new ArrayList<>();
         boolean inCode = false;
@@ -75,6 +68,7 @@ public class MarkdownRenderer {
         String codeLang = "";
 
         for (String line : rawLines) {
+            // Step 2：检测代码围栏边界（``` 开头的行），切换 inCode 状态
             Matcher fence = CODE_FENCE.matcher(line);
             if (!inCode && fence.matches()) {
                 inCode = true;
@@ -83,18 +77,21 @@ public class MarkdownRenderer {
                 continue;
             }
             if (inCode && line.trim().equals("```")) {
+                // Step 3：代码块结束——把累积的行交给 renderCodeBlock 带边框渲染
                 inCode = false;
                 renderCodeBlock(out, codeBuf.toString(), codeLang);
                 continue;
             }
             if (inCode) {
+                // Step 3：代码块内部——原样累积到 codeBuf，不做行内格式化
                 if (!codeBuf.isEmpty()) codeBuf.append("\n");
                 codeBuf.append(line);
                 continue;
             }
+            // Step 4：非代码行——委托 renderLine() 识别块级元素并做行内格式化
             out.add(renderLine(line));
         }
-        // 未闭合的代码块
+        // 未闭合的代码块（文末没有 ``` 收尾）也要渲染出来
         if (inCode) renderCodeBlock(out, codeBuf.toString(), codeLang);
         return String.join("\n", out);
     }
@@ -165,6 +162,8 @@ public class MarkdownRenderer {
     private static String renderInline(String text) {
         if (text == null || text.isEmpty()) return text;
         String r = text;
+        // 顺序敏感：先处理显式链接 [text](url)，把 url 消耗掉，否则 AUTO_LINK 会把
+        // 残留的 url 再匹配一次，导致同一段 url 被双重着色/嵌套 ANSI。
         r = replaceAll(r, LINK, BLUE + UNDER + "$1" + RESET);
         r = replaceAll(r, AUTO_LINK, BLUE + UNDER + "$1" + RESET);
         r = replaceAll(r, INLINE_CODE, CYAN + "$1" + RESET);
@@ -174,10 +173,14 @@ public class MarkdownRenderer {
         return r;
     }
 
+    /**
+     * 正则替换包装：等同于 String.replaceAll，但 replacement 中允许使用 $1 反向引用。
+     * 刻意不调用 Matcher.quoteReplacement——它会转义 $ 与 \，使 $1 失效；
+     * 我们依赖 $1 把捕获组（如链接文字、代码内容）原样插回着色串中。
+     */
     private static String replaceAll(String input, Pattern p, String replacement) {
         Matcher m = p.matcher(input);
         StringBuilder sb = new StringBuilder();
-        // 注意：不能用 Matcher.quoteReplacement，否则 $1 反向引用会被当字面量
         while (m.find()) {
             m.appendReplacement(sb, replacement);
         }

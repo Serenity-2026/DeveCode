@@ -68,6 +68,7 @@ public class DeveCodeApp {
             selected = showProviderSelector(providers);
         }
 
+        // 交接点：把选定的 provider 交给主聊天 UI，进入交互式对话循环
         TerminalUI.launch(selected);
     }
 
@@ -79,7 +80,7 @@ public class DeveCodeApp {
      *   │                                              │
      *   │   ASCII Logo         小狗图案                 │
      *   │   (5 行并排)                                   │
-     *   │   v0.1.0 · tagline    "Woof! ..."            │
+     *   │   v1.0.0 · tagline    "Woof! ..."            │
      *   │                                              │
      *   ├──────────────────────────────────────────────┤
      *   │                                              │
@@ -92,6 +93,7 @@ public class DeveCodeApp {
     private static ProviderConfig showProviderSelector(List<ProviderConfig> providers) {
         Terminal terminal = null;
         try {
+            // Step 1：初始化 JLine 终端，开启 raw 模式并忽略中断信号（Ctrl+C 由我们自己的键绑定接管）
             terminal = TerminalBuilder.builder()
                     .jna(true).system(true)
                     .signalHandler(Terminal.SignalHandler.SIG_IGN)
@@ -102,6 +104,7 @@ public class DeveCodeApp {
             int selectedIdx = 0;
             int n = providers.size();
 
+            // Step 2：注册键绑定——上/下导航、Enter 确认、Ctrl+C / q 退出（兼容多种转义序列）
             BindingReader bindingReader = new BindingReader(terminal.reader());
             KeyMap<String> keys = new KeyMap<>();
             keys.bind("up",    key(terminal, Capability.key_up),    "\033[A", "\033OA");
@@ -109,6 +112,7 @@ public class DeveCodeApp {
             keys.bind("enter", "\r", "\n");
             keys.bind("quit",  ctrl('C'), "\003", "q");
 
+            // Step 3：主渲染循环——清屏 → 渲染欢迎屏 → 读取按键 → 派发动作，直到确认或退出
             boolean quit = false;
             while (!quit) {
                 Integer hObj = terminal.getHeight();
@@ -138,7 +142,7 @@ public class DeveCodeApp {
                 }
             }
 
-            // 先恢复终端（退出 raw 模式、显示光标），再退出
+            // Step 4：清理——先恢复终端（退出 raw 模式、显示光标），再决定退出或返回选中项
             terminal.close();
 
             if (quit) {
@@ -356,6 +360,8 @@ public class DeveCodeApp {
         y = drawBoxRow(buf, y, left, right, "");
 
         // ── Provider 列表（整块左对齐）──
+        // ProviderConfig 三个展示用 getter：getName()=provider 显示名（如 "claude"）；
+        // getProtocol()=协议类型 "anthropic"/"openai"；getModel()=模型标识（如 "claude-sonnet-4-5"）
         int maxProviderW = 0;
         for (ProviderConfig p : providers) {
             int len = 2 + maxNameLen + 4 + p.getProtocol().length() + 3 + p.getModel().length();

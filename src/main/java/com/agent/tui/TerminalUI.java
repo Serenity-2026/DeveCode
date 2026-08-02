@@ -4,16 +4,6 @@ import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 
 import com.agent.*;
-import org.jline.terminal.Terminal;
-import org.jline.terminal.TerminalBuilder;
-import org.jline.utils.InfoCmp;
-import org.jline.utils.InfoCmp.Capability;
-import org.jline.keymap.BindingReader;
-import org.jline.keymap.KeyMap;
-import static org.jline.keymap.KeyMap.key;
-import static org.jline.keymap.KeyMap.ctrl;
-import static org.jline.keymap.KeyMap.alt;
-import static org.jline.keymap.KeyMap.del;
 
 import java.io.IOException;
 import java.io.PrintWriter;
@@ -24,14 +14,37 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
 import com.sun.management.OperatingSystemMXBean;
 
 /**
  * 全功能终端 UI，承载输入、流式输出、多轮对话与状态展示。
  *
- * 依赖 JLine Terminal 获取非规范输入 + ANSI 渲染。
- * 结构：输入线程 → 事件队列 → 主线程（渲染+状态机）。
+ * <h2>架构</h2>
+ * <pre>
+ *   ┌─────────────┐         ┌──────────────────┐
+ *   │ inputLoop   │──事件──→│ 主线程 (run)     │
+ *   │ (虚拟线程)  │  队列   │ ├─ handleEvent   │
+ *   │ 读取原始字节│         │ ├─ submitMessage │──→ LlmClient.stream()
+ *   └─────────────┘         │ ├─ render()      │←── StreamEvent 队列
+ *                           │ └─ 状态面板      │
+ *                           └──────────────────┘
+ * </pre>
+ *
+ * <h2>外部依赖</h2>
+ * <ul>
+ *   <li>{@link ProviderConfig} — provider 配置（名称、协议、模型、API Key、上下文窗口大小）</li>
+ *   <li>{@link LlmClient} — LLM 流式客户端，调用 {@code stream()} 返回 StreamEvent 队列</li>
+ *   <li>{@link ConversationManager} — 对话历史管理，维护发给 LLM 的消息列表</li>
+ *   <li>{@link StreamEvent} — 流式事件密封接口（ThinkingDelta/TextDelta/StreamEnd/Error）</li>
+ *   <li>{@link MarkdownRenderer} — 将 Markdown 转为带 ANSI 颜色的终端字符串</li>
+ * </ul>
+ *
+ * <h2>线程模型</h2>
+ * <ul>
+ *   <li>主线程：事件消费 + 渲染 + 状态机（16ms 节流 ≈ 60fps）</li>
+ *   <li>输入线程（虚拟）：阻塞读取终端字节，控制字符直接处理，可打印字符走队列</li>
+ *   <li>流式线程（虚拟）：每次 submitMessage 创建，消费 StreamEvent 队列</li>
+ * </ul>
  */
 public class TerminalUI {
 
@@ -46,10 +59,10 @@ public class TerminalUI {
     private final Terminal terminal;
     private final PrintWriter writer;
 
-    // ── 应用状态 ──
-    private final ProviderConfig provider;
-    private final LlmClient client;
-    private final ConversationManager conversation;
+    // ── 应用状态（外部依赖）──
+    private final ProviderConfig provider;       // 当前选中的 provider 配置
+    private final LlmClient client;              // LLM 流式客户端
+    private final ConversationManager conversation; // 对话历史管理器
 
     // ── 消息记录 ──
     private final List<UIMessage> messages = new ArrayList<>();
@@ -59,10 +72,7 @@ public class TerminalUI {
    private final StringBuilder inputBuffer = new StringBuilder();
    private int cursorCol = 0;
    private int cursorRow = 0;  // 多行光标行号（相对于输入第一行）
-    private boolean lastWasCR = false;   // 防止 Windows CRLF 被双重处理
    private final List<String> inputHistory = new ArrayList<>();
-    private int historyIdx = -1;
-    private String savedInput = null; // 浏览历史时暂存当前输入
 
     // ── 流式状态 ──
     private volatile boolean streaming = false;
@@ -82,7 +92,7 @@ public class TerminalUI {
     private final OperatingSystemMXBean osBean =
             ManagementFactory.getPlatformMXBean(OperatingSystemMXBean.class);
 
-    // --- UTF-8 multi-byte accumulator for Chinese/CJK input ---
+    // ── 终端尺寸（每次渲染前刷新）──
     private int termWidth = 80;
     private int termHeight = 24;
 
@@ -108,6 +118,12 @@ public class TerminalUI {
     private static final String REVERSE = ESC + "[7m";
 
     // ── 入口 ──
+
+    /**
+     * 启动终端 UI。由 {@link DeveCodeApp} 在 provider 选择完成后调用。
+     *
+     * @param provider 用户选中的 provider 配置（含 API Key、模型名、协议等）
+     */
     public static void launch(ProviderConfig provider) {
         try {
             new TerminalUI(provider).run();
@@ -118,21 +134,36 @@ public class TerminalUI {
         }
     }
 
+    /**
+     * 构造函数：初始化所有外部依赖和终端连接。
+     *
+     * 步骤：
+     *   1. 保存 provider 配置
+     *   2. 创建 JLine Terminal（JNA 模式 + 忽略默认信号处理）
+     *   3. 注册 SIGINT 处理器（Ctrl+C → 推入 Exit 事件）
+     *   4. 创建 LlmClient（传入 provider 配置 + 系统提示词）
+     *   5. 创建 ConversationManager（空对话历史）
+     *
+     * @param provider 用户选中的 provider 配置
+     */
     private TerminalUI(ProviderConfig provider) throws IOException {
         this.provider = provider;
+        // 步骤 2：JLine Terminal — JNA 提供原生终端控制，SIG_IGN 防止 Ctrl+C 直接杀进程
         this.terminal = TerminalBuilder.builder()
                 .jna(true)
                 .system(true)
                 .signalHandler(Terminal.SignalHandler.SIG_IGN)
                 .build();
-        // 信号处理器：捕获 Ctrl+C (SIGINT)，确保跨平台可靠退出
+        // 步骤 3：SIGINT 处理器 — Ctrl+C 时设置 running=false 并推入 Exit 事件
         this.terminal.handle(Terminal.Signal.INT, s -> {
             running = false;
             eventQueue.add(new UIEvent.Exit());
         });
         this.writer = terminal.writer();
+        // 步骤 4：LlmClient.create — 根据 provider 的 protocol（anthropic/openai）创建对应客户端
         this.client = LlmClient.create(provider,
                 "You are a helpful coding assistant. Respond concisely.");
+        // 步骤 5：ConversationManager — 管理对话历史，每次 addUserMessage/addAssistantMessage 会追加到内部列表
         this.conversation = new ConversationManager();
     }
 
@@ -226,30 +257,15 @@ public class TerminalUI {
     }
 
     /**
-     * 处理单键输入。
-     * Windows 终端 raw 模式下 Enter 发送 CR+LF 两个字节，
-     * 用 lastWasCR 标记防止重复提交。
+     * 处理可打印字符输入（由主线程从事件队列消费）。
+     *
+     * 注意：Enter、Backspace、Ctrl+C、Ctrl+P 等控制字符在 inputLoop 中直接处理，
+     * 不会到达此方法。此处只处理 ch >= 32 的可打印字符（含中日韩）。
      */
     private void handleKeyTyped(int ch) {
         inputHistory.removeIf(String::isEmpty);
-        historyIdx = -1;
-        savedInput = null;
-
-        if (ch == '\b' || ch == 127) {          // Backspace
-            handleBackspace();
-        } else if (ch == '\r') {                 // Enter (CR) - Windows
-            handleEnter();
-            lastWasCR = true;
-        } else if (ch == '\n') {                 // LF - skip if follows CR
-            if (lastWasCR) { lastWasCR = false; return; }
-            handleEnter();
-        } else if (ch == 3) {                    // Ctrl+C
-            eventQueue.add(new UIEvent.Exit());
-        } else if (ch >= 32) {                    // printable (including CJK)
-            lastWasCR = false;
-            inputBuffer.insert(linearPos(), String.valueOf((char) ch));
-            cursorCol++;
-        }
+        inputBuffer.insert(linearPos(), String.valueOf((char) ch));
+        cursorCol++;
         needsRedraw = true;
     }
 
@@ -265,16 +281,6 @@ public class TerminalUI {
             }
         }
         needsRedraw = true;
-    }
-
-    private void handleEnter() {
-        if (!streaming) {
-            String text = inputBuffer.toString();
-            if (!text.isBlank()) {
-                inputHistory.add(text);
-            }
-            eventQueue.add(new UIEvent.Submit(text));
-        }
     }
 
     // 将 (row, col) 转成线性位置
@@ -298,6 +304,22 @@ public class TerminalUI {
     //  消息提交 & 流式接收
     // ═══════════════════════════════════════════════════════════════
 
+    /**
+     * 提交用户消息并启动流式接收。
+     *
+     * 步骤：
+     *   1. 添加用户消息到 UI 列表和 ConversationManager
+     *   2. 重置输入缓冲区和流式状态
+     *   3. 添加 "Imagining…" 占位消息
+     *   4. 启动虚拟线程消费 StreamEvent 队列：
+     *      a. ThinkingDelta → 累积思考内容，流式显示（浅灰色）
+     *      b. ThinkingComplete → 显示 "✻ Done" 结束标记
+     *      c. TextDelta → 累积正文，替换占位消息
+     *      d. StreamEnd → 用 MarkdownRenderer 渲染最终文本，保存到 ConversationManager
+     *      e. Error → 显示错误消息
+     *
+     * @param text 用户输入的文本
+     */
     private void submitMessage(String text) {
         if (text == null || text.isBlank()) return;
 
@@ -307,7 +329,7 @@ public class TerminalUI {
             return;
         }
 
-        // 添加用户消息
+        // 步骤 1：添加用户消息到 UI 列表 + ConversationManager（后者会追加到发给 LLM 的消息列表）
         messages.add(UIMessage.user(text));
         conversation.addUserMessage(text);
         inputBuffer.setLength(0);
@@ -315,16 +337,18 @@ public class TerminalUI {
         cursorRow = 0;
         scrollToBottom();
 
-        // 开启流式
+        // 步骤 2：重置流式状态
         streaming = true;
         firstTokenReceived = false;
         streamAccum.setLength(0);
         thinkingAccum.setLength(0);
         streamStartMs = System.currentTimeMillis();
 
-        // 异步启动请求
+        // 步骤 4：启动虚拟线程消费 StreamEvent 队列
         Thread.startVirtualThread(() -> {
             try {
+                // 调用 LlmClient.stream() — 发送对话历史给 LLM，返回 StreamEvent 阻塞队列
+                // 第二个参数是 tools 列表（目前传空列表，未接入 MCP 工具）
                 BlockingQueue<StreamEvent> events = client.stream(conversation, new ArrayList<>());
                 while (true) {
                     StreamEvent evt = events.take();
@@ -382,18 +406,19 @@ public class TerminalUI {
                             needsRedraw = true;
                         }
                         case StreamEvent.StreamEnd se -> {
-                            // 流式结束，用 Markdown 重新渲染
+                            // 步骤 4d：流式结束 — 用 MarkdownRenderer 渲染最终文本
                             String finalText = streamAccum.toString();
                             String thinkText = thinkingAccum.toString();
                             long elapsed = (firstTokenReceived ? firstTokenMs : System.currentTimeMillis()) - streamStartMs;
                             double secs = Math.max(elapsed, 0) / 1000.0;
                             String rendered;
                             try {
+                                // MarkdownRenderer.render — 将 Markdown 转为带 ANSI 颜色的终端字符串
                                 rendered = MarkdownRenderer.render(finalText);
                             } catch (Exception e) {
-                                rendered = finalText;
+                                rendered = finalText;  // 渲染失败时回退为纯文本
                             }
-                            // 如有思考内容，拼接在正文前
+                            // 如有思考内容，拼接在正文前（浅灰色思考块 + 正文）
                             if (!thinkText.isEmpty()) {
                                 String thinkBlock = GRAY + "✻ Thinking…" + RESET + "\n"
                                     + UIMessage.grayLines(thinkText) + "\n"
@@ -401,6 +426,7 @@ public class TerminalUI {
                                 rendered = thinkBlock + rendered;
                             }
                             replaceLastStreamingWithFinal(rendered, secs);
+                            // 将原始文本（不含 ANSI/Markdown）存入 ConversationManager，供下一轮对话发给 LLM
                             conversation.addAssistantMessage(finalText);
                             streaming = false;
                             needsRedraw = true;
@@ -426,11 +452,15 @@ public class TerminalUI {
             }
         });
 
-        // 添加"等待中"占位消息
+        // 步骤 3：添加 "Imagining…" 占位消息（在虚拟线程启动后添加，避免竞态）
         messages.add(UIMessage.streaming("Imagining… (0s)"));
         needsRedraw = true;
     }
 
+    /**
+     * 替换最后一条流式消息的内容，同时追加到 streamAccum。
+     * 仅在首个 TextDelta 到达且无思考内容时调用。
+     */
     private void replaceLastStreaming(String text) {
         if (!messages.isEmpty()) {
             var last = messages.getLast();
@@ -441,6 +471,12 @@ public class TerminalUI {
         }
     }
 
+    /**
+     * 流式结束后，将最后一条流式消息替换为最终渲染结果（含时间标签）。
+     *
+     * @param rendered  MarkdownRenderer 渲染后的 ANSI 字符串
+     * @param totalSecs 从请求开始到首 token（或结束）的耗时
+     */
     private void replaceLastStreamingWithFinal(String rendered, double totalSecs) {
         if (!messages.isEmpty()) {
             var last = messages.getLast();
@@ -460,12 +496,18 @@ public class TerminalUI {
     //  输入处理（后台线程）
     // ═══════════════════════════════════════════════════════════════
 
-    // Operations recognized by the input BindingReader.
-    private enum Op {
-        INSERT, ENTER, ALT_ENTER, BACKSPACE, DELETE,
-        LEFT, RIGHT, UP, DOWN, HOME, END, CTRL_C
-    }
-
+    /**
+     * 后台输入线程：阻塞读取终端原始字节，解析为按键事件。
+     *
+     * 处理流程：
+     *   1. 读取一个字节
+     *   2. 若为 ESC (0x1B)：解析 CSI / SS3 转义序列（方向键、PageUp/Down、Home/End、Delete）
+     *   3. 若为控制字符（CR/LF/Backspace/Ctrl+C/Ctrl+P）：直接处理
+     *   4. 若为可打印字符（>= 32 或 Tab）：封装为 KeyTyped 事件推入队列
+     *
+     * 注意：控制字符直接处理，不经过事件队列，确保响应即时。
+     *      可打印字符走队列，由主线程的 handleKeyTyped 处理。
+     */
     private void inputLoop() {
         try {
             var reader = (org.jline.utils.NonBlockingReader) terminal.reader();
@@ -537,7 +579,7 @@ public class TerminalUI {
 
                 // --- Control characters ---
                 if (ch == '\r' || ch == '\n') {
-                    handleEnterKey();
+                    handleEnter();
                     continue;
                 }
                 if (ch == '\b' || ch == 127) {
@@ -567,8 +609,11 @@ public class TerminalUI {
         }
     }
 
-    /** Handle Enter key without KeyTyped double-CRLF issues. */
-    private void handleEnterKey() {
+    /**
+     * 处理 Enter 键提交：将输入缓冲区内容封装为 Submit 事件推入队列。
+     * 由 inputLoop 直接调用（不经过 KeyTyped 事件，避免 Windows CRLF 双触发）。
+     */
+    private void handleEnter() {
         if (!streaming) {
             String text = inputBuffer.toString();
             if (!text.isBlank()) {
@@ -582,28 +627,6 @@ public class TerminalUI {
         inputBuffer.insert(linearPos(), '\n');
         cursorRow++;
         cursorCol = 0;
-        needsRedraw = true;
-    }
-
-    private void handleHistoryUp() {
-        if (inputHistory.isEmpty()) return;
-        if (historyIdx == -1) savedInput = inputBuffer.toString();
-        if (historyIdx < inputHistory.size() - 1) {
-            historyIdx++;
-            setInput(inputHistory.get(inputHistory.size() - 1 - historyIdx));
-        }
-        needsRedraw = true;
-    }
-
-    private void handleHistoryDown() {
-        if (historyIdx <= 0) {
-            historyIdx = -1;
-            setInput(savedInput != null ? savedInput : "");
-            savedInput = null;
-        } else {
-            historyIdx--;
-            setInput(inputHistory.get(inputHistory.size() - 1 - historyIdx));
-        }
         needsRedraw = true;
     }
 
@@ -648,13 +671,6 @@ public class TerminalUI {
         }
     }
 
-    private void setInput(String text) {
-        inputBuffer.setLength(0);
-        inputBuffer.append(text);
-        cursorCol = 0;
-        cursorRow = 0;
-    }
-
     // ═══════════════════════════════════════════════════════════════
     //  渲染
     // ═══════════════════════════════════════════════════════════════
@@ -665,6 +681,25 @@ public class TerminalUI {
         return Math.max(1, n);
     }
 
+    /**
+     * 全屏渲染：将整个终端画面一次性写入 StringBuilder 再 flush。
+     *
+     * 布局（从上到下）：
+     *   ┌────────────────────────────────────────────────┬───────────┐
+     *   │ 状态行 (全宽)                                    │           │ row 0
+     *   │ ──────────────────────────────────────────────  │           │ row 1 (分隔线)
+     *   │                                                │  右侧     │
+     *   │  对话区 (左侧)                                  │  状态     │ rows 2~sep2-1
+     *   │  (消息列表 + 滚动条)                            │  面板     │
+     *   │                                                │           │
+     *   │ ──────────────────────────────────────────────  │           │ sep2 (分隔线)
+     *   │  输入区 (左侧, ASCII 边框)                      │           │ sep2+1~statusBar-1
+     *   │ provider名                          model名    │           │ statusBar (反白)
+     *   └────────────────────────────────────────────────┴───────────┘
+     *
+     * 渲染顺序：状态行 → 分隔线1 → 对话区 → 分隔线2 → 状态面板 → 状态栏 → 输入区
+     * 输入区最后渲染，确保光标最终定位在输入框内。
+     */
     private void render() {
         StringBuilder buf = new StringBuilder(4096);
         buf.append(CURSOR_HIDE);
@@ -885,9 +920,11 @@ public class TerminalUI {
 
         // ── 收集数据 ──
         int usedTokens = estimateTokens();
+        // provider.resolvedContextWindow() — 从 ProviderConfig 获取上下文窗口大小（如 200000）
         int contextWindow = provider.resolvedContextWindow();
         double pct = contextWindow > 0 ? usedTokens * 100.0 / contextWindow : 0;
         double freePct = 100.0 - pct;
+        // provider.getModel() — 从 ProviderConfig 获取模型名（如 "deepseek-v4-flash"）
         String modelName = provider.getModel();
         if (modelName.length() > 18) modelName = modelName.substring(0, 17) + "…";
 
@@ -1032,14 +1069,24 @@ public class TerminalUI {
     }
 
     // ── Token 估算 ──
-    /** 粗略估算当前对话已消耗的 token 数（~4 字符/token） */
+
+    /**
+     * 粗略估算当前对话已消耗的 token 数（~4 字符/token）。
+     *
+     * 数据来源：
+     *   - ConversationManager.getMessages()：已完成的对话历史
+     *   - streamAccum：当前流式输出中尚未完成的文本
+     *
+     * 用于右侧状态面板的 Context 占用率显示。
+     */
     private int estimateTokens() {
         int totalChars = 0;
+        // conversation.getMessages() 返回的是发给 LLM 的消息列表（Message 类型）
         for (var msg : conversation.getMessages()) {
             String content = msg.getContent();
             if (content != null) totalChars += content.length();
         }
-        // 加上流式累积中的文本
+        // 加上流式累积中的文本（尚未存入 ConversationManager）
         if (streaming) totalChars += streamAccum.length();
         return totalChars / 4;
     }
@@ -1106,6 +1153,15 @@ public class TerminalUI {
         for (int i = 0; i < stripped.length(); i++) len += displayCharWidth(stripped.charAt(i));
         return len;
     }
+    /**
+     * UI 消息记录。封装一条消息在终端中显示所需的全部信息。
+     *
+     * @param role      消息角色："user" / "assistant" / "error" / "banner"
+     * @param content   已格式化的内容（含 ANSI 颜色码），按 \n 分行
+     * @param timeLabel 时间标签（如 "14:30"），显示在首行前；null 表示不显示
+     * @param streaming 是否为流式进行中的消息（true 时不加空行分隔）
+     * @param error     是否为错误消息
+     */
     private record UIMessage(String role, String content, String timeLabel, boolean streaming, boolean error) {
         private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
 
@@ -1274,9 +1330,18 @@ public class TerminalUI {
 
     }
 
+    /** 渲染行：text 含 ANSI 颜色码，style 预留（目前未使用） */
     private record RenderLine(String text, String style) {}
 
-    /** 输入线程 → 主线程的事件 */
+    /**
+     * 输入线程 → 主线程的事件（密封接口）。
+     *
+     * 事件类型：
+     *   - KeyTyped：可打印字符（ch >= 32 或 Tab），由主线程 handleKeyTyped 处理
+     *   - Submit：用户按 Enter 提交的文本，由主线程 submitMessage 处理
+     *   - TerminalResize：终端尺寸变化（目前由 readTerminalSize 轮询检测，此事件未使用）
+     *   - Exit：退出请求（Ctrl+C 或 EOF）
+     */
     private sealed interface UIEvent {
         record KeyTyped(int ch) implements UIEvent {}
         record Submit(String text) implements UIEvent {}
