@@ -16,6 +16,7 @@ public interface LlmClient {
     static LlmClient create(ProviderConfig cfg, String systemPrompt) {
         return switch (cfg.getProtocol()) {
             case "anthropic" -> new AnthropicCodeClient(cfg, systemPrompt);
+            case "openai" -> new OpenAiClient(cfg, systemPrompt);
             default -> throw new IllegalArgumentException("Unknown protocol: " + cfg.getProtocol());
         };
     }

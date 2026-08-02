@@ -117,46 +117,57 @@ public class ConversationManager {
                 ? serializeAnthropic()
                 : serializeOpenAI();
     }
-    //将历史消息history转为OpenAI标准
+    //将历史消息history转为OpenAI Chat Completions标准格式
+    //OpenAI 的消息格式与 Anthropic 有三大区别：
+    //  1. 每条消息必须有顶层 role 字段（user/assistant/tool/system）
+    //  2. 工具调用放在 assistant 消息的 tool_calls 数组里，结构为 {id, type:"function", function:{name, arguments}}
+    //     其中 arguments 是 JSON 字符串而非嵌套对象
+    //  3. 工具执行结果用独立的 role="tool" 消息发送，携带 tool_call_id 关联到对应的工具调用
+    //  4. OpenAI 标准 API 不支持 thinking 块（reasoning 内容只在响应中出现，不需要回传），故不序列化思考内容
     public List<Map<String, Object>> serializeOpenAI() {
-        var content=new ArrayList<Map<String,Object>>();
+        var messages = new ArrayList<Map<String, Object>>();
         for (Message msg : history) {
-            if(msg.hasThinking()){
-                //1.添加thinking块
-                for (var tb : msg.getThinkingBlocks()) {
-                    content.add(Map.of(
-                            "type", "thinking",
-                            "thinking", tb.thinking(),
-                            "signature", tb.signature()));
+            //优先处理工具结果消息：OpenAI 用 role="tool" + tool_call_id + content
+            //一条 user 消息可能携带多个 ToolResultBlock（对应多个并发工具调用），每个都拆成独立的 tool 消息
+            if (msg.getToolResults() != null && !msg.getToolResults().isEmpty()) {
+                for (var tr : msg.getToolResults()) {
+                    var toolMsg = new LinkedHashMap<String, Object>();
+                    toolMsg.put("role", "tool");
+                    toolMsg.put("tool_call_id", tr.toolUseId());
+                    toolMsg.put("content", tr.content() != null ? tr.content() : "");
+                    messages.add(toolMsg);
                 }
+                //如果同一条消息还附带文本内容，作为额外的 user 消息发送
+                if (msg.getContent() != null && !msg.getContent().isEmpty()) {
+                    messages.add(Map.of("role", "user", "content", msg.getContent()));
+                }
+                continue;
             }
-            //2.添加text
-            if(msg.getContent()!=null&&!msg.getContent().isEmpty()){
-                content.add(Map.of(
-                        "type", "text",
-                        "text", msg.getContent()));
-            }
-            //3.添加tool_use,有可能存在发起函数调用但无参数的情况，因此用LinkedHashMap单独构建
-            //和 Anthropic 最大的区别是:工具调用的参数需要序列化成JSON字符串,而不是直接嵌套Map对象.Anthropic的input字段接受嵌套JSON对象,
-            // OpenAI 的 arguments 字段只接受字符串。所以这里多了一步 MAPPER.writeValueAsString() 。
+            //普通消息（user/assistant）
+            var message = new LinkedHashMap<String, Object>();
+            message.put("role", msg.getRole() != null ? msg.getRole() : "user");
+            message.put("content", msg.getContent() != null ? msg.getContent() : "");
+            //工具调用：OpenAI 的 tool_calls 结构，arguments 需序列化成 JSON 字符串
             if (msg.hasToolUses()) {
+                var toolCalls = new ArrayList<Map<String, Object>>();
                 for (var tu : msg.getToolUses()) {
                     String argsJson;
                     try { argsJson = MAPPER.writeValueAsString(tu.arguments()); }
                     catch (JsonProcessingException e) { argsJson = "{}"; }
-                    var item = new LinkedHashMap<String, Object>();
-                    item.put("type", "function_call");
-                    item.put("name", tu.toolName());
-                    item.put("call_id", tu.toolUseId());
-                    item.put("arguments", argsJson);
-                    content.add(item);
+                    var tc = new LinkedHashMap<String, Object>();
+                    tc.put("id", tu.toolUseId());
+                    tc.put("type", "function");
+                    var fn = new LinkedHashMap<String, Object>();
+                    fn.put("name", tu.toolName());
+                    fn.put("arguments", argsJson);
+                    tc.put("function", fn);
+                    toolCalls.add(tc);
                 }
-
-
+                message.put("tool_calls", toolCalls);
+            }
+            messages.add(message);
         }
-
-    }
-        return content;
+        return messages;
     }
     //将历史消息history转为Anthropic标准,按顺序放 thinking、text、tool_use 块。
     /*

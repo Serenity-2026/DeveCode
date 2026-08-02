@@ -13,13 +13,13 @@ public class Main {
                 "deepseek-v4-flash",
                 "sk-c39ba4ff31ac42ae8fa5d6a20451c66f",
                 true);
-        AnthropicCodeClient anthropicCodeClient= (AnthropicCodeClient) LlmClient.create(config,"你是一个代码编写助手");
+        LlmClient client = LlmClient.create(config,"你是一个代码编写助手");
         ConversationManager conversationManager = new ConversationManager();
         conversationManager.addUserMessage("我想使用java编写一个冒泡排序代码");
-        BlockingQueue<StreamEvent> events = anthropicCodeClient.stream(conversationManager, new ArrayList<>());
+        BlockingQueue<StreamEvent> events = client.stream(conversationManager, new ArrayList<>());
         conversationManager.addAssistantMessage(extracted(events).toString());
         conversationManager.addUserMessage("变成python实现");
-        BlockingQueue<StreamEvent> events2 = anthropicCodeClient.stream(conversationManager, new ArrayList<>());
+        BlockingQueue<StreamEvent> events2 = client.stream(conversationManager, new ArrayList<>());
         extracted(events2);
     }
 
