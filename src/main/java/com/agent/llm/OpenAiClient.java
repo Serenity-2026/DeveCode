@@ -1,5 +1,8 @@
-package com.agent;
+package com.agent.llm;
 
+import com.agent.infra.ProviderConfig;
+import com.agent.infra.LlmException;
+import com.agent.history.ConversationManager;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.BufferedReader;

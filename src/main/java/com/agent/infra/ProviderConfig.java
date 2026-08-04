@@ -1,4 +1,4 @@
-package com.agent;
+package com.agent.infra;
 
 import java.util.Map;
 //配置解析类

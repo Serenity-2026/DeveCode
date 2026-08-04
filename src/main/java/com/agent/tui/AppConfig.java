@@ -1,6 +1,6 @@
 package com.agent.tui;
 
-import com.agent.ProviderConfig;
+import com.agent.infra.ProviderConfig;
 import org.yaml.snakeyaml.Yaml;
 
 import java.io.IOException;

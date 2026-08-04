@@ -1,5 +1,9 @@
-package com.agent;
+package com.agent.history;
 
+import com.agent.llm.Message;
+import com.agent.llm.ThinkingBlock;
+import com.agent.llm.ToolResultBlock;
+import com.agent.llm.ToolUseBlock;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 

@@ -1,9 +1,12 @@
-package com.agent;
+package com.agent.llm;
 
+import com.agent.infra.ModelResolver;
+import com.agent.infra.ProviderConfig;
+import com.agent.infra.LlmException;
+import com.agent.history.ConversationManager;
 import com.anthropic.client.AnthropicClient;
 import com.anthropic.client.okhttp.AnthropicOkHttpClient;
 import com.anthropic.errors.*;
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.BufferedReader;
@@ -20,7 +23,7 @@ import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 
-public class AnthropicCodeClient implements LlmClient{
+public class AnthropicCodeClient implements LlmClient {
 
     private final String model;
     private final boolean thinking;

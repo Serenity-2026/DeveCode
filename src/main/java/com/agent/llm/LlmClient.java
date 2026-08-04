@@ -1,5 +1,8 @@
-package com.agent;
+package com.agent.llm;
 
+
+import com.agent.history.ConversationManager;
+import com.agent.infra.ProviderConfig;
 
 import java.util.List;
 import java.util.Map;

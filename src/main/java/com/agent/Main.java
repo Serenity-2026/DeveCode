@@ -1,8 +1,12 @@
 package com.agent;
 
+import com.agent.history.ConversationManager;
+import com.agent.infra.ProviderConfig;
+import com.agent.llm.LlmClient;
+import com.agent.llm.StreamEvent;
+
 import java.util.ArrayList;
 import java.util.concurrent.BlockingQueue;
-import java.util.function.Consumer;
 
 public class Main {
     public static void main(String[] args) throws InterruptedException {

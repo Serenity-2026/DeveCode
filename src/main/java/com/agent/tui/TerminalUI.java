@@ -1,9 +1,11 @@
 package com.agent.tui;
 
+import com.agent.history.ConversationManager;
+import com.agent.infra.ProviderConfig;
+import com.agent.llm.LlmClient;
+import com.agent.llm.StreamEvent;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
-
-import com.agent.*;
 
 import java.io.IOException;
 import java.io.PrintWriter;
