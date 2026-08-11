@@ -58,6 +58,7 @@ public class FileStateCache {
             // File might have been deleted; let the caller's own exists-check handle it
             return null;
         }
+        //说明在read后有修改,需要重新读取
         if (currentMtime > state.mtimeMs()) {
             return "Error: file has been modified since last read. Read it again before editing.";
         }
