@@ -17,7 +17,7 @@ public class FileStateCache {
     public record FileState(String content, long mtimeMs) {}
     //多工具调用，保障线程安全
     private final ConcurrentHashMap<String, FileState> cache = new ConcurrentHashMap<>();
-
+    //ReadFile后记录
     public void record(String absPath, String content, long mtimeMs) {
         cache.put(absPath, new FileState(content, mtimeMs));
     }
