@@ -87,6 +87,11 @@ public class BashTool implements Tool {
     }
 
     @Override
+    public boolean shouldDefer() {
+        return true;
+    }
+
+    @Override
     public Map<String, Object> schema() {
         return Map.of(
                 "name", name(),
