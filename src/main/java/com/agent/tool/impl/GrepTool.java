@@ -93,7 +93,9 @@ public class GrepTool implements Tool {
                 ? null
                 : FileSystems.getDefault().getPathMatcher("glob:" + include);
 
-        // Collect files first, then sort for deterministic output
+        // 先收集再搜索,得到确定性输出:
+        //同一项目在不同OS上搜索，结果顺序不同:
+        //边遍历边搜时截断:截断发生在"文件系统遍历顺序靠后"的文件中,不可预测.同一项目两次搜索,截断位置可能不同。
         var files = new ArrayList<Path>();
         try {
             //先收集所有满足要求的文件
