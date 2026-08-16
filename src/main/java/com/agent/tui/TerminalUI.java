@@ -4,6 +4,15 @@ import com.agent.history.ConversationManager;
 import com.agent.infra.ProviderConfig;
 import com.agent.llm.LlmClient;
 import com.agent.llm.StreamEvent;
+import com.agent.llm.ThinkingBlock;
+import com.agent.llm.ToolUseBlock;
+import com.agent.llm.ToolResultBlock;
+import com.agent.tool.Tool;
+import com.agent.tool.ToolRegistry;
+import com.agent.tool.ToolResult;
+import com.agent.tool.FileHistory;
+import com.agent.tool.FileStateCache;
+import com.agent.tool.impl.ToolSearchTool;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 
@@ -13,7 +22,9 @@ import java.lang.management.ManagementFactory;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import com.sun.management.OperatingSystemMXBean;
@@ -65,6 +76,9 @@ public class TerminalUI {
     private final ProviderConfig provider;       // 当前选中的 provider 配置
     private final LlmClient client;              // LLM 流式客户端
     private final ConversationManager conversation; // 对话历史管理器
+    private final ToolRegistry toolRegistry;     // 工具注册中心
+    private final FileHistory fileHistory;       // 文件编辑历史（备份/快照/回退）
+    private final FileStateCache fileStateCache; // 先读后改强制缓存
 
     // ── 消息记录 ──
     private final List<UIMessage> messages = new ArrayList<>();
@@ -167,6 +181,22 @@ public class TerminalUI {
                 "You are a helpful coding assistant. Respond concisely.");
         // 步骤 5：ConversationManager — 管理对话历史，每次 addUserMessage/addAssistantMessage 会追加到内部列表
         this.conversation = new ConversationManager();
+        // 步骤 6：初始化工具基础设施
+        // FileStateCache — 记录 ReadFile 读取过的文件内容和 mtime，EditFile/WriteFile 据此强制"先读后改"
+        this.fileStateCache = new FileStateCache();
+        // FileHistory — 文件编辑备份/快照管理，每次 AI 轮次结束时打快照，支持回退
+        String sessionId = java.util.UUID.randomUUID().toString().substring(0, 8);
+        this.fileHistory = new FileHistory(System.getProperty("user.dir"), sessionId);
+        // ToolRegistry — 用 createDefault() 创建所有工具，再通过 getTool() 注入依赖
+        this.toolRegistry = ToolRegistry.createDefault();
+        // 向需要文件依赖的工具注入 FileHistory / FileStateCache
+        ((com.agent.tool.impl.ReadFileTool) toolRegistry.getTool("ReadFile")).setFileStateCache(fileStateCache);
+        ((com.agent.tool.impl.EditFileTool) toolRegistry.getTool("EditFile")).setFileHistory(fileHistory);
+        ((com.agent.tool.impl.EditFileTool) toolRegistry.getTool("EditFile")).setFileStateCache(fileStateCache);
+        ((com.agent.tool.impl.WriteFileTool) toolRegistry.getTool("WriteFile")).setFileHistory(fileHistory);
+        ((com.agent.tool.impl.WriteFileTool) toolRegistry.getTool("WriteFile")).setFileStateCache(fileStateCache);
+        // ToolSearchTool 需要持有 registry 引用，用于延迟工具发现
+        toolRegistry.register(new ToolSearchTool(toolRegistry, provider.getProtocol()));
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -307,18 +337,20 @@ public class TerminalUI {
     // ═══════════════════════════════════════════════════════════════
 
     /**
-     * 提交用户消息并启动流式接收。
+     * 提交用户消息并启动 Agent Loop。
      *
-     * 步骤：
-     *   1. 添加用户消息到 UI 列表和 ConversationManager
-     *   2. 重置输入缓冲区和流式状态
-     *   3. 添加 "Imagining…" 占位消息
-     *   4. 启动虚拟线程消费 StreamEvent 队列：
-     *      a. ThinkingDelta → 累积思考内容，流式显示（浅灰色）
-     *      b. ThinkingComplete → 显示 "✻ Done" 结束标记
-     *      c. TextDelta → 累积正文，替换占位消息
-     *      d. StreamEnd → 用 MarkdownRenderer 渲染最终文本，保存到 ConversationManager
-     *      e. Error → 显示错误消息
+     * Agent Loop 是 Coding Agent 的核心循环：
+     *   1. 添加用户消息 → 发送给 LLM（携带工具列表）
+     *   2. 流式接收响应：思考、正文、工具调用
+     *   3. 如果 LLM 请求工具调用（stopReason=tool_use）：
+     *      a. 保存助手消息（含 tool_uses）到对话历史
+     *      b. 逐个执行工具，展示结果
+     *      c. 将工具结果添加到对话历史
+     *      d. 回到步骤 2，继续下一轮
+     *   4. 如果 LLM 自然结束（stopReason=end_turn）：
+     *      a. 渲染最终 Markdown，保存到对话历史
+     *      b. 打文件快照（FileHistory.makeSnapshot）
+     *      c. 退出循环
      *
      * @param text 用户输入的文本
      */
@@ -331,7 +363,7 @@ public class TerminalUI {
             return;
         }
 
-        // 步骤 1：添加用户消息到 UI 列表 + ConversationManager（后者会追加到发给 LLM 的消息列表）
+        // 添加用户消息到 UI 列表 + ConversationManager
         messages.add(UIMessage.user(text));
         conversation.addUserMessage(text);
         inputBuffer.setLength(0);
@@ -339,154 +371,309 @@ public class TerminalUI {
         cursorRow = 0;
         scrollToBottom();
 
-        // 步骤 2：重置流式状态
+        // 启动流式状态
         streaming = true;
-        firstTokenReceived = false;
-        streamAccum.setLength(0);
-        thinkingAccum.setLength(0);
-        streamStartMs = System.currentTimeMillis();
+        messages.add(UIMessage.streaming("Imagining… (0s)"));
+        needsRedraw = true;
 
-        // 步骤 4：启动虚拟线程消费 StreamEvent 队列
+        final String userText = text;
         Thread.startVirtualThread(() -> {
             try {
-                // 调用 LlmClient.stream() — 发送对话历史给 LLM，返回 StreamEvent 阻塞队列
-                // 第二个参数是 tools 列表（目前传空列表，未接入 MCP 工具）
-                BlockingQueue<StreamEvent> events = client.stream(conversation, new ArrayList<>());
-                while (true) {
-                    StreamEvent evt = events.take();
-                    switch (evt) {
-                        case StreamEvent.ThinkingDelta td -> {
-                            thinkingAccum.append(td.text());
-                            // 流式显示思考过程
-                            if (!messages.isEmpty()) {
-                                var msg = messages.getLast();
-                                if (msg.streaming()) {
-                                    long elapsed = (System.currentTimeMillis() - streamStartMs) / 1000;
-                                    messages.set(messages.size() - 1,
-                                        UIMessage.streamingThinking(thinkingAccum.toString(), elapsed));
-                                }
-                            }
-                            needsRedraw = true;
-                        }
-                        case StreamEvent.ThinkingComplete ignored -> {
-                            // 思考完成，显示结束标记
-                            if (!messages.isEmpty() && messages.getLast().streaming()) {
-                                messages.set(messages.size() - 1,
-                                    UIMessage.streamingThinkingDone(thinkingAccum.toString()));
-                            }
-                            needsRedraw = true;
-                        }
-                        case StreamEvent.TextDelta td -> {
-                            if (!firstTokenReceived) {
-                                firstTokenReceived = true;
-                                firstTokenMs = System.currentTimeMillis();
-                                // 替换过渡消息为正文（如有思考内容则保留）
-                                String think = thinkingAccum.toString();
-                                if (!think.isEmpty()) {
-                                    streamAccum.append(td.text());
-                                    messages.set(messages.size() - 1,
-                                        UIMessage.streamingWithThinking(think, streamAccum.toString()));
-                                } else {
-                                    replaceLastStreaming(td.text());
-                                }
-                            } else {
-                                streamAccum.append(td.text());
-                                if (!messages.isEmpty()) {
-                                    var msg = messages.getLast();
-                                    if (msg.streaming()) {
-                                        String think = thinkingAccum.toString();
-                                        if (!think.isEmpty()) {
-                                            messages.set(messages.size() - 1,
-                                                UIMessage.streamingWithThinking(think, streamAccum.toString()));
-                                        } else {
-                                            messages.set(messages.size() - 1,
-                                                UIMessage.streaming(streamAccum.toString()));
-                                        }
-                                    }
-                                }
-                            }
-                            needsRedraw = true;
-                        }
-                        case StreamEvent.StreamEnd se -> {
-                            // 步骤 4d：流式结束 — 用 MarkdownRenderer 渲染最终文本
-                            String finalText = streamAccum.toString();
-                            String thinkText = thinkingAccum.toString();
-                            long elapsed = (firstTokenReceived ? firstTokenMs : System.currentTimeMillis()) - streamStartMs;
-                            double secs = Math.max(elapsed, 0) / 1000.0;
-                            String rendered;
-                            try {
-                                // MarkdownRenderer.render — 将 Markdown 转为带 ANSI 颜色的终端字符串
-                                rendered = MarkdownRenderer.render(finalText);
-                            } catch (Exception e) {
-                                rendered = finalText;  // 渲染失败时回退为纯文本
-                            }
-                            // 如有思考内容，拼接在正文前（浅灰色思考块 + 正文）
-                            if (!thinkText.isEmpty()) {
-                                String thinkBlock = GRAY + "✻ Thinking…" + RESET + "\n"
-                                    + UIMessage.grayLines(thinkText) + "\n"
-                                    + GRAY + "✻ Done" + RESET + "\n\n";
-                                rendered = thinkBlock + rendered;
-                            }
-                            replaceLastStreamingWithFinal(rendered, secs);
-                            // 将原始文本（不含 ANSI/Markdown）存入 ConversationManager，供下一轮对话发给 LLM
-                            conversation.addAssistantMessage(finalText);
-                            streaming = false;
-                            needsRedraw = true;
-                            return;
-                        }
-                        case StreamEvent.Error e -> {
-                            String errText = e.message();
-                            if (firstTokenReceived) {
-                                errText += "\n\n[Partial reply] " + streamAccum.toString();
-                            }
-                            messages.add(UIMessage.error(errText));
-                            streaming = false;
-                            needsRedraw = true;
-                            return;
-                        }
-                        default -> {}
-                    }
-                }
+                runAgentLoop(userText);
             } catch (InterruptedException e) {
                 messages.add(UIMessage.error("Request interrupted."));
+            } finally {
                 streaming = false;
                 needsRedraw = true;
             }
         });
-
-        // 步骤 3：添加 "Imagining…" 占位消息（在虚拟线程启动后添加，避免竞态）
-        messages.add(UIMessage.streaming("Imagining… (0s)"));
-        needsRedraw = true;
     }
 
     /**
-     * 替换最后一条流式消息的内容，同时追加到 streamAccum。
-     * 仅在首个 TextDelta 到达且无思考内容时调用。
+     * Agent Loop 主循环 — 在虚拟线程中执行。
+     *
+     * 每次迭代代表一轮 LLM 请求-响应：
+     *   流式接收 → 如果有工具调用 → 执行工具 → 继续循环
+     *   流式接收 → 如果自然结束 → 渲染最终文本 → 退出循环
+     *
+     * @param userText 原始用户输入（用于 FileHistory 快照标签）
      */
-    private void replaceLastStreaming(String text) {
-        if (!messages.isEmpty()) {
-            var last = messages.getLast();
-            if (last.streaming()) {
-                messages.set(messages.size() - 1, UIMessage.streaming(text));
-                streamAccum.append(text);
+    private void runAgentLoop(String userText) throws InterruptedException {
+        String protocol = provider.getProtocol();
+        List<Map<String, Object>> toolSchemas = toolRegistry.getAllSchemas(protocol);
+
+        while (true) {
+            // ── 重置本轮状态 ──
+            streamAccum.setLength(0);
+            thinkingAccum.setLength(0);
+            firstTokenReceived = false;
+            streamStartMs = System.currentTimeMillis();
+
+            // 本轮工具调用累积
+            var pendingToolUses = new ArrayList<ToolUseBlock>();
+            var toolCallArgsMap = new HashMap<String, StringBuilder>();
+            String[] currentTool = {"", ""};  // [toolId, toolName]，用数组绕过 lambda effectively-final 限制
+
+            // 本轮思考块（含 signature，用于对话历史回传）
+            var thinkingBlocks = new ArrayList<ThinkingBlock>();
+
+            // 替换占位消息
+            replaceLastMessage(UIMessage.streaming("Imagining… (0s)"));
+            needsRedraw = true;
+
+            // ── 发送请求并消费流式事件 ──
+            BlockingQueue<StreamEvent> events = client.stream(conversation, toolSchemas);
+
+            String stopReason = "";
+            boolean gotError = false;
+            String errorMsg = null;
+
+            while (true) {
+                StreamEvent evt = events.take();
+                switch (evt) {
+                    case StreamEvent.ThinkingDelta td -> {
+                        thinkingAccum.append(td.text());
+                        updateStreamingMessage();
+                        needsRedraw = true;
+                    }
+                    case StreamEvent.ThinkingComplete tc -> {
+                        thinkingBlocks.add(new ThinkingBlock(tc.thinking(), tc.signature()));
+                        updateStreamingMessage();
+                        needsRedraw = true;
+                    }
+                    case StreamEvent.TextDelta td -> {
+                        if (!firstTokenReceived) {
+                            firstTokenReceived = true;
+                            firstTokenMs = System.currentTimeMillis();
+                        }
+                        streamAccum.append(td.text());
+                        updateStreamingMessage();
+                        needsRedraw = true;
+                    }
+                    case StreamEvent.ToolCallStart tcs -> {
+                        // 如果流式消息已有文本/思考内容，先定稿为助手消息，再添加工具调用
+                        // 这样助手正文和工具调用各自独立显示，不会互相覆盖
+                        if (!messages.isEmpty() && messages.getLast().streaming()
+                                && (!streamAccum.isEmpty() || !thinkingAccum.isEmpty())) {
+                            finalizeStreamingAssistant();
+                            messages.add(UIMessage.streamingToolCall(tcs.toolName(), "…"));
+                        } else {
+                            // 无文本内容，直接替换占位消息
+                            replaceLastMessage(UIMessage.streamingToolCall(tcs.toolName(), "…"));
+                        }
+                        currentTool[0] = tcs.toolId();
+                        currentTool[1] = tcs.toolName();
+                        toolCallArgsMap.put(tcs.toolId(), new StringBuilder());
+                        needsRedraw = true;
+                    }
+                    case StreamEvent.ToolCallDelta tcd -> {
+                        // 累积当前工具的参数片段
+                        if (!currentTool[0].isEmpty()) {
+                            toolCallArgsMap.get(currentTool[0]).append(tcd.text());
+                            String partial = toolCallArgsMap.get(currentTool[0]).toString();
+                            replaceLastMessage(UIMessage.streamingToolCall(currentTool[1], partial));
+                            needsRedraw = true;
+                        }
+                    }
+                    case StreamEvent.ToolCallComplete tcc -> {
+                        pendingToolUses.add(new ToolUseBlock(tcc.toolId(), tcc.toolName(), tcc.arguments()));
+                        currentTool[0] = "";
+                        currentTool[1] = "";
+                        // 显示完整的工具调用
+                        replaceLastMessage(UIMessage.toolCall(tcc.toolName(), formatToolArgs(tcc.arguments())));
+                        needsRedraw = true;
+                    }
+                    case StreamEvent.StreamEnd se -> {
+                        stopReason = se.stopReason();
+                    }
+                    case StreamEvent.Error e -> {
+                        gotError = true;
+                        errorMsg = e.message();
+                    }
+                    default -> {}
+                }
+                // StreamEnd 或 Error 时退出内层循环
+                if (evt instanceof StreamEvent.StreamEnd || evt instanceof StreamEvent.Error) break;
+            }
+
+            // ── 错误处理 ──
+            if (gotError) {
+                String errText = errorMsg;
+                if (firstTokenReceived) {
+                    errText += "\n\n[Partial reply] " + streamAccum.toString();
+                }
+                messages.add(UIMessage.error(errText));
+                return;
+            }
+
+            // ── 渲染本轮最终文本 ──
+            String finalText = streamAccum.toString();
+            String thinkText = thinkingAccum.toString();
+            String rendered;
+            try {
+                rendered = MarkdownRenderer.render(finalText);
+            } catch (Exception e) {
+                rendered = finalText;
+            }
+            // 如有思考内容，拼接在正文前
+            if (!thinkText.isEmpty()) {
+                String thinkBlock = GRAY + "✻ Thinking…" + RESET + "\n"
+                    + UIMessage.grayLines(thinkText) + "\n"
+                    + GRAY + "✻ Done" + RESET + "\n\n";
+                rendered = thinkBlock + rendered;
+            }
+
+            // ── 根据是否有工具调用决定下一步 ──
+            if ("tool_use".equals(stopReason) && !pendingToolUses.isEmpty()) {
+                // ★ 工具调用分支：保存助手消息（含 tool_uses）→ 执行工具 → 添加结果 → 继续循环
+                conversation.addAssistantFull(finalText, thinkingBlocks, pendingToolUses);
+
+                // 如果流式消息仍有内容（无工具调用前缀文本的边缘情况），定稿它
+                if (!messages.isEmpty() && messages.getLast().streaming()
+                        && (!streamAccum.isEmpty() || !thinkingAccum.isEmpty())) {
+                    finalizeStreamingAssistant();
+                }
+
+                // 逐个执行工具（toolCall 消息已在 ToolCallComplete 时显示，这里只追加结果）
+                var toolResults = new ArrayList<ToolResultBlock>();
+                for (var tu : pendingToolUses) {
+                    // 执行工具
+                    ToolResultBlock result = executeToolCall(tu);
+                    toolResults.add(result);
+
+                    // 显示结果（↳ 缩进表示工具输出）
+                    messages.add(UIMessage.toolResult(tu.toolName(), result.content(), result.isError()));
+                    needsRedraw = true;
+                }
+
+                // 将工具结果添加到对话历史（Anthropic 用 user 角色 + tool_result block）
+                conversation.addToolResultsMessage(toolResults);
+
+                // 添加下一轮的占位消息
+                messages.add(UIMessage.streaming("Imagining… (0s)"));
+                needsRedraw = true;
+                // 继续循环 → 下一轮 LLM 请求
+            } else {
+                // ★ 自然结束分支：保存助手消息 → 打快照 → 退出循环
+                conversation.addAssistantFull(finalText,
+                        thinkingBlocks.isEmpty() ? null : thinkingBlocks, null);
+
+                long elapsed = (firstTokenReceived ? firstTokenMs : System.currentTimeMillis()) - streamStartMs;
+                double secs = Math.max(elapsed, 0) / 1000.0;
+                replaceLastMessage(UIMessage.assistant(rendered, String.format("DeveCode  (%.1fs)", secs)));
+
+                // 打文件快照（用于后续回退）
+                if (fileHistory != null) {
+                    fileHistory.makeSnapshot(conversation.size(), userText);
+                }
+                return;
             }
         }
     }
 
     /**
-     * 流式结束后，将最后一条流式消息替换为最终渲染结果（含时间标签）。
+     * 执行单个工具调用。
      *
-     * @param rendered  MarkdownRenderer 渲染后的 ANSI 字符串
-     * @param totalSecs 从请求开始到首 token（或结束）的耗时
+     * 步骤：
+     *   1. 从 ToolRegistry 查找工具实例
+     *   2. 调用 tool.execute(args)
+     *   3. 截断超长输出（MAX_OUTPUT_CHARS）
+     *   4. 返回 ToolResultBlock（含 toolUseId 关联到对应的 tool_use）
+     *
+     * @param toolUse LLM 请求的工具调用（工具名 + 参数）
+     * @return 工具执行结果（含 toolUseId、输出内容、是否出错）
      */
-    private void replaceLastStreamingWithFinal(String rendered, double totalSecs) {
-        if (!messages.isEmpty()) {
-            var last = messages.getLast();
-            if (last.streaming()) {
-                String timeStr = String.format("DeveCode  (%.1fs)", totalSecs);
-                messages.set(messages.size() - 1,
-                        UIMessage.assistant(rendered, timeStr));
+    private ToolResultBlock executeToolCall(ToolUseBlock toolUse) {
+        String toolName = toolUse.toolName();
+        Tool tool = toolRegistry.getTool(toolName);
+        if (tool == null) {
+            return new ToolResultBlock(toolUse.toolUseId(),
+                    "Error: unknown tool '" + toolName + "'", true);
+        }
+        try {
+            ToolResult result = tool.execute(toolUse.arguments());
+            String output = result.output();
+            // 截断超长输出，避免撑爆 LLM 上下文窗口
+            if (output.length() > ToolRegistry.MAX_OUTPUT_CHARS) {
+                output = output.substring(0, ToolRegistry.MAX_OUTPUT_CHARS)
+                        + "\n... (truncated at " + ToolRegistry.MAX_OUTPUT_CHARS + " chars)";
             }
+            return new ToolResultBlock(toolUse.toolUseId(), output, result.isError());
+        } catch (Exception e) {
+            return new ToolResultBlock(toolUse.toolUseId(),
+                    "Error executing tool: " + e.getMessage(), true);
+        }
+    }
+
+    /** 格式化工具参数为 "key: value, key: value" 形式，超长值截断 */
+    private String formatToolArgs(Map<String, Object> args) {
+        if (args == null || args.isEmpty()) return "";
+        var sb = new StringBuilder();
+        for (var entry : args.entrySet()) {
+            if (!sb.isEmpty()) sb.append(", ");
+            String val = String.valueOf(entry.getValue());
+            if (val.length() > 50) val = val.substring(0, 47) + "…";
+            sb.append(entry.getKey()).append(": ").append(val);
+        }
+        return sb.toString();
+    }
+
+    /** 更新最后一条流式消息的显示内容（根据当前 thinking 和 text 状态） */
+    private void updateStreamingMessage() {
+        if (messages.isEmpty()) return;
+        var msg = messages.getLast();
+        if (!msg.streaming()) return;
+
+        String think = thinkingAccum.toString();
+        String text = streamAccum.toString();
+
+        if (!think.isEmpty() && !text.isEmpty()) {
+            messages.set(messages.size() - 1,
+                UIMessage.streamingWithThinking(think, text));
+        } else if (!think.isEmpty()) {
+            long elapsed = (System.currentTimeMillis() - streamStartMs) / 1000;
+            messages.set(messages.size() - 1,
+                UIMessage.streamingThinking(think, elapsed));
+        } else if (!text.isEmpty()) {
+            messages.set(messages.size() - 1,
+                UIMessage.streaming(text));
+        }
+    }
+
+    /**
+     * 将流式消息定稿为最终助手消息（Markdown 渲染 + 时间标签 + 思考块）。
+     * 在 ToolCallStart 到达时调用，把已收到的文本"封存"为独立消息，
+     * 然后添加新的工具调用消息，避免互相覆盖。
+     */
+    private void finalizeStreamingAssistant() {
+        if (messages.isEmpty()) return;
+        if (!messages.getLast().streaming()) return;
+
+        String finalText = streamAccum.toString();
+        String thinkText = thinkingAccum.toString();
+        String rendered;
+        try {
+            rendered = MarkdownRenderer.render(finalText);
+        } catch (Exception e) {
+            rendered = finalText;
+        }
+        if (!thinkText.isEmpty()) {
+            String thinkBlock = GRAY + "✻ Thinking…" + RESET + "\n"
+                + UIMessage.grayLines(thinkText) + "\n"
+                + GRAY + "✻ Done" + RESET + "\n\n";
+            rendered = thinkBlock + rendered;
+        }
+        long elapsed = (firstTokenReceived ? firstTokenMs : System.currentTimeMillis()) - streamStartMs;
+        double secs = Math.max(elapsed, 0) / 1000.0;
+        replaceLastMessage(UIMessage.assistant(rendered, String.format("DeveCode  (%.1fs)", secs)));
+    }
+
+    /** 替换最后一条消息（不管是否流式） */
+    private void replaceLastMessage(UIMessage msg) {
+        if (messages.isEmpty()) {
+            messages.add(msg);
+        } else {
+            messages.set(messages.size() - 1, msg);
         }
     }
 
@@ -951,7 +1138,8 @@ public class TerminalUI {
         y = panelKV(buf, y, padX, maxW, "Context window:", formatTokens(contextWindow) + " (" + String.format("%.1f%%", pct) + ")");
         y = panelKV(buf, y, padX, maxW, "Model:", modelName);
         y = panelKV(buf, y, padX, maxW, "Mode:", "default");
-        y = panelKV(buf, y, padX, maxW, "MCP tools:", "0");
+        y = panelKV(buf, y, padX, maxW, "Tools:", String.valueOf(
+                toolRegistry.getAllSchemas(provider.getProtocol()).size()));
         y = panelKV(buf, y, padX, maxW, "Free Space:", String.format("%.1f%%", freePct));
         y++;
 
@@ -1158,7 +1346,7 @@ public class TerminalUI {
     /**
      * UI 消息记录。封装一条消息在终端中显示所需的全部信息。
      *
-     * @param role      消息角色："user" / "assistant" / "error" / "banner"
+     * @param role      消息角色："user" / "assistant" / "error" / "banner" / "tool"
      * @param content   已格式化的内容（含 ANSI 颜色码），按 \n 分行
      * @param timeLabel 时间标签（如 "14:30"），显示在首行前；null 表示不显示
      * @param streaming 是否为流式进行中的消息（true 时不加空行分隔）
@@ -1217,6 +1405,44 @@ public class TerminalUI {
                     GRAY + "✻ Done" + RESET + "\n\n" +
                     responseText,
                     null, true, false);
+        }
+
+        // ── 工具调用相关的工厂方法 ──
+
+        /** 工具调用流式中（参数正在推送） */
+        static UIMessage streamingToolCall(String toolName, String argsDisplay) {
+            return new UIMessage("tool",
+                    YELLOW + "⚙ " + CYAN + toolName + RESET +
+                    GRAY + "(" + argsDisplay + ")" + RESET,
+                    null, true, false);
+        }
+
+        /** 工具调用完成（显示完整参数） */
+        static UIMessage toolCall(String toolName, String argsDisplay) {
+            return new UIMessage("tool",
+                    YELLOW + "⚙ " + CYAN + toolName + RESET +
+                    GRAY + "(" + argsDisplay + ")" + RESET,
+                    LocalTime.now().format(TIME_FMT), false, false);
+        }
+
+        /** 工具执行中 */
+        static UIMessage toolExecuting(String toolName) {
+            return new UIMessage("tool",
+                    YELLOW + "⚙ " + CYAN + toolName + RESET +
+                    GRAY + "  executing…" + RESET,
+                    null, false, false);
+        }
+
+        /** 工具执行结果（超长输出截断为前 500 字符） */
+        static UIMessage toolResult(String toolName, String output, boolean isError) {
+            String color = isError ? RED : GRAY;
+            String display = output;
+            if (display != null && display.length() > 500) {
+                display = display.substring(0, 500) + "\n…";
+            }
+            return new UIMessage("tool",
+                    color + "↳ " + (display != null ? display : "") + RESET,
+                    null, false, false);
         }
 
         /** 将多行文本逐行包裹 GRAY 颜色（防止 \n 分割后丢失颜色） */
