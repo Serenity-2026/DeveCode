@@ -14,6 +14,10 @@ public class ToolRegistry {
     public void register(Tool tool) {
         tools.put(tool.name(), tool);
     }
+    /**根据工具名查找工具实例，供 Agent Loop 执行工具调用时使用*/
+    public Tool getTool(String name) {
+        return tools.get(name);
+    }
     public static ToolRegistry createDefault() {
         var reg = new ToolRegistry();
         //注册方法,直接在此处添加
@@ -23,6 +27,7 @@ public class ToolRegistry {
         reg.register(new GlobTool());
         reg.register(new GrepTool());
         reg.register(new BashTool());
+        reg.register(new MathTool());
         return reg;
     }
     //过未发现的延迟工具，根据 protocol 参数适配 Anthropic/OpenAI 两种 API 格式。
@@ -35,9 +40,13 @@ public class ToolRegistry {
                 continue;
             var base = tool.schema();
             //对open_ai参数格式做特殊处理以适配
+            //OpenAI 标准 Chat Completions API 要求 tools 格式为 {type:"function", function:{name, description, parameters}}
             if ("openai".equals(protocol)) {
-                schemas.add(Map.of("type", "function", "name", base.get("name"),
-                        "parameters", base.get("input_schema")));
+                var fn = new LinkedHashMap<String, Object>();
+                fn.put("name", base.get("name"));
+                fn.put("description", base.get("description"));
+                fn.put("parameters", base.get("input_schema"));
+                schemas.add(Map.of("type", "function", "function", fn));
             } else {
                 schemas.add(base);
             }
@@ -60,13 +69,12 @@ public class ToolRegistry {
             if (nameSet.contains(tool.name().toLowerCase())) {
                 var base = tool.schema();
                 if (isOpenAIProtocol(protocol)) {
-                    //openai格式特殊处理
-                    matches.add(Map.of(
-                            "type", "function",
-                            "name", base.get("name"),
-                            "description", base.get("description"),
-                            "parameters", base.get("input_schema")
-                    ));
+                    //openai格式特殊处理：嵌套在 function 键下
+                    var fn = new LinkedHashMap<String, Object>();
+                    fn.put("name", base.get("name"));
+                    fn.put("description", base.get("description"));
+                    fn.put("parameters", base.get("input_schema"));
+                    matches.add(Map.of("type", "function", "function", fn));
                 } else {
                     matches.add(base);
                 }
@@ -96,12 +104,11 @@ public class ToolRegistry {
                     || tool.description().toLowerCase().contains(lower)) {
                 var base = tool.schema();
                 if (isOpenAIProtocol(protocol)) {
-                    matches.add(Map.of(
-                            "type", "function",
-                            "name", base.get("name"),
-                            "description", base.get("description"),
-                            "parameters", base.get("input_schema")
-                    ));
+                    var fn = new LinkedHashMap<String, Object>();
+                    fn.put("name", base.get("name"));
+                    fn.put("description", base.get("description"));
+                    fn.put("parameters", base.get("input_schema"));
+                    matches.add(Map.of("type", "function", "function", fn));
                 } else {
                     matches.add(base);
                 }
