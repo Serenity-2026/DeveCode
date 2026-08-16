@@ -219,6 +219,20 @@ public class ConversationManager {
                     content.add(block);
                 }
             }
+            //4.添加tool_result块（工具执行结果）
+            //Anthropic 协议中工具结果用 user 角色 + tool_result content block 发送
+            if (msg.getToolResults() != null && !msg.getToolResults().isEmpty()) {
+                for (var tr : msg.getToolResults()) {
+                    var block = new LinkedHashMap<String, Object>();
+                    block.put("type", "tool_result");
+                    block.put("tool_use_id", tr.toolUseId());
+                    block.put("content", tr.content() != null ? tr.content() : "");
+                    if (tr.isError()) {
+                        block.put("is_error", true);
+                    }
+                    content.add(block);
+                }
+            }
             message.put("content", content);
             messages.add(message);
 
