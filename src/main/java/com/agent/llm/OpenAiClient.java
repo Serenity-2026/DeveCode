@@ -107,6 +107,10 @@ public class OpenAiClient implements LlmClient {
         if (maxOutputTokens > 0) {
             body.put("max_tokens", maxOutputTokens);
         }
+        //工具列表非空时放入请求体，让 LLM 知道有哪些工具可调用
+        if (tools != null && !tools.isEmpty()) {
+            body.put("tools", tools);
+        }
 
         //Step 3：发送 HTTP POST 请求
         var httpClient = HttpClient.newHttpClient();

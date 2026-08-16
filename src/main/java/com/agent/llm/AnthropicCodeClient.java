@@ -115,6 +115,10 @@ public class AnthropicCodeClient implements LlmClient {
             }
         }
         body.put("messages",conv.serializeAnthropic());
+        //工具列表非空时放入请求体，让 LLM 知道有哪些工具可调用
+        if (tools != null && !tools.isEmpty()) {
+            body.put("tools", tools);
+        }
         var httpClient = HttpClient.newHttpClient();
         var request = HttpRequest.newBuilder()
                 .uri(URI.create("https://api.deepseek.com/anthropic/v1/messages"))
