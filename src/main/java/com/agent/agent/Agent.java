@@ -1,5 +1,7 @@
 package com.agent.agent;
 
+import com.agent.compact.ContextCompactor;
+import com.agent.compact.RecoveryState;
 import com.agent.history.ConversationManager;
 import com.agent.infra.ProviderConfig;
 import com.agent.llm.LlmClient;
@@ -21,9 +23,15 @@ public class Agent {
     private final int contextWindow;
     private final int maxOutput;
     private Predicate<String> toolNameFilter;
+    private final RecoveryState recoveryState = new RecoveryState();
+
 
     private int maxIterations=5;
     private String workDir;
+    private String lastStreamError;
+
+    private String instructions = "";
+    private String memoryContent = "";
 
     private record ToolCallInfo(String toolId, String toolName, Map<String, Object> args) {}
     private record ToolCallResult(String toolId, String output, boolean isError) {}
@@ -51,6 +59,9 @@ public class Agent {
         return queue;
     }
     private void agentLoop(ConversationManager conv, BlockingQueue<AgentEvent> queue) {
+        conv.injectLongTermMemory(instructions,memoryContent);
+        int contextRetries=0;
+        int totalInput = 0, totalOutput = 0;
         for (int iteration = 1; ; iteration++) {
             // 1. 检查迭代上限
             if (iteration > maxIterations) {
@@ -88,6 +99,13 @@ public class Agent {
             }
             var tools=iterToolSchemas;
             var streamQueue = client.stream(conv, tools);
+            var text = new StringBuilder();
+            var thinkingBlocks = new ArrayList<ThinkingBlock>();
+            var toolCalls = new ArrayList<ToolCallInfo>();
+            String stopReason = "end_turn";
+            int turnInput = 0, turnOutput = 0;
+            int turnCacheRead = 0, turnCacheCreation = 0;
+            boolean streamError = false;
             // 7. 消费流式响应
             while(true){
                 StreamEvent event;
@@ -101,10 +119,7 @@ public class Agent {
                     putSafe(queue, new AgentEvent.ErrorEvent("Stream timeout"));
                     return;
                 }
-                // Consume stream events, collect tool calls
-                var text = new StringBuilder();
-                var thinkingBlocks = new ArrayList<ThinkingBlock>();
-                var toolCalls = new ArrayList<ToolCallInfo>();
+
                 switch (event) {
                     case StreamEvent.TextDelta td -> {
                         text.append(td.text());
@@ -138,9 +153,28 @@ public class Agent {
                         streamError = true;
                     }
                 }
+                if (event instanceof StreamEvent.StreamEnd || event instanceof StreamEvent.Error) break;
             }
+
             // 8. 错误恢复
+            if (streamError) {
+                if (lastStreamError != null && (lastStreamError.contains("context") || lastStreamError.contains("too long")
+                        || lastStreamError.contains("prompt"))) {
+                    if (contextRetries < 3) {
+                        contextRetries++;
+                        ContextCompactor.forceCompact(conv, client, contextWindow,recoveryState,tools);
+                        continue; // 重试
+                    }
+                }
+                if (lastStreamError != null && lastStreamError.toLowerCase().contains("rate limit")) {
+                    putSafe(queue, new AgentEvent.RetryEvent("Rate limited, waiting 5s...", 5000));
+                    try { Thread.sleep(5000); } catch (InterruptedException e) { break; }
+                    continue;
+                }
+                break;
+            }
             // 9. max_tokens 恢复
+
             // 10. 保存 assistant 消息
             // 11. 没有工具调用 → 结束
             // 12. 执行工具 + 收集结果
