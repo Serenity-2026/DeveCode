@@ -239,21 +239,5 @@ public class ConversationManager {
         }
         return messages;
     }
-    //添加消息时要注意：AnthropicAPI要求消息严格按user/assistant交替（user→assistant→user→…），连续两条同角色消息会直接报错。
-    // 但在用户消息后追加的system-reminder也是 user 角色，于是出现连续两条 user。在把消息塞进结果列表前，先看上一条是不是同角色，是的话就并成一条。
-    private void checkSingleRole(Message msg){
-        if (!history.isEmpty()) {
-            var prev = history.getLast();
-            var prevRole = (String) prev.getRole();
-            //如果是相同角色
-            if (prevRole != null && prevRole.equals(msg.getRole())) {
-                var prevContent = prev.getContent();
-                if (prevContent instanceof String s) {
-                    var merged = new Message(prev.getRole(),s + "\n\n" + prev.getContent(),prev.getThinkingBlocks(),prev.getToolUses(),prev.getToolResults());
-                    history.set(history.size() - 1, merged);
-                }
-            }
-        }
-    }
 }
 
