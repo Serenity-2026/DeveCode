@@ -32,6 +32,10 @@ public class AnthropicCodeClient implements LlmClient {
     private static final ObjectMapper MAPPER=new ObjectMapper();
     private final AnthropicClient sdkClient;
 
+    @Override
+    public void setMaxOutputTokens(int tokens) {
+        this.maxOutputTokens=maxOutputTokens;
+    }
 
     public AnthropicCodeClient(ProviderConfig cfg, String systemPrompt) {
         String apiKey = cfg.resolvedApiKey();

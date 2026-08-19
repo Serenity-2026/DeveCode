@@ -4,12 +4,14 @@ import com.agent.compact.ContextCompactor;
 import com.agent.compact.RecoveryState;
 import com.agent.history.ConversationManager;
 import com.agent.infra.ProviderConfig;
+import com.agent.llm.AnthropicCodeClient;
 import com.agent.llm.LlmClient;
 import com.agent.llm.StreamEvent;
 import com.agent.llm.ThinkingBlock;
 import com.agent.tool.ToolRegistry;
 
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -35,6 +37,12 @@ public class Agent {
 
     private record ToolCallInfo(String toolId, String toolName, Map<String, Object> args) {}
     private record ToolCallResult(String toolId, String output, boolean isError) {}
+
+    //升级上限,首次遇到max_tokens截断时把客户端的maxOutputTokens一次性抬高到这个值（64K）。
+    private static final int MAX_TOKENS_CEILING = 64_000;
+    //恢复次数上限,升级之后若仍被截断最多再让模型续写 3 次。
+    private static final int MAX_OUTPUT_RECOVERIES = 3;
+
     public Agent(LlmClient client, ToolRegistry registry, ProviderConfig providerConfig) {
         this.client = client;
         this.registry = registry;
@@ -62,6 +70,9 @@ public class Agent {
         conv.injectLongTermMemory(instructions,memoryContent);
         int contextRetries=0;
         int totalInput = 0, totalOutput = 0;
+        //升级标识,只提升一次上限,后续走续写路线
+        boolean maxTokensEscalated = false;
+        int outputRecoveries = 0;
         for (int iteration = 1; ; iteration++) {
             // 1. 检查迭代上限
             if (iteration > maxIterations) {
@@ -173,8 +184,31 @@ public class Agent {
                 }
                 break;
             }
+            totalInput += turnInput;
+            totalOutput += turnOutput;
+            putSafe(queue, new AgentEvent.UsageEvent(totalInput, totalOutput));
             // 9. max_tokens 恢复
-
+            if ("max_tokens".equals(stopReason)) {
+                if (!maxTokensEscalated) {
+                    maxTokensEscalated = true;
+                    client.setMaxOutputTokens(MAX_TOKENS_CEILING);
+                    if (!text.isEmpty()) {
+                        conv.addAssistantFull(text.toString(), thinkingBlocks, List.of());
+                        conv.addUserMessage("Output token limit hit. Resume directly from where you stopped. Do not apologize or repeat previous content. Pick up mid-thought if needed.");
+                    }
+                    putSafe(queue, new AgentEvent.RetryEvent("max_tokens escalation", 0));
+                    continue;
+                } else if (outputRecoveries < MAX_OUTPUT_RECOVERIES) {
+                    outputRecoveries++;
+                    conv.addAssistantFull(text.toString(), thinkingBlocks, List.of());
+                    conv.addUserMessage("Output token limit hit. Resume directly from where you stopped. Break remaining work into smaller pieces.");
+                    putSafe(queue, new AgentEvent.RetryEvent(
+                            "max_tokens recovery %d/%d".formatted(outputRecoveries, MAX_OUTPUT_RECOVERIES), 0));
+                    continue;
+                }
+            } else {
+                outputRecoveries = 0;
+            }
             // 10. 保存 assistant 消息
             // 11. 没有工具调用 → 结束
             // 12. 执行工具 + 收集结果
