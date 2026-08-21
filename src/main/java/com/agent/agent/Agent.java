@@ -4,10 +4,8 @@ import com.agent.compact.ContextCompactor;
 import com.agent.compact.RecoveryState;
 import com.agent.history.ConversationManager;
 import com.agent.infra.ProviderConfig;
-import com.agent.llm.AnthropicCodeClient;
-import com.agent.llm.LlmClient;
-import com.agent.llm.StreamEvent;
-import com.agent.llm.ThinkingBlock;
+import com.agent.llm.*;
+import com.agent.tool.FileHistory;
 import com.agent.tool.ToolRegistry;
 
 import java.util.ArrayList;
@@ -27,6 +25,7 @@ public class Agent {
     private Predicate<String> toolNameFilter;
     private final RecoveryState recoveryState = new RecoveryState();
 
+    private FileHistory fileHistory;
 
     private int maxIterations=5;
     private String workDir;
@@ -42,6 +41,18 @@ public class Agent {
     private static final int MAX_TOKENS_CEILING = 64_000;
     //恢复次数上限,升级之后若仍被截断最多再让模型续写 3 次。
     private static final int MAX_OUTPUT_RECOVERIES = 3;
+
+    private ContextCompactor.UsageAnchor usageAnchor;
+    boolean loopCompleted = false;
+
+    public FileHistory getFileHistory() {
+        return fileHistory;
+    }
+
+    public void setFileHistory(FileHistory fileHistory) {
+        this.fileHistory = fileHistory;
+    }
+
 
     public Agent(LlmClient client, ToolRegistry registry, ProviderConfig providerConfig) {
         this.client = client;
@@ -210,8 +221,46 @@ public class Agent {
                 outputRecoveries = 0;
             }
             // 10. 保存 assistant 消息
+            var toolUseBlocks = toolCalls.stream()
+                    .map(tc -> new ToolUseBlock(tc.toolId, tc.toolName, tc.args))
+                    .toList();
+            conv.addAssistantFull(text.toString(), thinkingBlocks, toolUseBlocks);
             // 11. 没有工具调用 → 结束
+            if(toolCalls.isEmpty()){
+                if (fileHistory != null) {
+                    String summary = text.length() > 60 ? text.substring(0, 60) + "..." : text.toString();
+                    fileHistory.makeSnapshot(conv.size(), summary);
+                }
+                putSafe(queue, new AgentEvent.LoopComplete(iteration));
+                loopCompleted = true;
+                break;
+            }
             // 12. 执行工具 + 收集结果
+            var executor = new StreamingExecutor(registry, checker, hookEngine, queue, recoveryState);
+            var callInfos = toolCalls.stream()
+                    .map(tc -> new StreamingExecutor.ToolCallInfo(tc.toolId, tc.toolName, tc.args))
+                    .toList();
+            var results = executor.executeAll(callInfos);
+
+            // Add results to conversation
+            var resultBlocks = results.stream()
+                    .map(r -> new ToolResultBlock(r.toolId(), r.output(), r.isError()))
+                    .toList();
+            conv.addToolResultsMessage(resultBlocks);
+
+            // 非阻塞 memory recall：工具执行完后检查 prefetch 是否就绪
+            // 记忆在第 1 轮工具执行后、第 2 轮迭代前注入
+            if (memoryRecallFuture != null && !memoryRecallConsumed) {
+                if (memoryRecallFuture.isDone()) {
+                    try {
+                        String recall = memoryRecallFuture.getNow("");
+                        if (recall != null && !recall.isEmpty()) {
+                            conv.addSystemReminder(recall);
+                        }
+                    } catch (Exception ignored) {}
+                    memoryRecallConsumed = true;
+                }
+            }
             // 13. turn_end 通知
         }
 

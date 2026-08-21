@@ -15,10 +15,9 @@ import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 
 /**
- * Layer 2 context compaction: summarizes the older prefix of a conversation
- * via an LLM call, keeping the recent verbatim tail. Recovery snapshots
- * (file reads + skill SOPs) are appended so the model does not lose working
- * context after compaction.
+ 二层上下文压缩：
+ 1.通过大型语言模型（LLM）调用，总结对话中较旧的前缀，同时保留最近的完整尾部。
+ 2.恢复快照（文件读取+技能标准操作流程）被附加，以确保模型在压缩后不会丢失工作上下文。
  */
 public final class ContextCompactor {
 
@@ -41,6 +40,7 @@ public final class ContextCompactor {
     private static final double RECOVERY_CHARS_PER_TOKEN = 3.5;
     private static final DateTimeFormatter RECOVERY_TS = DateTimeFormatter
             .ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'").withZone(ZoneOffset.UTC);
+    public record UsageAnchor(int baselineTokens, int anchorCount) {}
 
     private static final String SUMMARY_SYSTEM_PROMPT = """
             Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
@@ -470,7 +470,7 @@ public final class ContextCompactor {
             //消息只带name和id
             if (m.getToolUses() != null) {
                 for (ToolUseBlock tu : m.getToolUses()) {
-                    sb.append(String.format("[tool_use %s]: %s\n", tu.toolName(), tu.toolUseId()));
+                    sb.append(String.format("[tool_use %s]: %s\n", tu.toolName(), tu.toolId()));
                 }
             }
             //result最多保留500字符
