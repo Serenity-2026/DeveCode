@@ -137,7 +137,7 @@ public class ConversationManager {
                 for (var tr : msg.getToolResults()) {
                     var toolMsg = new LinkedHashMap<String, Object>();
                     toolMsg.put("role", "tool");
-                    toolMsg.put("tool_call_id", tr.toolUseId());
+                    toolMsg.put("tool_call_id", tr.toolId());
                     toolMsg.put("content", tr.content() != null ? tr.content() : "");
                     messages.add(toolMsg);
                 }
@@ -159,7 +159,7 @@ public class ConversationManager {
                     try { argsJson = MAPPER.writeValueAsString(tu.arguments()); }
                     catch (JsonProcessingException e) { argsJson = "{}"; }
                     var tc = new LinkedHashMap<String, Object>();
-                    tc.put("id", tu.toolUseId());
+                    tc.put("id", tu.toolId());
                     tc.put("type", "function");
                     var fn = new LinkedHashMap<String, Object>();
                     fn.put("name", tu.toolName());
@@ -213,7 +213,7 @@ public class ConversationManager {
                 for (var tu : msg.getToolUses()) {
                     var block = new LinkedHashMap<String, Object>();
                     block.put("type", "tool_use");
-                    block.put("id", tu.toolUseId());
+                    block.put("id", tu.toolId());
                     block.put("name", tu.toolName());
                     block.put("input", tu.arguments());
                     content.add(block);
@@ -225,7 +225,7 @@ public class ConversationManager {
                 for (var tr : msg.getToolResults()) {
                     var block = new LinkedHashMap<String, Object>();
                     block.put("type", "tool_result");
-                    block.put("tool_use_id", tr.toolUseId());
+                    block.put("tool_use_id", tr.toolId());
                     block.put("content", tr.content() != null ? tr.content() : "");
                     if (tr.isError()) {
                         block.put("is_error", true);

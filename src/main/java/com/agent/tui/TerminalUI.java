@@ -587,7 +587,7 @@ public class TerminalUI {
         String toolName = toolUse.toolName();
         Tool tool = toolRegistry.getTool(toolName);
         if (tool == null) {
-            return new ToolResultBlock(toolUse.toolUseId(),
+            return new ToolResultBlock(toolUse.toolId(),
                     "Error: unknown tool '" + toolName + "'", true);
         }
         try {
@@ -598,9 +598,9 @@ public class TerminalUI {
                 output = output.substring(0, ToolRegistry.MAX_OUTPUT_CHARS)
                         + "\n... (truncated at " + ToolRegistry.MAX_OUTPUT_CHARS + " chars)";
             }
-            return new ToolResultBlock(toolUse.toolUseId(), output, result.isError());
+            return new ToolResultBlock(toolUse.toolId(), output, result.isError());
         } catch (Exception e) {
-            return new ToolResultBlock(toolUse.toolUseId(),
+            return new ToolResultBlock(toolUse.toolId(),
                     "Error executing tool: " + e.getMessage(), true);
         }
     }
