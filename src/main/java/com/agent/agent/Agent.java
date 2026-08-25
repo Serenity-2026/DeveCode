@@ -3,8 +3,10 @@ package com.agent.agent;
 import com.agent.compact.ContextCompactor;
 import com.agent.compact.RecoveryState;
 import com.agent.history.ConversationManager;
+import com.agent.hook.HookEngine;
 import com.agent.infra.ProviderConfig;
 import com.agent.llm.*;
+import com.agent.permission.PermissionChecker;
 import com.agent.tool.FileHistory;
 import com.agent.tool.ToolRegistry;
 
@@ -12,6 +14,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
@@ -43,7 +46,25 @@ public class Agent {
     private static final int MAX_OUTPUT_RECOVERIES = 3;
 
     private ContextCompactor.UsageAnchor usageAnchor;
+    private PermissionChecker checker;
+
+
+    private HookEngine hookEngine;
+    //LoopComplete事件是否已发送"的幂等标志——保证正常退出和异常退出两条路径下 LoopComplete 都恰好发一次，让UI不会因为信号缺失而卡死、也不会因为信号重复而错乱。
     boolean loopCompleted = false;
+
+    // 非阻塞 memory recall：prefetch 与主 LLM 调用并行，工具执行后注入
+    //memoryRecallFuture是Agent 用于非阻塞记忆检索的占位句柄——TUI在用户发消息时并行启动记忆检索(prefetch),
+    // 把这个"将来才有结果"的future 注入 agent，agent 在第一轮工具执行后 非阻塞 地检查它是否就绪，就绪就把检索结果作为system reminder注入对话。
+    private CompletableFuture<String> memoryRecallFuture;
+    private boolean memoryRecallConsumed;
+
+
+
+    public void setMemoryRecallFuture(CompletableFuture<String> future) {
+        this.memoryRecallFuture = future;
+        this.memoryRecallConsumed = false;
+    }
 
     public FileHistory getFileHistory() {
         return fileHistory;
@@ -78,12 +99,13 @@ public class Agent {
         return queue;
     }
     private void agentLoop(ConversationManager conv, BlockingQueue<AgentEvent> queue) {
-        conv.injectLongTermMemory(instructions,memoryContent);
-        int contextRetries=0;
+        conv.injectLongTermMemory(instructions, memoryContent);
+        int contextRetries = 0;
         int totalInput = 0, totalOutput = 0;
         //升级标识,只提升一次上限,后续走续写路线
         boolean maxTokensEscalated = false;
         int outputRecoveries = 0;
+        try{
         for (int iteration = 1; ; iteration++) {
             // 1. 检查迭代上限
             if (iteration > maxIterations) {
@@ -119,17 +141,17 @@ public class Agent {
                         })
                         .toList();
             }
-            var tools=iterToolSchemas;
+            var tools = iterToolSchemas;
             var streamQueue = client.stream(conv, tools);
             var text = new StringBuilder();
             var thinkingBlocks = new ArrayList<ThinkingBlock>();
-            var toolCalls = new ArrayList<ToolCallInfo>();
+            var toolUseBlocks = new ArrayList<ToolUseBlock>();
             String stopReason = "end_turn";
             int turnInput = 0, turnOutput = 0;
             int turnCacheRead = 0, turnCacheCreation = 0;
             boolean streamError = false;
             // 7. 消费流式响应
-            while(true){
+            while (true) {
                 StreamEvent event;
                 try {
                     event = streamQueue.poll(30, TimeUnit.SECONDS);
@@ -147,8 +169,7 @@ public class Agent {
                         text.append(td.text());
                         putSafe(queue, new AgentEvent.StreamText(td.text()));
                     }
-                    case StreamEvent.ThinkingDelta td ->
-                            putSafe(queue, new AgentEvent.ThinkingText(td.text()));
+                    case StreamEvent.ThinkingDelta td -> putSafe(queue, new AgentEvent.ThinkingText(td.text()));
                     case StreamEvent.ThinkingComplete tc -> {
                         thinkingBlocks.add(new ThinkingBlock(tc.thinking(), tc.signature()));
                         putSafe(queue, new AgentEvent.ThinkingComplete(tc.thinking(), tc.signature()));
@@ -156,9 +177,10 @@ public class Agent {
                     case StreamEvent.ToolCallStart tcs ->
                             putSafe(queue, new AgentEvent.ToolUseEvent(tcs.toolId(), tcs.toolName(), Map.of()));
                     //等待参数,无需展示
-                    case StreamEvent.ToolCallDelta tcd -> {}
+                    case StreamEvent.ToolCallDelta tcd -> {
+                    }
                     case StreamEvent.ToolCallComplete tcc -> {
-                        toolCalls.add(new ToolCallInfo(tcc.toolId(), tcc.toolName(), tcc.arguments()));
+                        toolUseBlocks.add(new ToolUseBlock(tcc.toolId(), tcc.toolName(), tcc.arguments()));
                         putSafe(queue, new AgentEvent.ToolUseEvent(
                                 tcc.toolId(), tcc.toolName(), tcc.arguments()));
                     }
@@ -184,13 +206,17 @@ public class Agent {
                         || lastStreamError.contains("prompt"))) {
                     if (contextRetries < 3) {
                         contextRetries++;
-                        ContextCompactor.forceCompact(conv, client, contextWindow,recoveryState,tools);
+                        ContextCompactor.forceCompact(conv, client, contextWindow, recoveryState, tools);
                         continue; // 重试
                     }
                 }
                 if (lastStreamError != null && lastStreamError.toLowerCase().contains("rate limit")) {
                     putSafe(queue, new AgentEvent.RetryEvent("Rate limited, waiting 5s...", 5000));
-                    try { Thread.sleep(5000); } catch (InterruptedException e) { break; }
+                    try {
+                        Thread.sleep(5000);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
                     continue;
                 }
                 break;
@@ -221,12 +247,9 @@ public class Agent {
                 outputRecoveries = 0;
             }
             // 10. 保存 assistant 消息
-            var toolUseBlocks = toolCalls.stream()
-                    .map(tc -> new ToolUseBlock(tc.toolId, tc.toolName, tc.args))
-                    .toList();
             conv.addAssistantFull(text.toString(), thinkingBlocks, toolUseBlocks);
             // 11. 没有工具调用 → 结束
-            if(toolCalls.isEmpty()){
+            if (toolUseBlocks.isEmpty()) {
                 if (fileHistory != null) {
                     String summary = text.length() > 60 ? text.substring(0, 60) + "..." : text.toString();
                     fileHistory.makeSnapshot(conv.size(), summary);
@@ -237,19 +260,12 @@ public class Agent {
             }
             // 12. 执行工具 + 收集结果
             var executor = new StreamingExecutor(registry, checker, hookEngine, queue, recoveryState);
-            var callInfos = toolCalls.stream()
-                    .map(tc -> new StreamingExecutor.ToolCallInfo(tc.toolId, tc.toolName, tc.args))
-                    .toList();
-            var results = executor.executeAll(callInfos);
-
+            var results = executor.executeAll(toolUseBlocks);
             // Add results to conversation
-            var resultBlocks = results.stream()
-                    .map(r -> new ToolResultBlock(r.toolId(), r.output(), r.isError()))
-                    .toList();
-            conv.addToolResultsMessage(resultBlocks);
+            conv.addToolResultsMessage(results);
 
-            // 非阻塞 memory recall：工具执行完后检查 prefetch 是否就绪
-            // 记忆在第 1 轮工具执行后、第 2 轮迭代前注入
+            // 非阻塞memory recall:工具执行完后检查prefetch是否就绪
+            // 记忆在第1轮工具执行后、第2轮迭代前注入
             if (memoryRecallFuture != null && !memoryRecallConsumed) {
                 if (memoryRecallFuture.isDone()) {
                     try {
@@ -257,11 +273,17 @@ public class Agent {
                         if (recall != null && !recall.isEmpty()) {
                             conv.addSystemReminder(recall);
                         }
-                    } catch (Exception ignored) {}
+                    } catch (Exception ignored) {
+                    }
                     memoryRecallConsumed = true;
                 }
             }
+        }
+    } finally {
             // 13. turn_end 通知
+            if (!loopCompleted) {
+                putSafe(queue, new AgentEvent.LoopComplete(0));
+            }
         }
 
     }
