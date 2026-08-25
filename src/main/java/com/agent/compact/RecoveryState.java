@@ -9,16 +9,6 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Per-agent snapshots that need to survive Layer 2 compaction.
- *
- * <p>Compact wipes the working transcript; without these records the
- * model would forget which files it had just read and which skill SOPs it
- * was operating under. {@link ContextCompactor#buildRecoveryAttachment}
- * renders the recorded data into a single attachment block that gets
- * appended to the post-compact summary message.
- *
- * <p>Thread-safe: tool callbacks may fire from multiple virtual threads in
- * the streaming executor.
  * RecoveryState 是 压缩前的快照记录器 ——在压缩把旧消息清空之前，记录"AI 最近读过哪些文件"、
  * "激活了哪些 skill"，压缩后把这些信息附加到摘要消息中，避免 AI 失忆。
  */
