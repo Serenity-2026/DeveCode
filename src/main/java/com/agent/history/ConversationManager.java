@@ -17,8 +17,6 @@ public class ConversationManager {
 
     private final List<Message> history = new ArrayList<>();
 
-    private boolean ltmInjected = false;
-
     private static final ObjectMapper MAPPER=new ObjectMapper();
 
     public void addUserMessage(String content) {
@@ -56,7 +54,6 @@ public class ConversationManager {
      * 把项目说明（CLAUDE.md/AGENTS.md 风格）和自动记忆注入到对话开头，作为给 LLM 的背景上下文。
      */
     public void injectLongTermMemory(String instructions, String memories) {
-        if (ltmInjected) return;
         var sections = new ArrayList<String>();
         if (instructions != null && !instructions.isEmpty()) {
             sections.add("# devecodeMd\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\n" + instructions);
@@ -74,29 +71,36 @@ public class ConversationManager {
                 body +
                 "\n\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\n</system-reminder>";
         //Anthropic 的 system prompt 是请求级的独立参数（在 LlmClient.stream() 里通过 systemPrompt 传入），而 history 里的消息只能是 user/assistant。
-        history.add(0, new Message("user", wrapped));
-        ltmInjected = true;
-    }
-
-    public void resetLtmInjected() {
-        ltmInjected = false;
-    }
-    //动态状态 -> 包成 system-reminder，贴在最新 user 消息末尾，每轮刷新
-    public void addSystemReminder(String content) {
-        //需要合并system-reminder和前面一条消息
+        // 关键:先看 history[0] 是不是已经注入过的 system-reminder
         if (!history.isEmpty()) {
-            var prev = history.getLast();
-            var prevRole = (String) prev.getRole();
-            //如果是相同角色
-            if (prevRole != null && prevRole.equals("user")) {
-                var prevContent = prev.getContent();
-                if (prevContent instanceof String s) {
-                    var merged = new Message(prev.getRole(),s + "\n\n" + prev.getContent(),prev.getThinkingBlocks(),prev.getToolUses(),prev.getToolResults());
-                    history.set(history.size() - 1, merged);
-                }
+            var first = history.getFirst();
+            if (first.getContent() instanceof String s && s.startsWith("<system-reminder>")) {
+                history.set(0, new Message("user", wrapped));  // 原地替换
+                return;
             }
         }
-        history.add(new Message("user", "<system-reminder>\n" + content + "\n</system-reminder>"));
+        // 否则首次注入,插入到开头
+        history.addFirst(new Message("user", wrapped));
+    }
+
+
+    //动态状态 -> 包成 system-reminder，贴在最新 user 消息末尾，每轮刷新
+    public void addSystemReminder(String content) {
+        String wrapped = "<system-reminder>\n" + content + "\n</system-reminder>";
+        if (!history.isEmpty()) {
+            var prev = history.getLast();
+            if ("user".equals(prev.getRole()) && prev.getContent() != null) {
+                var merged = new Message(
+                        prev.getRole(),
+                        prev.getContent() + "\n\n" + wrapped,
+                        prev.getThinkingBlocks(),
+                        prev.getToolUses(),
+                        prev.getToolResults());
+                history.set(history.size() - 1, merged);
+                return;
+            }
+        }
+        history.add(new Message("user", wrapped));
     }
 
     public List<Message> getMessages() {
@@ -191,7 +195,8 @@ public class ConversationManager {
         var messages = new ArrayList<Map<String, Object>>();
         for (Message msg : history) {
             var message = new LinkedHashMap<String, Object>();
-            message.put("role", msg.getRole());
+            //role 兜底：null 会导致 Anthropic API 400
+            message.put("role", msg.getRole() != null ? msg.getRole() : "user");
             var content = new ArrayList<Map<String, Object>>();
             if(msg.hasThinking()){
                 //1.添加thinking块
@@ -232,6 +237,11 @@ public class ConversationManager {
                     }
                     content.add(block);
                 }
+            }
+            //空 content 会导致 Anthropic API 400（content 必须非空数组），
+            //跳过既无 thinking/text 也无 tool_use/tool_result 的空消息
+            if (content.isEmpty()) {
+                continue;
             }
             message.put("content", content);
             messages.add(message);
