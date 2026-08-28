@@ -118,7 +118,7 @@ public class AnthropicCodeClient implements LlmClient {
                 body.put("thinking", Map.of("type", "enabled", "budget_tokens", maxOutputTokens - 1));
             }
         }
-        body.put("messages",conv.serializeAnthropic());
+        body.put("messages",conv.serialize("anthropic"));
         //工具列表非空时放入请求体，让 LLM 知道有哪些工具可调用
         if (tools != null && !tools.isEmpty()) {
             body.put("tools", tools);

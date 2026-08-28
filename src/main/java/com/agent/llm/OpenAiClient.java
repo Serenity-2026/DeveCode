@@ -95,7 +95,7 @@ public class OpenAiClient implements LlmClient {
         if (systemPrompt != null && !systemPrompt.isEmpty()) {
             messages.add(Map.of("role", "system", "content", systemPrompt));
         }
-        messages.addAll(conv.serializeOpenAI());
+        messages.addAll(conv.serialize("openAI"));
 
         //Step 2：拼接 OpenAI Chat Completions 请求体
         var body = new LinkedHashMap<String, Object>();
