@@ -45,7 +45,6 @@ public class Agent {
     //恢复次数上限,升级之后若仍被截断最多再让模型续写 3 次。
     private static final int MAX_OUTPUT_RECOVERIES = 3;
 
-    private ContextCompactor.UsageAnchor usageAnchor;
     private PermissionChecker checker;
 
 
@@ -86,9 +85,32 @@ public class Agent {
         if(maxIterations>0)this.maxIterations = maxIterations;
     }
     public void setWorkDir(String workDir) { this.workDir = workDir; }
+
+    // ── 依赖注入（UI/宿主组装 Agent 时调用）──
+    public void setChecker(PermissionChecker checker) { this.checker = checker; }
+    public void setHookEngine(HookEngine hookEngine) { this.hookEngine = hookEngine; }
+    public void setInstructions(String instructions) {
+        this.instructions = instructions == null ? "" : instructions;
+    }
+    public void setMemoryContent(String memoryContent) {
+        this.memoryContent = memoryContent == null ? "" : memoryContent;
+    }
+    public void setToolNameFilter(Predicate<String> toolNameFilter) {
+        this.toolNameFilter = toolNameFilter;
+    }
+
+    // ── 中断支持：UI 按 Esc 时可停止当前 agent 循环 ──
+    private volatile Thread agentThread;
+    /** 请求中断当前正在运行的 agent 循环（幂等，未运行时无副作用）。 */
+    public void stop() {
+        Thread t = agentThread;
+        if (t != null) t.interrupt();
+    }
+
     public BlockingQueue<AgentEvent> run(ConversationManager conv) {
         var queue = new LinkedBlockingQueue<AgentEvent>(64);
         Thread.startVirtualThread(() -> {
+            agentThread = Thread.currentThread();
             try {
                 agentLoop(conv, queue);
             } catch (Exception e) {
