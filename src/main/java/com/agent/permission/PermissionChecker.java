@@ -312,7 +312,7 @@ public class PermissionChecker {
 
     public void appendLocalRule(String toolName, String pattern) {
         if (projectRoot == null) return;
-        Path localFile = projectRoot.resolve(".mewcode").resolve("permissions.local.yaml");
+        Path localFile = projectRoot.resolve(".devecode").resolve("permissions.local.yaml");
         try {
             Files.createDirectories(localFile.getParent());
             var rules = new ArrayList<>(loadRulesFile(localFile));
