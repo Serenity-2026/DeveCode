@@ -86,6 +86,8 @@ public class ConversationManager {
 
 
     //动态状态 -> 包成 system-reminder，贴在最新 user 消息末尾，每轮刷新
+    //system-reminder是一种特殊的消息标记。它放在messages字段里，但用XML标签包裹，告诉模型「这不是用户说的话，而是系统给你的补充指令」。
+    //不影响 system 字段的缓存，又能让模型在对话过程中随时参考
     public void addSystemReminder(String content) {
         String wrapped = "<system-reminder>\n" + content + "\n</system-reminder>";
         if (!history.isEmpty()) {
