@@ -69,6 +69,7 @@ public class TerminalUI {
     // ── 右侧状态面板 ──
     private static final int PANEL_WIDTH = 36;
     private static final int PANEL_MIN_COLS = 100;  // 终端宽度 >= 此值才显示面板
+    private static final long PANEL_REFRESH_MS = 1000;  // 面板周期刷新间隔（CPU/Context 实时更新）
 
     // ── 终端 ──
     private final Terminal terminal;
@@ -251,9 +252,11 @@ public class TerminalUI {
                     handleEvent(event);
                 }
 
-                // 渲染（最多 30 fps）
+                // 渲染（事件驱动 + 至少每秒一次的周期性刷新）
+                // 周期刷新保证右侧状态面板（CPU 占用、Context 用量、API usage）实时更新，
+                // 即使空闲无任何输入/流式事件也不会冻结
                 long now = System.currentTimeMillis();
-                if (needsRedraw || terminalResized) {
+                if (needsRedraw || terminalResized || now - lastRenderMs >= PANEL_REFRESH_MS) {
                     terminalResized = false;
                     render();
                     needsRedraw = false;

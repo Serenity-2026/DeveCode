@@ -30,6 +30,7 @@ public class DeveCodeApp {
     private static final String GREEN   = ESC + "[32m";
     private static final String YELLOW  = ESC + "[33m";
     private static final String GRAY    = ESC + "[90m";
+    private static final String WHITE   = ESC + "[97m";
 
     // ── 边框专用色：256 色亮天蓝 (75) ──
     private static final String BORDER  = ESC + "[38;5;75m";
@@ -371,12 +372,12 @@ public class DeveCodeApp {
 
         for (int i = 0; i < providers.size(); i++) {
             ProviderConfig p = providers.get(i);
-            // 选中行：三列全部高亮（❯ 黄、name 青粗、protocol · model 白粗）
-            // 未选中行：全部暗色（❯ 灰、name 青、protocol · model 灰）
+            // 选中行：三列全部高亮（● 实心白点、name 青粗、protocol · model 白粗）
+            // 未选中行：全部暗色（○ 空心灰点、name 青、protocol · model 灰）
             boolean sel = (i == selectedIdx);
             String prefix = sel
-                    ? BOLD + YELLOW + "❯ " + RESET
-                    : GRAY + "  " + RESET;
+                    ? BOLD + WHITE + "● " + RESET
+                    : GRAY + "○ " + RESET;
             String paddedName = padRight(p.getName(), maxNameLen);
             String nameColored = sel
                     ? BOLD + CYAN + paddedName + RESET
