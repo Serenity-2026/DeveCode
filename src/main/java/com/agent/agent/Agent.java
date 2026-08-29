@@ -99,7 +99,7 @@ public class Agent {
         return queue;
     }
     private void agentLoop(ConversationManager conv, BlockingQueue<AgentEvent> queue) {
-        conv.injectLongTermMemory(instructions, memoryContent);
+
         int contextRetries = 0;
         int totalInput = 0, totalOutput = 0;
         //升级标识,只提升一次上限,后续走续写路线
@@ -115,9 +115,9 @@ public class Agent {
             }
             // 2. 检查线程中断,已中断线程退出agent循环
             if (Thread.currentThread().isInterrupted()) break;
-            // 3. 消费通知队列
-            // 4. 自动上下文压缩
-            // 5. 注入延迟工具清单
+            // 3. 每轮注入最新的ltm信息
+            conv.injectLongTermMemory(instructions, memoryContent);
+            // 4. 注入延迟工具清单
             var deferredNames = registry.getDeferredToolNames();
             if (!deferredNames.isEmpty()) {
                 var sb = new StringBuilder();
@@ -129,7 +129,7 @@ public class Agent {
                 }
                 conv.addSystemReminder(sb.toString());
             }
-            // 6. 获取工具 schema，调用 LLM
+            // 5. 获取工具 schema，调用 LLM
             var iterToolSchemas = registry.getAllSchemas(protocol);
             if (toolNameFilter != null) {
                 //保留指定name的工具方法
@@ -150,7 +150,7 @@ public class Agent {
             int turnInput = 0, turnOutput = 0;
             int turnCacheRead = 0, turnCacheCreation = 0;
             boolean streamError = false;
-            // 7. 消费流式响应
+            // 6. 消费流式响应
             while (true) {
                 StreamEvent event;
                 try {
@@ -200,7 +200,7 @@ public class Agent {
                 if (event instanceof StreamEvent.StreamEnd || event instanceof StreamEvent.Error) break;
             }
 
-            // 8. 错误恢复
+            // 7. 错误恢复
             if (streamError) {
                 if (lastStreamError != null && (lastStreamError.contains("context") || lastStreamError.contains("too long")
                         || lastStreamError.contains("prompt"))) {
@@ -224,7 +224,7 @@ public class Agent {
             totalInput += turnInput;
             totalOutput += turnOutput;
             putSafe(queue, new AgentEvent.UsageEvent(totalInput, totalOutput));
-            // 9. max_tokens 恢复
+            // 8. max_tokens 恢复
             if ("max_tokens".equals(stopReason)) {
                 if (!maxTokensEscalated) {
                     maxTokensEscalated = true;
@@ -246,9 +246,9 @@ public class Agent {
             } else {
                 outputRecoveries = 0;
             }
-            // 10. 保存 assistant 消息
+            // 9. 保存 assistant 消息
             conv.addAssistantFull(text.toString(), thinkingBlocks, toolUseBlocks);
-            // 11. 没有工具调用 → 结束
+            // 10. 没有工具调用 → 结束
             if (toolUseBlocks.isEmpty()) {
                 if (fileHistory != null) {
                     String summary = text.length() > 60 ? text.substring(0, 60) + "..." : text.toString();
@@ -258,7 +258,7 @@ public class Agent {
                 loopCompleted = true;
                 break;
             }
-            // 12. 执行工具 + 收集结果
+            // 11. 执行工具 + 收集结果
             var executor = new StreamingExecutor(registry, checker, hookEngine, queue, recoveryState);
             var results = executor.executeAll(toolUseBlocks);
             // Add results to conversation
@@ -280,7 +280,7 @@ public class Agent {
             }
         }
     } finally {
-            // 13. turn_end 通知
+            // 12. turn_end 通知，使用loopCompleted
             if (!loopCompleted) {
                 putSafe(queue, new AgentEvent.LoopComplete(0));
             }
