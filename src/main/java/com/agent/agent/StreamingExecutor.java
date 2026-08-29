@@ -19,10 +19,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
 
-import static com.agent.permission.PermissionResponse.ALLOW;
-import static com.agent.permission.PermissionResponse.DENY;
-import static com.anthropic.models.beta.sessions.events.BetaManagedAgentsAgentToolUseEvent.EvaluatedPermission.ASK;
-
 /**
  并发工具执行器，将工具调用分为只读（并行）和写入/命令（顺序）批处理。
  当 LLM 一次性返回多个工具调用时，把"相邻的只读工具"合成一个并行批次用虚拟线程同时跑，
@@ -87,31 +83,28 @@ public class StreamingExecutor {
                             results.add(futures.get(i).get());
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
-                            String msg = "Interrupted while executing " + call.toolName();
-                            results.add(new ToolResultBlock(call.toolId(), msg, true));
-                            putSafe(new AgentEvent.ToolResultEvent(
-                                    call.toolId(), call.toolName(), msg, true, 0));
-                            break;
+                            results.add(skippedResult(call, "Interrupted while executing"));
                         } catch (ExecutionException e) {
                             Throwable cause = e.getCause() != null ? e.getCause() : e;
-                            String msg = "Tool execution failed: " + cause.getMessage();
-                            results.add(new ToolResultBlock(call.toolId(), msg, true));
-                            putSafe(new AgentEvent.ToolResultEvent(
-                                    call.toolId(), call.toolName(), msg, true, 0));
+                            results.add(failedResult(call, "Tool execution failed: " + cause.getMessage()));
                         }
                     }
-
                 }
             } else {
+                boolean batchFailed = false;
                 for (var call : batch.calls) {
+                    if (batchFailed) {
+                        // 串行批次：一个失败则跳过当前批次剩余工具，但必须补上
+                        // tool_result —— Anthropic 协议要求每个 tool_use 都有配对的
+                        // tool_result，缺失会导致 API 400。
+                        results.add(skippedResult(call, "Skipped: earlier tool in batch failed"));
+                        continue;
+                    }
                     try {
                         results.add(executeSingle(call));
                     } catch (Exception e) {
-                        String msg = "Tool execution failed: " + e.getMessage();
-                        results.add(new ToolResultBlock(call.toolId(), msg, true));
-                        putSafe(new AgentEvent.ToolResultEvent(
-                                call.toolId(), call.toolName(), msg, true, 0));
-                        break; // 串行批次：一个失败则放弃当前批次剩余工具
+                        results.add(failedResult(call, "Tool execution failed: " + e.getMessage()));
+                        batchFailed = true;
                     }
                 }
             }
@@ -236,6 +229,17 @@ public class StreamingExecutor {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    /** 构造"执行失败"结果并同步通知 UI。 */
+    private ToolResultBlock failedResult(ToolUseBlock call, String msg) {
+        putSafe(new AgentEvent.ToolResultEvent(call.toolId(), call.toolName(), msg, true, 0));
+        return new ToolResultBlock(call.toolId(), msg, true);
+    }
+
+    /** 构造"被跳过"结果（批次中前序工具失败/中断）并同步通知 UI。 */
+    private ToolResultBlock skippedResult(ToolUseBlock call, String msg) {
+        return failedResult(call, msg);
     }
 
     /**
