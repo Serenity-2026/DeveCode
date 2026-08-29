@@ -1,30 +1,33 @@
 package com.agent.tui;
 
+import com.agent.agent.Agent;
+import com.agent.agent.AgentEvent;
 import com.agent.history.ConversationManager;
+import com.agent.hook.HookEngine;
 import com.agent.infra.ProviderConfig;
 import com.agent.llm.LlmClient;
-import com.agent.llm.StreamEvent;
-import com.agent.llm.ThinkingBlock;
-import com.agent.llm.ToolUseBlock;
-import com.agent.llm.ToolResultBlock;
-import com.agent.tool.Tool;
+import com.agent.permission.PermissionChecker;
+import com.agent.permission.PermissionMode;
+import com.agent.permission.PermissionResponse;
 import com.agent.tool.ToolRegistry;
-import com.agent.tool.ToolResult;
 import com.agent.tool.FileHistory;
 import com.agent.tool.FileStateCache;
 import com.agent.tool.impl.ToolSearchTool;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
+import org.jline.utils.NonBlockingReader;
 
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.lang.management.ManagementFactory;
+import java.nio.file.Path;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import com.sun.management.OperatingSystemMXBean;
@@ -32,31 +35,30 @@ import com.sun.management.OperatingSystemMXBean;
 /**
  * 全功能终端 UI，承载输入、流式输出、多轮对话与状态展示。
  *
- * <h2>架构</h2>
+ * <h2>架构（后端/呈现端分离）</h2>
  * <pre>
  *   ┌─────────────┐         ┌──────────────────┐
  *   │ inputLoop   │──事件──→│ 主线程 (run)     │
  *   │ (虚拟线程)  │  队列   │ ├─ handleEvent   │
- *   │ 读取原始字节│         │ ├─ submitMessage │──→ LlmClient.stream()
- *   └─────────────┘         │ ├─ render()      │←── StreamEvent 队列
- *                           │ └─ 状态面板      │
+ *   │ 读取原始字节│         │ ├─ submitMessage │──→ Agent.run()
+ *   └─────────────┘         │ ├─ render()      │←── AgentEvent 队列
+ *                           │ └─ 状态面板      │    (consumeAgentEvents)
  *                           └──────────────────┘
  * </pre>
  *
- * <h2>外部依赖</h2>
- * <ul>
- *   <li>{@link ProviderConfig} — provider 配置（名称、协议、模型、API Key、上下文窗口大小）</li>
- *   <li>{@link LlmClient} — LLM 流式客户端，调用 {@code stream()} 返回 StreamEvent 队列</li>
- *   <li>{@link ConversationManager} — 对话历史管理，维护发给 LLM 的消息列表</li>
- *   <li>{@link StreamEvent} — 流式事件密封接口（ThinkingDelta/TextDelta/StreamEnd/Error）</li>
- *   <li>{@link MarkdownRenderer} — 将 Markdown 转为带 ANSI 颜色的终端字符串</li>
- * </ul>
+ * <p>UI 不再自己实现 agent 循环：用户提交消息后调用 {@link Agent#run}，
+ * 由 Agent 在后端完成 LLM 调用 → 工具执行（含权限检查/hook/并发分批）→
+ * 上下文压缩 → 错误恢复的完整循环，UI 只消费 {@link AgentEvent} 做呈现：
+ * 流式正文/思考、工具调用与结果（含耗时）、权限询问（y/a/n 交互）、
+ * 压缩/重试提示、token 用量统计。
  *
  * <h2>线程模型</h2>
  * <ul>
  *   <li>主线程：事件消费 + 渲染 + 状态机（16ms 节流 ≈ 60fps）</li>
- *   <li>输入线程（虚拟）：阻塞读取终端字节，控制字符直接处理，可打印字符走队列</li>
- *   <li>流式线程（虚拟）：每次 submitMessage 创建，消费 StreamEvent 队列</li>
+ *   <li>输入线程（虚拟）：阻塞读取终端字节，控制字符直接处理，可打印字符走队列；
+ *       流式期间负责权限按键（y/a/n）和 Esc 中断</li>
+ *   <li>消费线程（虚拟）：每次 submitMessage 创建，消费 AgentEvent 队列并更新 UI 状态</li>
+ *   <li>Agent 线程（虚拟）：由 Agent.run 创建，执行后端 agent 循环</li>
  * </ul>
  */
 public class TerminalUI {
@@ -74,11 +76,15 @@ public class TerminalUI {
 
     // ── 应用状态（外部依赖）──
     private final ProviderConfig provider;       // 当前选中的 provider 配置
-    private final LlmClient client;              // LLM 流式客户端
+    private final LlmClient client;              // LLM 流式客户端（由 Agent 使用）
     private final ConversationManager conversation; // 对话历史管理器
     private final ToolRegistry toolRegistry;     // 工具注册中心
     private final FileHistory fileHistory;       // 文件编辑历史（备份/快照/回退）
     private final FileStateCache fileStateCache; // 先读后改强制缓存
+    private final PermissionChecker permissionChecker; // 多层权限裁决器
+    private final HookEngine hookEngine;         // Hook 引擎（生命周期钩子）
+    private final Agent agent;                   // 后端 agent（事件驱动）
+    private final String sessionId;              // 会话 ID（快照目录/面板显示）
 
     // ── 消息记录 ──
     private final List<UIMessage> messages = new ArrayList<>();
@@ -97,6 +103,13 @@ public class TerminalUI {
     private volatile boolean firstTokenReceived = false;
     private long streamStartMs;
     private long firstTokenMs;
+
+    // ── 权限询问（Agent → UI）──
+    private volatile AgentEvent.PermissionRequestEvent pendingPermission;
+
+    // ── token 用量（UsageEvent 累计）──
+    private volatile int usageInTokens;
+    private volatile int usageOutTokens;
 
     // ── 控制 ──
     private volatile boolean running = true;
@@ -178,14 +191,17 @@ public class TerminalUI {
         this.writer = terminal.writer();
         // 步骤 4：LlmClient.create — 根据 provider 的 protocol（anthropic/openai）创建对应客户端
         this.client = LlmClient.create(provider,
-                "You are a helpful coding assistant. Respond concisely.");
+                "You are DeveCode, an interactive CLI coding agent. "
+                + "Use the available tools to read, search and edit files and to run commands "
+                + "in order to accomplish the user's task. Prefer tools over guessing. "
+                + "When you finish, summarize what you did concisely.");
         // 步骤 5：ConversationManager — 管理对话历史，每次 addUserMessage/addAssistantMessage 会追加到内部列表
         this.conversation = new ConversationManager();
         // 步骤 6：初始化工具基础设施
         // FileStateCache — 记录 ReadFile 读取过的文件内容和 mtime，EditFile/WriteFile 据此强制"先读后改"
         this.fileStateCache = new FileStateCache();
         // FileHistory — 文件编辑备份/快照管理，每次 AI 轮次结束时打快照，支持回退
-        String sessionId = java.util.UUID.randomUUID().toString().substring(0, 8);
+        this.sessionId = java.util.UUID.randomUUID().toString().substring(0, 8);
         this.fileHistory = new FileHistory(System.getProperty("user.dir"), sessionId);
         // ToolRegistry — 用 createDefault() 创建所有工具，再通过 getTool() 注入依赖
         this.toolRegistry = ToolRegistry.createDefault();
@@ -197,6 +213,18 @@ public class TerminalUI {
         ((com.agent.tool.impl.WriteFileTool) toolRegistry.getTool("WriteFile")).setFileStateCache(fileStateCache);
         // ToolSearchTool 需要持有 registry 引用，用于延迟工具发现
         toolRegistry.register(new ToolSearchTool(toolRegistry, provider.getProtocol()));
+        // 步骤 7：权限裁决器 — 多层规则（Plan模式 → 安全命令 → 危险命令 → 路径沙箱 → YAML 规则 → 模式矩阵）
+        this.permissionChecker = new PermissionChecker(
+                PermissionMode.DEFAULT, Path.of(System.getProperty("user.dir")));
+        // 步骤 8：Hook 引擎 — 生命周期钩子（默认无 hook，可通过 loadHooks 注入）
+        this.hookEngine = new HookEngine();
+        // 步骤 9：组装 Agent — 后端事件驱动的 agent 循环，UI 只消费 AgentEvent
+        this.agent = new Agent(client, toolRegistry, provider);
+        agent.setChecker(permissionChecker);
+        agent.setHookEngine(hookEngine);
+        agent.setFileHistory(fileHistory);
+        agent.setWorkDir(System.getProperty("user.dir"));
+        agent.setMaxIterations(30);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -233,18 +261,20 @@ public class TerminalUI {
                 }
 
                 // 流式模式下定时刷新计时器
-                if (streaming && !firstTokenReceived) {
+                if (streaming && !firstTokenReceived && pendingPermission == null) {
                     if (now - lastRenderMs >= 500) {
                         long elapsed = (System.currentTimeMillis() - streamStartMs) / 1000;
-                        if (!messages.isEmpty() && messages.getLast().streaming()) {
-                            String think = thinkingAccum.toString();
-                            if (think.isEmpty()) {
-                                messages.set(messages.size() - 1,
-                                    UIMessage.streaming("Imagining… (" + elapsed + "s)"));
-                            } else {
-                                // thinking 阶段也更新计时器
-                                messages.set(messages.size() - 1,
-                                    UIMessage.streamingThinking(think, elapsed));
+                        synchronized (messages) {
+                            if (!messages.isEmpty() && messages.getLast().streaming()) {
+                                String think = thinkingAccum.toString();
+                                if (think.isEmpty()) {
+                                    messages.set(messages.size() - 1,
+                                        UIMessage.streaming("Imagining… (" + elapsed + "s)"));
+                                } else {
+                                    // thinking 阶段也更新计时器
+                                    messages.set(messages.size() - 1,
+                                        UIMessage.streamingThinking(think, elapsed));
+                                }
                             }
                         }
                         needsRedraw = true;
@@ -337,20 +367,11 @@ public class TerminalUI {
     // ═══════════════════════════════════════════════════════════════
 
     /**
-     * 提交用户消息并启动 Agent Loop。
+     * 提交用户消息并启动后端 Agent。
      *
-     * Agent Loop 是 Coding Agent 的核心循环：
-     *   1. 添加用户消息 → 发送给 LLM（携带工具列表）
-     *   2. 流式接收响应：思考、正文、工具调用
-     *   3. 如果 LLM 请求工具调用（stopReason=tool_use）：
-     *      a. 保存助手消息（含 tool_uses）到对话历史
-     *      b. 逐个执行工具，展示结果
-     *      c. 将工具结果添加到对话历史
-     *      d. 回到步骤 2，继续下一轮
-     *   4. 如果 LLM 自然结束（stopReason=end_turn）：
-     *      a. 渲染最终 Markdown，保存到对话历史
-     *      b. 打文件快照（FileHistory.makeSnapshot）
-     *      c. 退出循环
+     * UI 只负责：添加用户消息 → 调用 {@link Agent#run} 拿到 AgentEvent 队列 →
+     * 在虚拟线程中消费事件并更新界面。LLM 调用、工具执行（权限检查/hook/并发分批）、
+     * 上下文压缩、错误恢复全部由后端 Agent 完成。
      *
      * @param text 用户输入的文本
      */
@@ -364,7 +385,7 @@ public class TerminalUI {
         }
 
         // 添加用户消息到 UI 列表 + ConversationManager
-        messages.add(UIMessage.user(text));
+        synchronized (messages) { messages.add(UIMessage.user(text)); }
         conversation.addUserMessage(text);
         inputBuffer.setLength(0);
         cursorCol = 0;
@@ -373,236 +394,204 @@ public class TerminalUI {
 
         // 启动流式状态
         streaming = true;
-        messages.add(UIMessage.streaming("Imagining… (0s)"));
+        streamAccum.setLength(0);
+        thinkingAccum.setLength(0);
+        firstTokenReceived = false;
+        streamStartMs = System.currentTimeMillis();
+        synchronized (messages) { messages.add(UIMessage.streaming("Imagining… (0s)")); }
         needsRedraw = true;
 
-        final String userText = text;
         Thread.startVirtualThread(() -> {
             try {
-                runAgentLoop(userText);
+                BlockingQueue<AgentEvent> events = agent.run(conversation);
+                consumeAgentEvents(events);
             } catch (InterruptedException e) {
-                messages.add(UIMessage.error("Request interrupted."));
+                appendMessage(UIMessage.error("Request interrupted."));
+            } catch (Exception e) {
+                appendMessage(UIMessage.error("UI error: " + e.getMessage()));
             } finally {
                 streaming = false;
+                pendingPermission = null;
                 needsRedraw = true;
             }
         });
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    //  AgentEvent 消费（后端 → 呈现端）
+    // ═══════════════════════════════════════════════════════════════
+
     /**
-     * Agent Loop 主循环 — 在虚拟线程中执行。
-     *
-     * 每次迭代代表一轮 LLM 请求-响应：
-     *   流式接收 → 如果有工具调用 → 执行工具 → 继续循环
-     *   流式接收 → 如果自然结束 → 渲染最终文本 → 退出循环
-     *
-     * @param userText 原始用户输入（用于 FileHistory 快照标签）
+     * 消费后端 Agent 抛出的 AgentEvent 流，直到 LoopComplete。
+     * 运行在 submitMessage 创建的虚拟线程上。
      */
-    private void runAgentLoop(String userText) throws InterruptedException {
-        String protocol = provider.getProtocol();
-        List<Map<String, Object>> toolSchemas = toolRegistry.getAllSchemas(protocol);
+    private void consumeAgentEvents(BlockingQueue<AgentEvent> events) throws InterruptedException {
+        // 本轮已展示过"调用中"的工具 ID（ToolUseEvent 会发两次：
+        // ToolCallStart 携带空参数，ToolCallComplete 携带完整参数）
+        Set<String> startedCalls = new HashSet<>();
 
         while (true) {
-            // ── 重置本轮状态 ──
-            streamAccum.setLength(0);
-            thinkingAccum.setLength(0);
-            firstTokenReceived = false;
-            streamStartMs = System.currentTimeMillis();
-
-            // 本轮工具调用累积
-            var pendingToolUses = new ArrayList<ToolUseBlock>();
-            var toolCallArgsMap = new HashMap<String, StringBuilder>();
-            String[] currentTool = {"", ""};  // [toolId, toolName]，用数组绕过 lambda effectively-final 限制
-
-            // 本轮思考块（含 signature，用于对话历史回传）
-            var thinkingBlocks = new ArrayList<ThinkingBlock>();
-
-            // 替换占位消息
-            replaceLastMessage(UIMessage.streaming("Imagining… (0s)"));
-            needsRedraw = true;
-
-            // ── 发送请求并消费流式事件 ──
-            BlockingQueue<StreamEvent> events = client.stream(conversation, toolSchemas);
-
-            String stopReason = "";
-            boolean gotError = false;
-            String errorMsg = null;
-
-            while (true) {
-                StreamEvent evt = events.take();
-                switch (evt) {
-                    case StreamEvent.ThinkingDelta td -> {
-                        thinkingAccum.append(td.text());
-                        updateStreamingMessage();
-                        needsRedraw = true;
+            AgentEvent event = events.take();
+            switch (event) {
+                case AgentEvent.StreamText st -> {
+                    ensureStreamingPlaceholder();
+                    if (!firstTokenReceived) {
+                        firstTokenReceived = true;
+                        firstTokenMs = System.currentTimeMillis();
                     }
-                    case StreamEvent.ThinkingComplete tc -> {
-                        thinkingBlocks.add(new ThinkingBlock(tc.thinking(), tc.signature()));
-                        updateStreamingMessage();
-                        needsRedraw = true;
-                    }
-                    case StreamEvent.TextDelta td -> {
-                        if (!firstTokenReceived) {
-                            firstTokenReceived = true;
-                            firstTokenMs = System.currentTimeMillis();
-                        }
-                        streamAccum.append(td.text());
-                        updateStreamingMessage();
-                        needsRedraw = true;
-                    }
-                    case StreamEvent.ToolCallStart tcs -> {
-                        // 如果流式消息已有文本/思考内容，先定稿为助手消息，再添加工具调用
-                        // 这样助手正文和工具调用各自独立显示，不会互相覆盖
-                        if (!messages.isEmpty() && messages.getLast().streaming()
-                                && (!streamAccum.isEmpty() || !thinkingAccum.isEmpty())) {
-                            finalizeStreamingAssistant();
-                            messages.add(UIMessage.streamingToolCall(tcs.toolName(), "…"));
-                        } else {
-                            // 无文本内容，直接替换占位消息
-                            replaceLastMessage(UIMessage.streamingToolCall(tcs.toolName(), "…"));
-                        }
-                        currentTool[0] = tcs.toolId();
-                        currentTool[1] = tcs.toolName();
-                        toolCallArgsMap.put(tcs.toolId(), new StringBuilder());
-                        needsRedraw = true;
-                    }
-                    case StreamEvent.ToolCallDelta tcd -> {
-                        // 累积当前工具的参数片段
-                        if (!currentTool[0].isEmpty()) {
-                            toolCallArgsMap.get(currentTool[0]).append(tcd.text());
-                            String partial = toolCallArgsMap.get(currentTool[0]).toString();
-                            replaceLastMessage(UIMessage.streamingToolCall(currentTool[1], partial));
-                            needsRedraw = true;
-                        }
-                    }
-                    case StreamEvent.ToolCallComplete tcc -> {
-                        pendingToolUses.add(new ToolUseBlock(tcc.toolId(), tcc.toolName(), tcc.arguments()));
-                        currentTool[0] = "";
-                        currentTool[1] = "";
-                        // 显示完整的工具调用
-                        replaceLastMessage(UIMessage.toolCall(tcc.toolName(), formatToolArgs(tcc.arguments())));
-                        needsRedraw = true;
-                    }
-                    case StreamEvent.StreamEnd se -> {
-                        stopReason = se.stopReason();
-                    }
-                    case StreamEvent.Error e -> {
-                        gotError = true;
-                        errorMsg = e.message();
-                    }
-                    default -> {}
-                }
-                // StreamEnd 或 Error 时退出内层循环
-                if (evt instanceof StreamEvent.StreamEnd || evt instanceof StreamEvent.Error) break;
-            }
-
-            // ── 错误处理 ──
-            if (gotError) {
-                String errText = errorMsg;
-                if (firstTokenReceived) {
-                    errText += "\n\n[Partial reply] " + streamAccum.toString();
-                }
-                messages.add(UIMessage.error(errText));
-                return;
-            }
-
-            // ── 渲染本轮最终文本 ──
-            String finalText = streamAccum.toString();
-            String thinkText = thinkingAccum.toString();
-            String rendered;
-            try {
-                rendered = MarkdownRenderer.render(finalText);
-            } catch (Exception e) {
-                rendered = finalText;
-            }
-            // 如有思考内容，拼接在正文前
-            if (!thinkText.isEmpty()) {
-                String thinkBlock = GRAY + "✻ Thinking…" + RESET + "\n"
-                    + UIMessage.grayLines(thinkText) + "\n"
-                    + GRAY + "✻ Done" + RESET + "\n\n";
-                rendered = thinkBlock + rendered;
-            }
-
-            // ── 根据是否有工具调用决定下一步 ──
-            if ("tool_use".equals(stopReason) && !pendingToolUses.isEmpty()) {
-                // ★ 工具调用分支：保存助手消息（含 tool_uses）→ 执行工具 → 添加结果 → 继续循环
-                conversation.addAssistantFull(finalText, thinkingBlocks, pendingToolUses);
-
-                // 如果流式消息仍有内容（无工具调用前缀文本的边缘情况），定稿它
-                if (!messages.isEmpty() && messages.getLast().streaming()
-                        && (!streamAccum.isEmpty() || !thinkingAccum.isEmpty())) {
-                    finalizeStreamingAssistant();
-                }
-
-                // 逐个执行工具（toolCall 消息已在 ToolCallComplete 时显示，这里只追加结果）
-                var toolResults = new ArrayList<ToolResultBlock>();
-                for (var tu : pendingToolUses) {
-                    // 执行工具
-                    ToolResultBlock result = executeToolCall(tu);
-                    toolResults.add(result);
-
-                    // 显示结果（↳ 缩进表示工具输出）
-                    messages.add(UIMessage.toolResult(tu.toolName(), result.content(), result.isError()));
+                    streamAccum.append(st.text());
+                    synchronized (messages) { updateStreamingMessage(); }
                     needsRedraw = true;
                 }
-
-                // 将工具结果添加到对话历史（Anthropic 用 user 角色 + tool_result block）
-                conversation.addToolResultsMessage(toolResults);
-
-                // 添加下一轮的占位消息
-                messages.add(UIMessage.streaming("Imagining… (0s)"));
-                needsRedraw = true;
-                // 继续循环 → 下一轮 LLM 请求
-            } else {
-                // ★ 自然结束分支：保存助手消息 → 打快照 → 退出循环
-                conversation.addAssistantFull(finalText,
-                        thinkingBlocks.isEmpty() ? null : thinkingBlocks, null);
-
-                long elapsed = (firstTokenReceived ? firstTokenMs : System.currentTimeMillis()) - streamStartMs;
-                double secs = Math.max(elapsed, 0) / 1000.0;
-                replaceLastMessage(UIMessage.assistant(rendered, String.format("DeveCode  (%.1fs)", secs)));
-
-                // 打文件快照（用于后续回退）
-                if (fileHistory != null) {
-                    fileHistory.makeSnapshot(conversation.size(), userText);
+                case AgentEvent.ThinkingText tt -> {
+                    ensureStreamingPlaceholder();
+                    thinkingAccum.append(tt.text());
+                    synchronized (messages) { updateStreamingMessage(); }
+                    needsRedraw = true;
                 }
-                return;
+                case AgentEvent.ThinkingComplete tc -> {
+                    synchronized (messages) { updateStreamingMessage(); }
+                    needsRedraw = true;
+                }
+                case AgentEvent.ToolUseEvent tu -> handleToolUse(tu, startedCalls);
+                case AgentEvent.ToolResultEvent tr -> {
+                    appendMessage(UIMessage.toolResult(
+                            tr.toolName(), tr.output(), tr.isError(), tr.elapsed()));
+                    scrollToBottom();
+                    needsRedraw = true;
+                }
+                case AgentEvent.UsageEvent u -> {
+                    usageInTokens = u.inputTokens();
+                    usageOutTokens = u.outputTokens();
+                    needsRedraw = true;
+                }
+                case AgentEvent.ErrorEvent e -> {
+                    appendMessage(UIMessage.error(e.message()));
+                    needsRedraw = true;
+                }
+                case AgentEvent.CompactEvent c -> {
+                    appendMessage(UIMessage.system(
+                            CYAN + "⤾ Context compacted" + RESET + GRAY +
+                            (c.message() == null || c.message().isEmpty() ? "" : ": " + c.message()) + RESET));
+                    needsRedraw = true;
+                }
+                case AgentEvent.RetryEvent r -> {
+                    appendMessage(UIMessage.system(
+                            YELLOW + "↻ Retrying: " + r.reason() + RESET + GRAY +
+                            (r.waitMs() > 0 ? " (waiting " + (r.waitMs() / 1000) + "s)" : "") + RESET));
+                    needsRedraw = true;
+                }
+                case AgentEvent.PermissionRequestEvent pr -> handlePermissionRequest(pr);
+                case AgentEvent.TurnComplete t -> { /* 后端当前未发送，预留 */ }
+                case AgentEvent.LoopComplete lc -> {
+                    finishLoop(lc.totalTurns());
+                    return;
+                }
             }
         }
     }
 
     /**
-     * 执行单个工具调用。
-     *
-     * 步骤：
-     *   1. 从 ToolRegistry 查找工具实例
-     *   2. 调用 tool.execute(args)
-     *   3. 截断超长输出（MAX_OUTPUT_CHARS）
-     *   4. 返回 ToolResultBlock（含 toolUseId 关联到对应的 tool_use）
-     *
-     * @param toolUse LLM 请求的工具调用（工具名 + 参数）
-     * @return 工具执行结果（含 toolUseId、输出内容、是否出错）
+     * 展示工具调用事件。
+     * ToolCallStart（空参数）→ 显示 "⚙ Name(…)"；
+     * ToolCallComplete（完整参数）→ 替换为完整参数显示。
      */
-    private ToolResultBlock executeToolCall(ToolUseBlock toolUse) {
-        String toolName = toolUse.toolName();
-        Tool tool = toolRegistry.getTool(toolName);
-        if (tool == null) {
-            return new ToolResultBlock(toolUse.toolId(),
-                    "Error: unknown tool '" + toolName + "'", true);
-        }
-        try {
-            ToolResult result = tool.execute(toolUse.arguments());
-            String output = result.output();
-            // 截断超长输出，避免撑爆 LLM 上下文窗口
-            if (output.length() > ToolRegistry.MAX_OUTPUT_CHARS) {
-                output = output.substring(0, ToolRegistry.MAX_OUTPUT_CHARS)
-                        + "\n... (truncated at " + ToolRegistry.MAX_OUTPUT_CHARS + " chars)";
+    private void handleToolUse(AgentEvent.ToolUseEvent tu, Set<String> startedCalls) {
+        String toolName = tu.toolName();
+        Map<String, Object> args = tu.args();
+        boolean isStart = (args == null || args.isEmpty()) && startedCalls.add(tu.toolId());
+
+        if (isStart) {
+            // 若流式消息已有文本/思考内容，先定稿为助手消息，再添加工具调用
+            // 这样助手正文和工具调用各自独立显示，不会互相覆盖
+            synchronized (messages) {
+                if (!messages.isEmpty() && messages.getLast().streaming()) {
+                    if (!streamAccum.isEmpty() || !thinkingAccum.isEmpty()) {
+                        finalizeStreamingAssistant();
+                        messages.add(UIMessage.streamingToolCall(toolName, "…"));
+                    } else {
+                        replaceLastMessage(UIMessage.streamingToolCall(toolName, "…"));
+                    }
+                } else {
+                    messages.add(UIMessage.streamingToolCall(toolName, "…"));
+                }
             }
-            return new ToolResultBlock(toolUse.toolId(), output, result.isError());
-        } catch (Exception e) {
-            return new ToolResultBlock(toolUse.toolId(),
-                    "Error executing tool: " + e.getMessage(), true);
+        } else {
+            // ToolCallComplete（完整参数）：替换"调用中"的显示为完整参数
+            synchronized (messages) {
+                replaceLastMessage(UIMessage.toolCall(toolName, formatToolArgs(args)));
+            }
         }
+        scrollToBottom();
+        needsRedraw = true;
+    }
+
+    /** 收到权限询问：在对话区渲染问题并挂起等待用户按键（y/a/n）。 */
+    private void handlePermissionRequest(AgentEvent.PermissionRequestEvent pr) {
+        pendingPermission = pr;
+        synchronized (messages) {
+            // 移除空的流式占位，让权限问题紧跟工具调用显示
+            if (!messages.isEmpty() && messages.getLast().streaming()
+                    && streamAccum.isEmpty() && thinkingAccum.isEmpty()) {
+                messages.remove(messages.size() - 1);
+            }
+            messages.add(UIMessage.permissionRequest(pr.toolName(), pr.description()));
+        }
+        scrollToBottom();
+        needsRedraw = true;
+    }
+
+    /** 整个 agent 循环结束：定稿流式消息，输出汇总 footer。 */
+    private void finishLoop(int totalTurns) {
+        synchronized (messages) {
+            if (!messages.isEmpty() && messages.getLast().streaming()) {
+                if (!streamAccum.isEmpty() || !thinkingAccum.isEmpty()) {
+                    finalizeStreamingAssistant();
+                } else {
+                    messages.remove(messages.size() - 1);  // 空占位直接移除
+                }
+            }
+            if (totalTurns > 0) {
+                messages.add(UIMessage.system(
+                        GREEN + "✔" + RESET + " Completed in " + totalTurns + " turn(s)" +
+                        GRAY + " · ↑" + formatTokens(usageInTokens) +
+                        " ↓" + formatTokens(usageOutTokens) + " tokens" + RESET));
+            }
+        }
+        scrollToBottom();
+        needsRedraw = true;
+    }
+
+    /** 回答挂起的权限询问（由 inputLoop 的按键直接调用）。 */
+    private void answerPermission(PermissionResponse response, String label) {
+        AgentEvent.PermissionRequestEvent pr = pendingPermission;
+        pendingPermission = null;
+        if (pr == null) return;
+        pr.future().complete(response);
+        String verdict = response == PermissionResponse.DENY
+                ? RED + "denied" + RESET
+                : GREEN + label + RESET;
+        appendMessage(UIMessage.system(GRAY + "  ↳ " + RESET + verdict));
+        needsRedraw = true;
+    }
+
+    /** 若当前末尾不是流式占位消息，则添加一个（新一轮 LLM 输出开始时调用）。 */
+    private void ensureStreamingPlaceholder() {
+        synchronized (messages) {
+            if (messages.isEmpty() || !messages.getLast().streaming()) {
+                streamAccum.setLength(0);
+                thinkingAccum.setLength(0);
+                firstTokenReceived = false;
+                streamStartMs = System.currentTimeMillis();
+                messages.add(UIMessage.streaming("Imagining… (0s)"));
+            }
+        }
+        scrollToBottom();
+    }
+
+    /** 线程安全地追加消息（消费线程/输入线程/主线程均可能调用）。 */
+    private void appendMessage(UIMessage msg) {
+        synchronized (messages) { messages.add(msg); }
     }
 
     /** 格式化工具参数为 "key: value, key: value" 形式，超长值截断 */
@@ -618,7 +607,7 @@ public class TerminalUI {
         return sb.toString();
     }
 
-    /** 更新最后一条流式消息的显示内容（根据当前 thinking 和 text 状态） */
+    /** 更新最后一条流式消息的显示内容（根据当前 thinking 和 text 状态）。调用方需持有 messages 锁。 */
     private void updateStreamingMessage() {
         if (messages.isEmpty()) return;
         var msg = messages.getLast();
@@ -642,8 +631,8 @@ public class TerminalUI {
 
     /**
      * 将流式消息定稿为最终助手消息（Markdown 渲染 + 时间标签 + 思考块）。
-     * 在 ToolCallStart 到达时调用，把已收到的文本"封存"为独立消息，
-     * 然后添加新的工具调用消息，避免互相覆盖。
+     * 在工具调用开始 / 循环结束时调用，把已收到的文本"封存"为独立消息。
+     * 调用方需持有 messages 锁。
      */
     private void finalizeStreamingAssistant() {
         if (messages.isEmpty()) return;
@@ -663,12 +652,12 @@ public class TerminalUI {
                 + GRAY + "✻ Done" + RESET + "\n\n";
             rendered = thinkBlock + rendered;
         }
-        long elapsed = (firstTokenReceived ? firstTokenMs : System.currentTimeMillis()) - streamStartMs;
-        double secs = Math.max(elapsed, 0) / 1000.0;
+        // 总耗时 = 定稿时刻 - 本轮流式开始时刻（原来误用了首 token 时间）
+        double secs = Math.max(System.currentTimeMillis() - streamStartMs, 0) / 1000.0;
         replaceLastMessage(UIMessage.assistant(rendered, String.format("DeveCode  (%.1fs)", secs)));
     }
 
-    /** 替换最后一条消息（不管是否流式） */
+    /** 替换最后一条消息（不管是否流式）。调用方需持有 messages 锁。 */
     private void replaceLastMessage(UIMessage msg) {
         if (messages.isEmpty()) {
             messages.add(msg);
@@ -690,9 +679,11 @@ public class TerminalUI {
      *
      * 处理流程：
      *   1. 读取一个字节
-     *   2. 若为 ESC (0x1B)：解析 CSI / SS3 转义序列（方向键、PageUp/Down、Home/End、Delete）
+     *   2. 若为 ESC (0x1B)：带超时读下一个字节——超时说明是独立的 Esc 键
+     *      （流式期间触发中断 agent），否则解析 CSI / SS3 转义序列
      *   3. 若为控制字符（CR/LF/Backspace/Ctrl+C/Ctrl+P）：直接处理
-     *   4. 若为可打印字符（>= 32 或 Tab）：封装为 KeyTyped 事件推入队列
+     *   4. 流式期间若有挂起的权限询问：y/a/n（或 1/2/3）直接应答
+     *   5. 若为可打印字符（>= 32 或 Tab）：封装为 KeyTyped 事件推入队列
      *
      * 注意：控制字符直接处理，不经过事件队列，确保响应即时。
      *      可打印字符走队列，由主线程的 handleKeyTyped 处理。
@@ -704,9 +695,15 @@ public class TerminalUI {
                 int ch = reader.read();
                 if (ch == -1) { running = false; break; }
 
-                // --- ESC sequences (function keys) ---
+                // --- ESC sequences (function keys) / lone Esc (interrupt) ---
                 if (ch == 0x1B) {
-                    int c2 = reader.read();
+                    // 30ms 超时区分"独立 Esc 键"和"转义序列首字节"
+                    int c2 = reader.read(30L);
+                    if (c2 == NonBlockingReader.READ_EXPIRED) {
+                        // 独立 Esc：流式期间中断当前 agent 循环
+                        if (streaming) interruptAgent();
+                        continue;
+                    }
                     if (c2 == -1) break;
 
                     if (c2 == '[') {
@@ -787,6 +784,17 @@ public class TerminalUI {
                     continue;
                 }
 
+                // --- Permission prompt keys (权限询问期间直接应答) ---
+                if (streaming && pendingPermission != null) {
+                    switch (ch) {
+                        case 'y', 'Y', '1' -> answerPermission(PermissionResponse.ALLOW, "allowed");
+                        case 'a', 'A', '2' -> answerPermission(PermissionResponse.ALLOW_ALWAYS, "always allowed");
+                        case 'n', 'N', '3', 'q', 'Q' -> answerPermission(PermissionResponse.DENY, "denied");
+                        default -> { /* 权限等待期间忽略其他按键 */ }
+                    }
+                    continue;
+                }
+
                 // --- Printable characters (incl. CJK) ---
                 if (ch >= 32 || ch == '\t') {
                     eventQueue.add(new UIEvent.KeyTyped(ch));
@@ -796,6 +804,13 @@ public class TerminalUI {
         } catch (Exception e) {
             eventQueue.add(new UIEvent.Exit());
         }
+    }
+
+    /** 中断当前正在运行的 agent 循环（Esc 键）。 */
+    private void interruptAgent() {
+        agent.stop();
+        appendMessage(UIMessage.system(YELLOW + "⏹ Interrupting…" + RESET));
+        needsRedraw = true;
     }
 
     /**
@@ -984,7 +999,9 @@ public class TerminalUI {
     private List<RenderLine> buildAllRenderLines() {
         List<RenderLine> allLines = new ArrayList<>();
         int textWidth = Math.max(1, leftContentWidth());
-        for (UIMessage msg : messages) { allLines.addAll(msg.toRenderLines(textWidth)); }
+        List<UIMessage> snapshot;
+        synchronized (messages) { snapshot = new ArrayList<>(messages); }
+        for (UIMessage msg : snapshot) { allLines.addAll(msg.toRenderLines(textWidth)); }
         return allLines;
     }
     private int estimateConvAvailRows() {
@@ -1064,6 +1081,14 @@ public class TerminalUI {
                 buf.append(DIM).append("Send a message, or ctrl + c to quit, ctrl + p to toggle panel").append(RESET);
                 moveTo(buf, topRow + 1, 3);
                 buf.append(CURSOR_SHOW);
+            } else if (inputBuffer.isEmpty() && streaming && pendingPermission != null) {
+                buf.append(YELLOW).append("Permission required: [y] allow  [a] always  [n] deny").append(RESET);
+                moveTo(buf, topRow + 1, 3);
+                buf.append(CURSOR_HIDE);
+            } else if (inputBuffer.isEmpty() && streaming) {
+                buf.append(DIM).append("Working… press Esc to interrupt, ctrl + c to quit").append(RESET);
+                moveTo(buf, topRow + 1, 3);
+                buf.append(CURSOR_HIDE);
             } else {
                 String[] lines = inputBuffer.toString().split("\n", -1);
                 int maxDisplayLines = height - 2;
@@ -1137,9 +1162,10 @@ public class TerminalUI {
         y = panelHeader(buf, y, padX, maxW, "Context Detail");
         y = panelKV(buf, y, padX, maxW, "Context window:", formatTokens(contextWindow) + " (" + String.format("%.1f%%", pct) + ")");
         y = panelKV(buf, y, padX, maxW, "Model:", modelName);
-        y = panelKV(buf, y, padX, maxW, "Mode:", "default");
+        y = panelKV(buf, y, padX, maxW, "Mode:", permissionChecker.getMode().name().toLowerCase());
         y = panelKV(buf, y, padX, maxW, "Tools:", String.valueOf(
                 toolRegistry.getAllSchemas(provider.getProtocol()).size()));
+        y = panelKV(buf, y, padX, maxW, "API usage:", "↑" + formatTokens(usageInTokens) + " ↓" + formatTokens(usageOutTokens));
         y = panelKV(buf, y, padX, maxW, "Free Space:", String.format("%.1f%%", freePct));
         y++;
 
@@ -1156,8 +1182,11 @@ public class TerminalUI {
 
         // 区块四：Sandbox
         y = panelHeader(buf, y, padX, maxW, "Sandbox");
-        y = panelKV(buf, y, padX, maxW, "Sandbox ID:", "212aab8b");
-        y = panelKV(buf, y, padX, maxW, "Status:", GREEN + "●" + RESET + WHITE + " active" + RESET);
+        y = panelKV(buf, y, padX, maxW, "Session:", sessionId);
+        y = panelKV(buf, y, padX, maxW, "Status:",
+                permissionChecker.isSandboxEnabled()
+                        ? GREEN + "●" + RESET + WHITE + " active" + RESET
+                        : GRAY + "○" + RESET + WHITE + " off" + RESET);
         y++;
 
         // 区块五：MCP
@@ -1433,16 +1462,43 @@ public class TerminalUI {
                     null, false, false);
         }
 
-        /** 工具执行结果（超长输出截断为前 500 字符） */
-        static UIMessage toolResult(String toolName, String output, boolean isError) {
+        /** 工具执行结果（超长输出截断为前 500 字符，附执行耗时） */
+        static UIMessage toolResult(String toolName, String output, boolean isError, double elapsed) {
             String color = isError ? RED : GRAY;
             String display = output;
             if (display != null && display.length() > 500) {
                 display = display.substring(0, 500) + "\n…";
             }
-            return new UIMessage("tool",
-                    color + "↳ " + (display != null ? display : "") + RESET,
-                    null, false, false);
+            String time = elapsed > 0
+                    ? GRAY + " [" + String.format("%.1fs", elapsed) + "]" + RESET
+                    : "";
+            // 输出可能含换行，逐行包裹颜色防止 \n 分割后丢失颜色
+            String body = display != null ? display : "";
+            String[] lines = body.split("\n", -1);
+            var sb = new StringBuilder();
+            for (int i = 0; i < lines.length; i++) {
+                if (i > 0) sb.append("\n");
+                sb.append(color).append(i == 0 ? "↳ " : "  ").append(lines[i]);
+                if (i == lines.length - 1) sb.append(time);
+                sb.append(RESET);
+            }
+            return new UIMessage("tool", sb.toString(), null, false, false);
+        }
+
+        /** 系统提示消息（压缩/重试/中断/轮次汇总等） */
+        static UIMessage system(String text) {
+            return new UIMessage("system", text, null, false, false);
+        }
+
+        /** 权限询问：显示待执行操作和 y/a/n 选项 */
+        static UIMessage permissionRequest(String toolName, String description) {
+            return new UIMessage("system",
+                    BOLD + YELLOW + "⚠ Permission required" + RESET + "\n" +
+                    BOLD + CYAN + toolName + RESET + GRAY + " — " + description + RESET + "\n" +
+                    BOLD + "[y]" + RESET + " allow   " +
+                    BOLD + "[a]" + RESET + " always allow   " +
+                    BOLD + "[n]" + RESET + " deny",
+                    LocalTime.now().format(TIME_FMT), false, false);
         }
 
         /** 将多行文本逐行包裹 GRAY 颜色（防止 \n 分割后丢失颜色） */
