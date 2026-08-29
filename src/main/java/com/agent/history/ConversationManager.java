@@ -19,6 +19,7 @@ public class ConversationManager {
 
     private static final ObjectMapper MAPPER=new ObjectMapper();
 
+
     public void addUserMessage(String content) {
         Message msg = new Message("user", content);
         history.add(msg);
@@ -193,10 +194,10 @@ public class ConversationManager {
     * */
     public List<Map<String, Object>> serializeAnthropic() {
         var messages = new ArrayList<Map<String, Object>>();
+        String lastRole=null;
         for (Message msg : history) {
-            var message = new LinkedHashMap<String, Object>();
+            String role = msg.getRole() != null ? msg.getRole() : "user";
             //role 兜底：null 会导致 Anthropic API 400
-            message.put("role", msg.getRole() != null ? msg.getRole() : "user");
             var content = new ArrayList<Map<String, Object>>();
             if(msg.hasThinking()){
                 //1.添加thinking块
@@ -243,8 +244,19 @@ public class ConversationManager {
             if (content.isEmpty()) {
                 continue;
             }
-            message.put("content", content);
-            messages.add(message);
+            if (role.equals(lastRole) && !messages.isEmpty()) {
+                // 相邻同角色:把 content 块追加到上一条消息的 content 数组
+                @SuppressWarnings("unchecked")
+                List<Map<String, Object>> prevContent =
+                        (List<Map<String, Object>>) messages.getLast().get("content");
+                prevContent.addAll(content);
+            }else {
+                var message = new LinkedHashMap<String, Object>();
+                message.put("role", role);
+                message.put("content", content);
+                messages.add(message);
+                lastRole = role;
+            }
 
         }
         return messages;
