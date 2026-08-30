@@ -161,7 +161,8 @@ public class PermissionChecker {
         // Layer 0: Plan mode exceptions
         /*
           - 元工具（Agent/ToolSearch/AskUserQuestion/ExitPlanMode）→ ALLOW
-          - 写工具只能写 .mewcode/plans/ 目录（计划文件）→ ALLOW
+          - 写工具只能写 .devecode/plans/ 目录（计划文件）→ ALLOW
+          Plan Mode 是用户显式选择的强意图模式，语义上它应该"覆盖一切其他规则",放最前还能省掉后续所有层的计算。
           */
         if (mode == PermissionMode.PLAN) {
             if (PLAN_MODE_ALLOWED_TOOLS.contains(toolName)) {
@@ -175,7 +176,7 @@ public class PermissionChecker {
             }
         }
 
-        // Layer 1: Safe commands (auto-allow)
+        // Layer 1: Safe bash commands (auto-allow)
         /*
          * 只对Bash工具有效。isSafeCommand先拒绝含管道/分号/重定向/命令替换的命令（防止组合），再查白名单。命中 → ALLOW。
          * 设计目的:让ls、git status这类纯读命令不打扰用户。
@@ -184,7 +185,7 @@ public class PermissionChecker {
             return CheckResult.allow();
         }
 
-        // Layer 2: Dangerous command detection
+        // Layer 2a: Dangerous command detection
         //用find()部分匹配，命中即DENY。这是最硬的拦截 ——即使用户选了BYPASS模式、即使YAML写了allow，也无效（因为Layer 2在它们之前返回）
         if ("Bash".equals(toolName) && content != null) {
             for (var pattern : DANGEROUS_PATTERNS) {
@@ -200,7 +201,7 @@ public class PermissionChecker {
         }
 
         // Layer 3: Path sandbox
-        //路径工具（ReadFile/WriteFile/EditFile）的路径必须在 projectRoot或/tmp下，否则 ASK。BYPASS 模式跳过此检查——这是BYPASS唯一的"特权"。
+        //路径工具(ReadFile/WriteFile/EditFile)的路径必须在 projectRoot或/tmp下，否则 ASK。BYPASS 模式跳过此检查——这是BYPASS唯一的"特权"。
         if (content != null && isPathTool(toolName)) {
             if (!isPathAllowed(content) && mode != PermissionMode.BYPASS) {
                 return CheckResult.ask("Path outside allowed sandbox: " + content);
@@ -209,6 +210,7 @@ public class PermissionChecker {
 
         // Layer4: File-based permission rules (last matching rule wins)
         //从后往前遍历，第一个匹配的规则生效。这是因为loadRules按用户级 → 项目级 → 本地级顺序追加，本地级在列表末尾，应该优先级最高。
+        //YAML是用户深思熟虑写下的持久化配置（尤其里面的DENY规则），必须压过会话里随手点的"总是允许"。但YAML没命中时，会话规则可以放行，避免重复打扰。
         if (content != null) {
             for (int i = fileRules.size() - 1; i >= 0; i--) {
                 PermissionRule rule = fileRules.get(i);
@@ -223,7 +225,7 @@ public class PermissionChecker {
         }
 
         // Layer 4b: Allow-always rules (session-level)
-        //用户在交互中选 "ALLOW_ALWAYS" 时动态加入的规则（通过 addAllowAlwaysRule ）。 会话级，不持久化 。
+        //用户在交互中选 "ALLOW_ALWAYS" 时动态加入的规则（通过 addAllowAlwaysRule）。会话级，不持久化。
         //YAML是持久化配置，优先级应高于会话级临时规则。但如果 YAML 没匹配到，会话级规则可以放行，避免重复询问。
         if (allowAlwaysRules.contains(toolName + ":" + content)) {
             return CheckResult.allow();
@@ -260,7 +262,7 @@ public class PermissionChecker {
         }
 
         // Layer 5: Permission mode matrix
-        //PermissionMode.decide 做最终裁决。
+        //PermissionMode.decide 做最终裁决,没有任何特殊规则时的默认行为
         var decision = mode.decide(tool.category());
         return switch (decision) {
             case ALLOW -> CheckResult.allow();
@@ -452,7 +454,9 @@ public class PermissionChecker {
     }
 
     /**
-     * 提取本次tool_call代表性内容
+     * 提取本次tool_call代表性内容,
+     * 不同工具的"关键内容"字段不同（Bash 是命令文本，文件工具是路径）。
+     * 第一步先把异构参数归一化成统一的 content 字符串，后续所有层只对着这个字符串做匹配。这是适配器思想：让管线各层不必关心工具的具体参数结构。
      * @param toolName tool name
      * @param args tool args
      * @return null or 代表性内容,如file_path的值
