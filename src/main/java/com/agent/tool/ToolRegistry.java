@@ -30,7 +30,7 @@ public class ToolRegistry {
         reg.register(new MathTool());
         return reg;
     }
-    //过未发现的延迟工具，根据 protocol 参数适配 Anthropic/OpenAI 两种 API 格式。
+    //跳过未发现的延迟工具，根据 protocol 参数适配 Anthropic/OpenAI 两种 API 格式。
     //每个工具自己实现 schema() 方法返回 JSON Schema。
     //shouldDefer() == true的工具默认不会出现在发送给LLM的工具列表里，需要LLM通过搜索（调用ToolSearchTool）主动"发现"后才暴露出来。
     public List<Map<String, Object>> getAllSchemas(String protocol) {
