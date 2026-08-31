@@ -133,6 +133,15 @@ public class AnthropicCodeClient implements LlmClient {
                 .build();
         //send会在响应头到达时就返回,把响应体留作InputStream供后续逐行读取,而不是一次性读进内存
         var response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
+        //状态码检查：非 2xx 时响应体是错误 JSON（非 SSE），若不检查会静默读完 EOF、
+        //既不推 StreamEnd 也不推 Error，Agent 侧表现为流式请求无限挂起
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            String errBody;
+            try (var is = response.body()) {
+                errBody = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            }
+            throw new LlmException("API error (HTTP " + response.statusCode() + "): " + errBody);
+        }
         //是否在thinking块内
         boolean inThinking = false;
         StringBuilder thinkingAccum = new StringBuilder();
@@ -144,6 +153,8 @@ public class AnthropicCodeClient implements LlmClient {
         String stopReason = "";
         int inputTokens=0;
         int outputTokens=0;
+        //是否已收到 message_stop 正常收尾（连接中断/异常截断时为 false，用于兜底报错）
+        boolean streamEnded = false;
         //流式响应,try-with-resource,确保 reader 和底层的 InputStream 在结束时自动关闭
         try (var reader = new BufferedReader(new InputStreamReader(response.body()))) {
             String line;
@@ -268,9 +279,15 @@ public class AnthropicCodeClient implements LlmClient {
                         if (do_ > 0) outputTokens = do_;
                     }
                 }
-                case "message_stop" ->
-                    streamQueue.add(new StreamEvent.StreamEnd(stopReason,inputTokens,outputTokens));
+                case "message_stop" -> {
+                    streamEnded = true;
+                    streamQueue.add(new StreamEvent.StreamEnd(stopReason, inputTokens, outputTokens));
+                }
             }
+        }
+        //兜底：SSE 流在 message_stop 之前中断（连接被掐断等），不推事件的话 Agent 会一直挂到超时
+        if (!streamEnded) {
+            throw new LlmException("Stream ended unexpectedly (no message_stop event received)");
         }
     }
 
