@@ -108,7 +108,7 @@ public class McpManager {
         else if (cfg.getUrl() != null && !cfg.getUrl().isBlank()) {
             var httpBuilder = HttpClientStreamableHttpTransport.builder(cfg.getUrl());
             if (cfg.getHeaders() != null && !cfg.getHeaders().isEmpty()) {
-                httpBuilder.customizeRequest(rb -> {
+                httpBuilder.httpRequestCustomizer((rb, method, endpoint, body, ctx) -> {
                     for (var e : cfg.getHeaders().entrySet()) {
                         rb.header(e.getKey(), resolveEnvVars(e.getValue()));
                     }
@@ -120,7 +120,7 @@ public class McpManager {
         }
 
         return McpClient.sync(transport)
-                .clientInfo(new McpSchema.Implementation("devecode", "0.1.0"))
+                .clientInfo(McpSchema.Implementation.builder("devecode", "0.1.0").build())
                 .requestTimeout(Duration.ofSeconds(60))
                 .build();
     }
@@ -188,18 +188,16 @@ public class McpManager {
         @Override
         public ToolCategory category() { return ToolCategory.COMMAND; }
         @Override
+        //mcp工具默认延迟加载，需通过ToolSearch搜索后暴露
         public boolean shouldDefer() { return true; }
         //把SDK的inputSchema（JSON Schema）转成项目统一的 name/description/input_schema结构;server没给schema时兜底一个空object schema
         @Override
         public Map<String, Object> schema() {
             var input = new LinkedHashMap<String, Object>();
             var jsonSchema = sdkTool.inputSchema();
-            if (jsonSchema != null) {
-                if (jsonSchema.type() != null) input.put("type", jsonSchema.type());
-                if (jsonSchema.properties() != null) input.put("properties", jsonSchema.properties());
-                if (jsonSchema.required() != null) input.put("required", jsonSchema.required());
-            }
-            if (input.isEmpty()) {
+            if (jsonSchema != null && !jsonSchema.isEmpty()) {
+                input.putAll(jsonSchema);
+            } else {
                 input.put("type", "object");
                 input.put("properties", Map.of());
             }
@@ -209,8 +207,9 @@ public class McpManager {
         @Override
         public ToolResult execute(Map<String, Object> args) {
             try {
-                var request = new McpSchema.CallToolRequest(
-                        sdkTool.name(), args != null ? args : Map.of());
+                var request = McpSchema.CallToolRequest.builder(sdkTool.name())
+                        .arguments(args != null ? args : Map.of())
+                        .build();
                 var result = client.callTool(request);
                 String text = extractTextContent(result);
                 boolean isError = result.isError() != null && result.isError();
