@@ -18,6 +18,7 @@ import java.util.concurrent.BlockingQueue;
  二层上下文压缩：
  1.通过大型语言模型（LLM）调用，总结对话中较旧的前缀，同时保留最近的完整尾部。
  2.恢复快照（文件读取+技能标准操作流程）被附加，以确保模型在压缩后不会丢失工作上下文。
+ 均为无状态方法，没有实例状态，构造函数私有化，多个 Agent 并发调用也不会冲突
  */
 public final class ContextCompactor {
 
