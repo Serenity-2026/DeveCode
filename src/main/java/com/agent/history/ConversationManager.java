@@ -201,33 +201,9 @@ public class ConversationManager {
             String role = msg.getRole() != null ? msg.getRole() : "user";
             //role 兜底：null 会导致 Anthropic API 400
             var content = new ArrayList<Map<String, Object>>();
-            if(msg.hasThinking()){
-                //1.添加thinking块
-            for (var tb : msg.getThinkingBlocks()) {
-                    content.add(Map.of(
-                            "type", "thinking",
-                            "thinking", tb.thinking(),
-                            "signature", tb.signature()));
-            }
-            }
-            //2.添加text
-            if(msg.getContent()!=null&&!msg.getContent().isEmpty()){
-                content.add(Map.of(
-                        "type", "text",
-                        "text", msg.getContent()));
-            }
-            //3.添加tool_use,有可能存在发起函数调用但无参数的情况，因此用LinkedHashMap单独构建
-            if (msg.hasToolUses()) {
-                for (var tu : msg.getToolUses()) {
-                    var block = new LinkedHashMap<String, Object>();
-                    block.put("type", "tool_use");
-                    block.put("id", tu.toolId());
-                    block.put("name", tu.toolName());
-                    block.put("input", tu.arguments());
-                    content.add(block);
-                }
-            }
-            //4.添加tool_result块（工具执行结果）
+            //1.添加tool_result块（工具执行结果），必须放在 content 最前：
+            //Anthropic 要求 tool_use 的下一条消息以 tool_result 开头（"immediately after"），
+            //前面插入 text 块（如 system-reminder 合并进来的文本）会触发 400
             //Anthropic 协议中工具结果用 user 角色 + tool_result content block 发送
             if (msg.getToolResults() != null && !msg.getToolResults().isEmpty()) {
                 for (var tr : msg.getToolResults()) {
@@ -238,6 +214,32 @@ public class ConversationManager {
                     if (tr.isError()) {
                         block.put("is_error", true);
                     }
+                    content.add(block);
+                }
+            }
+            //2.添加thinking块
+            if(msg.hasThinking()){
+            for (var tb : msg.getThinkingBlocks()) {
+                    content.add(Map.of(
+                            "type", "thinking",
+                            "thinking", tb.thinking(),
+                            "signature", tb.signature()));
+            }
+            }
+            //3.添加text
+            if(msg.getContent()!=null&&!msg.getContent().isEmpty()){
+                content.add(Map.of(
+                        "type", "text",
+                        "text", msg.getContent()));
+            }
+            //4.添加tool_use,有可能存在发起函数调用但无参数的情况，因此用LinkedHashMap单独构建
+            if (msg.hasToolUses()) {
+                for (var tu : msg.getToolUses()) {
+                    var block = new LinkedHashMap<String, Object>();
+                    block.put("type", "tool_use");
+                    block.put("id", tu.toolId());
+                    block.put("name", tu.toolName());
+                    block.put("input", tu.arguments());
                     content.add(block);
                 }
             }
