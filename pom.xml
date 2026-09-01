@@ -49,6 +49,13 @@
         <artifactId>snakeyaml</artifactId>
         <version>2.2</version>
     </dependency>
+    <!-- SLF4J NOP：MCP SDK 用 SLF4J 打日志，项目无日志实现，
+         显式绑定 NOP 避免每次启动刷 "No SLF4J providers were found" 警告 -->
+    <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-nop</artifactId>
+        <version>2.0.17</version>
+    </dependency>
     <!-- mcp -->
     <dependency>
         <groupId>io.modelcontextprotocol.sdk</groupId>
@@ -57,6 +64,20 @@
     <dependency>
         <groupId>io.modelcontextprotocol.sdk</groupId>
         <artifactId>mcp-json-jackson2</artifactId>
+    </dependency>
+    <!-- Jetty（test scope）：TestHttpMcpServer 常驻 HTTP MCP server 的嵌入式容器，
+         用 jakarta.servlet 命名空间（Jetty 11）与 mcp-core 的 servlet API 对齐 -->
+    <dependency>
+        <groupId>org.eclipse.jetty</groupId>
+        <artifactId>jetty-server</artifactId>
+        <version>11.0.24</version>
+        <scope>test</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.eclipse.jetty</groupId>
+        <artifactId>jetty-servlet</artifactId>
+        <version>11.0.24</version>
+        <scope>test</scope>
     </dependency>
 </dependencies>
     <dependencyManagement>
