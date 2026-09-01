@@ -2,13 +2,16 @@ package com.agent.tui;
 
 import com.agent.agent.Agent;
 import com.agent.agent.AgentEvent;
+import com.agent.config.McpServerConfig;
 import com.agent.history.ConversationManager;
 import com.agent.hook.HookEngine;
 import com.agent.infra.ProviderConfig;
 import com.agent.llm.LlmClient;
+import com.agent.mcp.McpManager;
 import com.agent.permission.PermissionChecker;
 import com.agent.permission.PermissionMode;
 import com.agent.permission.PermissionResponse;
+import com.agent.prompt.PromptBuilder;
 import com.agent.tool.ToolRegistry;
 import com.agent.tool.FileHistory;
 import com.agent.tool.FileStateCache;
@@ -20,11 +23,13 @@ import org.jline.utils.NonBlockingReader;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.lang.management.ManagementFactory;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -86,6 +91,15 @@ public class TerminalUI {
     private final HookEngine hookEngine;         // Hook 引擎（生命周期钩子）
     private final Agent agent;                   // 后端 agent（事件驱动）
     private final String sessionId;              // 会话 ID（快照目录/面板显示）
+
+    // ── MCP（providers.yaml mcp_servers 段）──
+    private final McpManager mcpManager;                    // null = 未配置任何 MCP server
+    private final List<McpManager.ServerInfo> mcpServers = new ArrayList<>(); // 已连接的 server
+    private final Map<String, Integer> mcpToolCounts = new LinkedHashMap<>(); // server 名 → 注册工具数
+    private final List<String> mcpErrors = new ArrayList<>();                 // 连接失败的错误
+
+    // ── system prompt（prompt 包组装）──
+    private final String systemPrompt;
 
     // ── 消息记录 ──
     private final List<UIMessage> messages = new ArrayList<>();
@@ -152,11 +166,12 @@ public class TerminalUI {
     /**
      * 启动终端 UI。由 {@link DeveCodeApp} 在 provider 选择完成后调用。
      *
-     * @param provider 用户选中的 provider 配置（含 API Key、模型名、协议等）
+     * @param provider    用户选中的 provider 配置（含 API Key、模型名、协议等）
+     * @param mcpServers  providers.yaml 中 mcp_servers 段解析出的 MCP server 配置（可为空）
      */
-    public static void launch(ProviderConfig provider) {
+    public static void launch(ProviderConfig provider, List<McpServerConfig> mcpServers) {
         try {
-            new TerminalUI(provider).run();
+            new TerminalUI(provider, mcpServers).run();
         } catch (IOException e) {
             System.err.println("Failed to initialize terminal: " + e.getMessage());
             e.printStackTrace();
@@ -171,12 +186,16 @@ public class TerminalUI {
      *   1. 保存 provider 配置
      *   2. 创建 JLine Terminal（JNA 模式 + 忽略默认信号处理）
      *   3. 注册 SIGINT 处理器（Ctrl+C → 推入 Exit 事件）
-     *   4. 创建 LlmClient（传入 provider 配置 + 系统提示词）
-     *   5. 创建 ConversationManager（空对话历史）
+     *   4. 创建 ConversationManager（空对话历史）
+     *   5. 初始化工具基础设施（ToolRegistry / FileHistory / FileStateCache）
+     *   6. 连接 MCP server，把 MCP 工具注册进 ToolRegistry
+     *   7. 由 prompt 包组装 system prompt（含 MCP server instructions），创建 LlmClient
+     *   8. 组装 Agent
      *
-     * @param provider 用户选中的 provider 配置
+     * @param provider         provider 配置
+     * @param mcpServerConfigs MCP server 配置列表（可为 null）
      */
-    private TerminalUI(ProviderConfig provider) throws IOException {
+    private TerminalUI(ProviderConfig provider, List<McpServerConfig> mcpServerConfigs) throws IOException {
         this.provider = provider;
         // 步骤 2：JLine Terminal — JNA 提供原生终端控制，SIG_IGN 防止 Ctrl+C 直接杀进程
         this.terminal = TerminalBuilder.builder()
@@ -190,15 +209,9 @@ public class TerminalUI {
             eventQueue.add(new UIEvent.Exit());
         });
         this.writer = terminal.writer();
-        // 步骤 4：LlmClient.create — 根据 provider 的 protocol（anthropic/openai）创建对应客户端
-        this.client = LlmClient.create(provider,
-                "You are DeveCode, an interactive CLI coding agent. "
-                + "Use the available tools to read, search and edit files and to run commands "
-                + "in order to accomplish the user's task. Prefer tools over guessing. "
-                + "When you finish, summarize what you did concisely.");
-        // 步骤 5：ConversationManager — 管理对话历史，每次 addUserMessage/addAssistantMessage 会追加到内部列表
+        // 步骤 4：ConversationManager — 管理对话历史，每次 addUserMessage/addAssistantMessage 会追加到内部列表
         this.conversation = new ConversationManager();
-        // 步骤 6：初始化工具基础设施
+        // 步骤 5：初始化工具基础设施
         // FileStateCache — 记录 ReadFile 读取过的文件内容和 mtime，EditFile/WriteFile 据此强制"先读后改"
         this.fileStateCache = new FileStateCache();
         // FileHistory — 文件编辑备份/快照管理，每次 AI 轮次结束时打快照，支持回退
@@ -214,18 +227,91 @@ public class TerminalUI {
         ((com.agent.tool.impl.WriteFileTool) toolRegistry.getTool("WriteFile")).setFileStateCache(fileStateCache);
         // ToolSearchTool 需要持有 registry 引用，用于延迟工具发现
         toolRegistry.register(new ToolSearchTool(toolRegistry, provider.getProtocol()));
-        // 步骤 7：权限裁决器 — 多层规则（Plan模式 → 安全命令 → 危险命令 → 路径沙箱 → YAML 规则 → 模式矩阵）
+        // 步骤 6：MCP — 依次连接配置的 server（stdio 子进程 / Streamable HTTP），
+        // 把 MCP 工具包装成 mcp__<server>__<tool> 注册进 ToolRegistry（延迟加载，经 ToolSearch 发现）
+        if (mcpServerConfigs == null || mcpServerConfigs.isEmpty()) {
+            this.mcpManager = null;
+        } else {
+            System.out.println("Connecting to " + mcpServerConfigs.size() + " MCP server(s)...");
+            this.mcpManager = new McpManager(mcpServerConfigs);
+            var mcpResult = mcpManager.connectAll();
+            for (var t : mcpResult.tools()) toolRegistry.register(t);
+            this.mcpServers.addAll(mcpResult.servers());
+            this.mcpErrors.addAll(mcpResult.errors());
+            // 统计每个 server 注册的工具数（工具名前缀 mcp__<sanitize(server)>__），供状态面板显示
+            for (var server : mcpResult.servers()) {
+                String prefix = "mcp__" + McpManager.sanitizeName(server.name()) + "__";
+                this.mcpToolCounts.put(server.name(),
+                        (int) mcpResult.tools().stream().filter(t -> t.name().startsWith(prefix)).count());
+            }
+        }
+        // 步骤 7：system prompt — 由 prompt 包（PromptBuilder + PromptSections）按优先级组装：
+        // 身份/系统/任务/执行/工具/语气/输出/环境 8 个固定段落
+        // + 工作目录 DEVECODE.md / CLAUDE.md 自定义指令
+        // + 已连接 MCP server 上报的 instructions
+        this.systemPrompt = buildSystemPrompt();
+        // LlmClient.create — 根据 provider 的 protocol（anthropic/openai）创建对应客户端
+        this.client = LlmClient.create(provider, systemPrompt);
+        // 步骤 8：权限裁决器 — 多层规则（Plan模式 → 安全命令 → 危险命令 → 路径沙箱 → YAML 规则 → 模式矩阵）
         this.permissionChecker = new PermissionChecker(
                 PermissionMode.DEFAULT, Path.of(System.getProperty("user.dir")));
-        // 步骤 8：Hook 引擎 — 生命周期钩子（默认无 hook，可通过 loadHooks 注入）
+        // Hook 引擎 — 生命周期钩子（默认无 hook，可通过 loadHooks 注入）
         this.hookEngine = new HookEngine();
-        // 步骤 9：组装 Agent — 后端事件驱动的 agent 循环，UI 只消费 AgentEvent
+        // 组装 Agent — 后端事件驱动的 agent 循环，UI 只消费 AgentEvent
         this.agent = new Agent(client, toolRegistry, provider);
         agent.setChecker(permissionChecker);
         agent.setHookEngine(hookEngine);
         agent.setFileHistory(fileHistory);
         agent.setWorkDir(System.getProperty("user.dir"));
         agent.setMaxIterations(30);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  System prompt 组装（prompt 包接入）
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * 组装完整 system prompt：
+     *   1. {@link PromptBuilder#buildSystemPrompt} 的 8 个固定段落（按优先级排序拼接）
+     *   2. 工作目录下 DEVECODE.md / CLAUDE.md 的自定义指令（CustomInstructions 段，优先级 80）
+     *   3. 已连接 MCP server 上报的 instructions（追加 "# MCP Servers" 段）
+     */
+    private String buildSystemPrompt() {
+        var env = PromptBuilder.detectEnvironment(provider.getModel());
+        var options = new PromptBuilder.BuildOptions(null, loadCustomInstructions(), null);
+        String prompt = PromptBuilder.buildSystemPrompt(env, options);
+
+        if (!mcpServers.isEmpty()) {
+            var sb = new StringBuilder(prompt);
+            sb.append("\n\n# MCP Servers\n\n");
+            sb.append("The following MCP servers are connected. Their tools follow the naming scheme ")
+              .append("mcp__<server>__<tool> and are deferred: use ToolSearch to load a tool's schema ")
+              .append("before calling it.\n");
+            for (var s : mcpServers) {
+                sb.append("\n## ").append(s.name()).append('\n');
+                if (s.instructions() != null && !s.instructions().isBlank()) {
+                    sb.append(s.instructions().strip()).append('\n');
+                }
+            }
+            prompt = sb.toString();
+        }
+        return prompt;
+    }
+
+    /** 加载用户自定义指令：优先工作目录下 DEVECODE.md，其次 CLAUDE.md；都不存在返回 null。 */
+    private static String loadCustomInstructions() {
+        for (String name : new String[]{"DEVECODE.md", "CLAUDE.md"}) {
+            try {
+                Path p = Path.of(System.getProperty("user.dir"), name);
+                if (Files.exists(p)) {
+                    String content = Files.readString(p).strip();
+                    if (!content.isEmpty()) return content;
+                }
+            } catch (Exception ignored) {
+                // 读取失败视为无自定义指令
+            }
+        }
+        return null;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -237,6 +323,19 @@ public class TerminalUI {
         readTerminalSize();
         // 不开启 trackMouse：保留终端原生 QuickEdit / 文本选区 / I-beam 光标。
         // 滚动改用键盘（PageUp/PageDown/↑/↓）。
+
+        // 首屏消息：横幅 + MCP 连接状态
+        synchronized (messages) {
+            messages.add(UIMessage.banner());
+            for (var s : mcpServers) {
+                messages.add(UIMessage.system(
+                        GREEN + "●" + RESET + " MCP " + CYAN + s.name() + RESET
+                        + GRAY + " — " + mcpToolCounts.getOrDefault(s.name(), 0) + " tool(s)" + RESET));
+            }
+            for (var err : mcpErrors) {
+                messages.add(UIMessage.system(RED + "○ " + err + RESET));
+            }
+        }
 
         // 输入线程：阻塞读取按键 → 事件队列
         Thread inputThread = Thread.startVirtualThread(this::inputLoop);
@@ -293,6 +392,10 @@ public class TerminalUI {
     }
 
     private void cleanup() {
+        // 关闭 MCP 连接（graceful shutdown stdio 子进程 / HTTP 客户端）
+        if (mcpManager != null) {
+            try { mcpManager.shutdown(); } catch (Exception ignored) {}
+        }
         writer.print(CURSOR_SHOW);
         writer.println();
         writer.flush();
@@ -387,6 +490,18 @@ public class TerminalUI {
             return;
         }
 
+        // /mcp — 查看 MCP server 连接状态
+        if (text.trim().equals("/mcp")) {
+            showMcpStatus();
+            return;
+        }
+
+        // /prompt — 查看当前 system prompt 概要
+        if (text.trim().equals("/prompt")) {
+            showPromptInfo();
+            return;
+        }
+
         // 添加用户消息到 UI 列表 + ConversationManager
         synchronized (messages) { messages.add(UIMessage.user(text)); }
         conversation.addUserMessage(text);
@@ -418,6 +533,46 @@ public class TerminalUI {
                 needsRedraw = true;
             }
         });
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  斜杠命令
+    // ═══════════════════════════════════════════════════════════════
+
+    /** /mcp — 在对话区列出已连接的 MCP server、各自注册的工具数和连接失败的错误。 */
+    private void showMcpStatus() {
+        synchronized (messages) {
+            if (mcpServers.isEmpty() && mcpErrors.isEmpty()) {
+                messages.add(UIMessage.system(GRAY
+                        + "No MCP servers configured. Add an 'mcp_servers' section to providers.yaml." + RESET));
+            }
+            for (var s : mcpServers) {
+                messages.add(UIMessage.system(
+                        GREEN + "●" + RESET + " MCP " + CYAN + s.name() + RESET
+                        + GRAY + " — " + mcpToolCounts.getOrDefault(s.name(), 0) + " tool(s)" + RESET
+                        + (s.instructions().isEmpty() ? "" : GRAY + " (has instructions)" + RESET)));
+            }
+            for (var err : mcpErrors) {
+                messages.add(UIMessage.system(RED + "○ " + err + RESET));
+            }
+        }
+        scrollToBottom();
+        needsRedraw = true;
+    }
+
+    /** /prompt — 显示当前 system prompt 的长度和开头内容（截断到 800 字符）。 */
+    private void showPromptInfo() {
+        String head = systemPrompt.length() > 800
+                ? systemPrompt.substring(0, 800) + "\n…"
+                : systemPrompt;
+        synchronized (messages) {
+            messages.add(UIMessage.system(
+                    CYAN + "System prompt" + RESET + GRAY + " (" + systemPrompt.length() + " chars · "
+                    + mcpServers.size() + " MCP server(s))" + RESET + "\n"
+                    + UIMessage.grayLines(head)));
+        }
+        scrollToBottom();
+        needsRedraw = true;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -1192,9 +1347,27 @@ public class TerminalUI {
                         : GRAY + "○" + RESET + WHITE + " off" + RESET);
         y++;
 
-        // 区块五：MCP
+        // 区块五：MCP（真实连接状态：server 数 / 各 server 工具数 / 失败数）
         y = panelHeader(buf, y, padX, maxW, "MCP");
-        y = panelKV(buf, y, padX, maxW, "servers:", "none");
+        if (mcpServers.isEmpty() && mcpErrors.isEmpty()) {
+            y = panelKV(buf, y, padX, maxW, "servers:", "none");
+        } else {
+            y = panelKV(buf, y, padX, maxW, "servers:", String.valueOf(mcpServers.size()));
+            int shown = 0;
+            for (var s : mcpServers) {
+                if (shown++ >= 4) {
+                    // 超过 4 个折叠显示
+                    y = panelLine(buf, y, padX, maxW, GRAY + "… +" + (mcpServers.size() - 4) + " more" + RESET);
+                    break;
+                }
+                y = panelKV(buf, y, padX, maxW,
+                        McpManager.sanitizeName(s.name()) + ":",
+                        mcpToolCounts.getOrDefault(s.name(), 0) + " tools");
+            }
+            if (!mcpErrors.isEmpty()) {
+                y = panelKV(buf, y, padX, maxW, "errors:", String.valueOf(mcpErrors.size()));
+            }
+        }
         y++;
 
         // 区块六：CPU
