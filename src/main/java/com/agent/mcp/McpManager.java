@@ -4,7 +4,7 @@ import com.agent.config.McpServerConfig;
 import com.agent.tool.Tool;
 import com.agent.tool.ToolCategory;
 import com.agent.tool.ToolRegistry;
-import com.agent.tool.ToolResult;
+import com.agent.tool.result.ToolResult;
 import io.modelcontextprotocol.client.McpClient;
 import io.modelcontextprotocol.client.McpSyncClient;
 
