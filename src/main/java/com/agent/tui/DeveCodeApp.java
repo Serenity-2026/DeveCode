@@ -69,8 +69,8 @@ public class DeveCodeApp {
             selected = showProviderSelector(providers);
         }
 
-        // 交接点：把选定的 provider 交给主聊天 UI，进入交互式对话循环
-        TerminalUI.launch(selected);
+        // 交接点：把选定的 provider 和 MCP server 配置交给主聊天 UI，进入交互式对话循环
+        TerminalUI.launch(selected, config.getMcpServers());
     }
 
     /**

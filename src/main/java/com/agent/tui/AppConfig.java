@@ -1,5 +1,6 @@
 package com.agent.tui;
 
+import com.agent.config.McpServerConfig;
 import com.agent.infra.ProviderConfig;
 import org.yaml.snakeyaml.Yaml;
 
@@ -28,13 +29,20 @@ import java.util.Map;
 public class AppConfig {
 
     private final List<ProviderConfig> providers;
+    private final List<McpServerConfig> mcpServers;
 
-    private AppConfig(List<ProviderConfig> providers) {
+    private AppConfig(List<ProviderConfig> providers, List<McpServerConfig> mcpServers) {
         this.providers = providers;
+        this.mcpServers = mcpServers;
     }
 
     public List<ProviderConfig> getProviders() {
         return providers;
+    }
+
+    /** providers.yaml 顶层 mcp_servers 段解析出的 MCP server 配置（无配置时为空列表）。 */
+    public List<McpServerConfig> getMcpServers() {
+        return mcpServers;
     }
 
     public ProviderConfig getSingle() {
@@ -108,7 +116,71 @@ public class AppConfig {
             }
         }
 
-        return new AppConfig(parsed);
+        return new AppConfig(parsed, parseMcpServers(root));
+    }
+
+    /**
+     * 解析顶层 mcp_servers 段（Map 结构，key 为 server 名）：
+     * <pre>
+     * mcp_servers:
+     *   GitHub:                     # stdio：有 command → 启动子进程
+     *     command: "npx"
+     *     args: ["-y", "@modelcontextprotocol/server-github"]
+     *     env:
+     *       GITHUB_TOKEN: "${GITHUB_TOKEN}"
+     *   remote-tool:                # Streamable HTTP：有 url → 发 HTTP 请求
+     *     url: "https://api.example.com/mcp"
+     *     headers:
+     *       Authorization: "Bearer ${API_TOKEN}"
+     * </pre>
+     * 校验规则：command 与 url 至少有一个，否则跳过并警告。
+     */
+    private static List<McpServerConfig> parseMcpServers(Map<String, Object> root) {
+        var result = new ArrayList<McpServerConfig>();
+        Object raw = root.get("mcp_servers");
+        if (!(raw instanceof Map<?, ?> servers)) return result;
+
+        for (var entry : servers.entrySet()) {
+            String name = String.valueOf(entry.getKey()).trim();
+            if (!(entry.getValue() instanceof Map<?, ?> cfg)) {
+                System.err.println("Warning: mcp_servers." + name + " is not a mapping, skipping.");
+                continue;
+            }
+            var c = new McpServerConfig();
+            c.setName(name);
+            c.setCommand(asString(cfg.get("command")));
+            c.setArgs(asStringList(cfg.get("args")));
+            c.setUrl(asString(cfg.get("url")));
+            c.setHeaders(asStringMap(cfg.get("headers")));
+            c.setEnv(asStringMap(cfg.get("env")));
+
+            boolean hasCommand = c.getCommand() != null && !c.getCommand().isBlank();
+            boolean hasUrl = c.getUrl() != null && !c.getUrl().isBlank();
+            if (!hasCommand && !hasUrl) {
+                System.err.println("Warning: mcp_servers." + name + " has neither command nor url, skipping.");
+                continue;
+            }
+            result.add(c);
+        }
+        return result;
+    }
+
+    private static String asString(Object val) {
+        return val == null ? null : val.toString().trim();
+    }
+
+    private static List<String> asStringList(Object val) {
+        if (!(val instanceof List<?> list)) return null;
+        var result = new ArrayList<String>();
+        for (var item : list) result.add(String.valueOf(item));
+        return result;
+    }
+
+    private static Map<String, String> asStringMap(Object val) {
+        if (!(val instanceof Map<?, ?> map)) return null;
+        var result = new java.util.LinkedHashMap<String, String>();
+        for (var e : map.entrySet()) result.put(String.valueOf(e.getKey()), String.valueOf(e.getValue()));
+        return result;
     }
 
     /**

@@ -21,3 +21,27 @@ providers:
     model: "deepseek-chat"
     api_key: "sk-your-deepseek-key"
     thinking: false
+
+# ── MCP servers（stdio / Streamable HTTP）────────────────────────────
+# 启动后 McpManager 会依次连接，工具以 mcp__<server>__<tool> 命名注册（延迟加载，经 ToolSearch 发现）
+# server 自述的 instructions 会拼进 system prompt，右上面板可查看连接状态
+mcp_servers:
+  # 常驻 HTTP 测试 server（先单独启动，见 src/test/java/com/agent/mcp/TestHttpMcpServer.java）：
+  #   mvn -q test-compile exec:java "-Dexec.mainClass=com.agent.mcp.TestHttpMcpServer" "-Dexec.classpathScope=test"
+  # 提供 echo / add / divide / get_current_time 四个工具；server 常驻运行，
+  # agent 每次启动通过 HTTP 连接，退出只断开连接、不影响 server
+  test-server:
+    url: "http://localhost:3001"
+
+  # stdio 方式（agent 启动时拉起子进程，退出时一并销毁）：
+  # test-server-stdio:
+  #   command: "mvn"
+  #   args: ["-q", "test-compile", "exec:java",
+  #          "-Dexec.mainClass=com.agent.mcp.TestMcpServer",
+  #          "-Dexec.classpathScope=test"]
+
+  # 带鉴权的远程 server 示例：
+  # remote-tool:
+  #   url: "https://api.example.com/mcp"
+  #   headers:
+  #     Authorization: "Bearer ${API_TOKEN}"   # ${VAR} 会替换成环境变量
