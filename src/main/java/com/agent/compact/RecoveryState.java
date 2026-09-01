@@ -11,6 +11,7 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * RecoveryState 是 压缩前的快照记录器 ——在压缩把旧消息清空之前，记录"AI 最近读过哪些文件"、
  * "激活了哪些 skill"，压缩后把这些信息附加到摘要消息中，避免 AI 失忆。
+ * 每个 Agent 持有一个独立实例，记自己跑过的 ReadFile 与 Skill。与ContextCompactor两个文件互补，一个无状态，一个有状态，分工很清晰。
  */
 public final class RecoveryState {
 

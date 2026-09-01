@@ -30,6 +30,10 @@ public class PermissionChecker {
     /** 沙箱模式开关：开启后命令类工具自动放行（由 OS 级沙箱保护） */
     private boolean sandboxEnabled;
 
+    private String planFilePath;
+
+    public void setPlanFilePath(String path) { this.planFilePath = path; }
+
     /** yaml规则
      * - toolName ：工具名（如 "Bash" 、 "WriteFile" ）
      * - pattern ：通配符模式（如 "git *" 、 "/etc/*" ）
@@ -170,7 +174,7 @@ public class PermissionChecker {
             }
             if ("WriteFile".equals(toolName) || "EditFile".equals(toolName)) {
                 String path = stringArg(args, "file_path", "");
-                if (path.contains(".devecode/plans/")) {
+                if (path.equals(planFilePath)) {
                     return CheckResult.allow();
                 }
             }

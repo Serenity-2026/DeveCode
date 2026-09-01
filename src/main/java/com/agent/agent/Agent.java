@@ -7,6 +7,9 @@ import com.agent.hook.HookEngine;
 import com.agent.infra.ProviderConfig;
 import com.agent.llm.*;
 import com.agent.permission.PermissionChecker;
+import com.agent.permission.PermissionMode;
+import com.agent.plan.PlanFile;
+import com.agent.prompt.PlanModePrompt;
 import com.agent.tool.FileHistory;
 import com.agent.tool.ToolRegistry;
 
@@ -162,6 +165,15 @@ public class Agent {
                             return name == null || toolNameFilter.test(name.toString());
                         })
                         .toList();
+            }
+            // 可选项:添加plan_mode提示词
+            if (checker != null && checker.getMode() == PermissionMode.PLAN) {
+                String wd = workDir != null ? workDir : System.getProperty("user.dir");
+                String planPath = PlanFile.getOrCreatePlanPath(wd);
+                checker.setPlanFilePath(planPath);
+                boolean planExists = PlanFile.planExists();
+                String reminder = PlanModePrompt.buildReminder(planPath, planExists, iteration);
+                conv.addSystemReminder(reminder);
             }
             var tools = iterToolSchemas;
             var streamQueue = client.stream(conv, tools);
