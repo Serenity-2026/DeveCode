@@ -173,6 +173,9 @@ public class OpenAiClient implements LlmClient {
         String stopReason = "";
         int inputTokens = 0;
         int outputTokens = 0;
+        //是否收到过完成信号（finish_reason 或 [DONE]）：
+        //两者都没有说明流被中途截断，不报错的话 Agent 会把残缺响应当正常结束
+        boolean sawCompletionSignal = false;
 
         //try-with-resources 确保 reader 和底层 InputStream 自动关闭
         try (var reader = new BufferedReader(new InputStreamReader(response.body()))) {
@@ -181,7 +184,10 @@ public class OpenAiClient implements LlmClient {
                 if (line.isBlank()) continue;
                 if (!line.startsWith("data: ")) continue;
                 String data = line.substring(6).trim();
-                if (data.equals("[DONE]")) break;
+                if (data.equals("[DONE]")) {
+                    sawCompletionSignal = true;
+                    break;
+                }
 
                 Map<String, Object> event = MAPPER.readValue(data, Map.class);
 
@@ -252,6 +258,7 @@ public class OpenAiClient implements LlmClient {
                     //4. finish_reason — 本轮结束原因
                     String finishReason = (String) choice.get("finish_reason");
                     if (finishReason != null && !"null".equals(finishReason)) {
+                        sawCompletionSignal = true;
                         stopReason = finishReason;
                         //finish_reason=tool_calls 时，完成所有未完成的工具调用（发 ToolCallComplete）
                         //参数需要等全部 JSON 片段到齐后才能反序列化成 Map
@@ -281,11 +288,21 @@ public class OpenAiClient implements LlmClient {
             streamQueue.add(new StreamEvent.ThinkingComplete(reasoningAccum.toString(), ""));
         }
 
+        //兜底：既没收到 finish_reason 也没收到 [DONE]，说明流被中途截断，
+        //不报错的话 Agent 会把残缺响应当正常结束
+        if (!sawCompletionSignal) {
+            throw new LlmException("Stream ended unexpectedly (no finish_reason or [DONE] received)");
+        }
+
         //映射 stop_reason 到与 Anthropic 一致的语义，方便 Agent Loop 统一处理
-        //OpenAI: "stop" → "end_turn"；"tool_calls" → "tool_use"；其余保持原值
-        String mappedStopReason = "tool_calls".equals(stopReason) ? "tool_use"
-                : "stop".equals(stopReason) ? "end_turn"
-                : stopReason;
+        //OpenAI: "stop" → "end_turn"；"tool_calls" → "tool_use"；"length" → "max_tokens"
+        //（"length" 表示输出打满 token 上限，映射后 Agent 的 max_tokens 恢复路径才能触发）
+        String mappedStopReason = switch (stopReason) {
+            case "tool_calls" -> "tool_use";
+            case "stop" -> "end_turn";
+            case "length" -> "max_tokens";
+            default -> stopReason;
+        };
 
         streamQueue.add(new StreamEvent.StreamEnd(mappedStopReason, inputTokens, outputTokens));
     }
