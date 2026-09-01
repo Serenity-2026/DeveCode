@@ -133,7 +133,7 @@ public class McpManager {
      * @param command cmd
      * @return not windows:command,windows:command+.cmd
      */
-    static String windowsSafe(String command) {
+    public static String windowsSafe(String command) {
         if (!System.getProperty("os.name", "").toLowerCase().contains("win")) return command;
         String base = command.toLowerCase();
         if (WIN_CMD_SUFFIXED.contains(base)) return command + ".cmd";
@@ -145,7 +145,7 @@ public class McpManager {
      * @param name 待替换字符串
      * @return 替换后的字符串
      */
-    static String sanitizeName(String name) {
+    public static String sanitizeName(String name) {
         return NON_ALNUM.matcher(name).replaceAll("_");
     }
 
@@ -154,7 +154,7 @@ public class McpManager {
      * @param value 待替换字符串
      * @return 替换后的字符串
      */
-    static String resolveEnvVars(String value) {
+    public static String resolveEnvVars(String value) {
         if (value == null) return null;
         return ENV_VAR.matcher(value).replaceAll(m -> {
             String env = System.getenv(m.group(1));
