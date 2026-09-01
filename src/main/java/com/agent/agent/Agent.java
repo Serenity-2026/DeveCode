@@ -12,7 +12,13 @@ import com.agent.plan.PlanFile;
 import com.agent.prompt.PlanModePrompt;
 import com.agent.tool.FileHistory;
 import com.agent.tool.ToolRegistry;
+import com.agent.tool.result.ContentReplacementRecord;
+import com.agent.tool.result.ContentReplacementState;
+import com.agent.tool.result.ReplacementRecordsIO;
+import com.agent.tool.result.ToolResultBudget;
 
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -50,6 +56,11 @@ public class Agent {
 
     private PermissionChecker checker;
 
+    public void setReplacementState(ContentReplacementState replacementState) {
+        this.replacementState = replacementState;
+    }
+
+    private ContentReplacementState replacementState = new ContentReplacementState();
 
     private HookEngine hookEngine;
     //LoopComplete事件是否已发送"的幂等标志——保证正常退出和异常退出两条路径下 LoopComplete 都恰好发一次，让UI不会因为信号缺失而卡死、也不会因为信号重复而错乱。
@@ -175,6 +186,37 @@ public class Agent {
                 String reminder = PlanModePrompt.buildReminder(planPath, planExists, iteration);
                 conv.addSystemReminder(reminder);
             }
+            // Layer 1: apply tool-result budget（就地修改 conv，Design A）
+            Path sessionDir = Paths.get(workDir == null ? "." : workDir, ".devecode/session");
+            //返回需要新落盘的文件记录,即溢写成功的文件
+            List<ContentReplacementRecord> newRecords = ToolResultBudget.apply(conv, sessionDir, replacementState);
+            if (!newRecords.isEmpty()) {
+                try {
+                    ReplacementRecordsIO.append(sessionDir, newRecords);
+                } catch (Exception ignored) {}
+            }
+
+            // Layer 2: auto-compact check
+            // 用 Layer 1 就地裁剪后的 conv 消息估算 token，判断更精确
+            try {
+                String wd = workDir != null ? workDir : System.getProperty("user.dir");
+                int sizeBefore = conv.size();
+                String compactMsg = ContextCompactor.manage(
+                        conv, client, contextWindow, maxOutput, wd, sessionId, compactTracking,
+                        recoveryState, iterToolSchemas, usageAnchor,
+                        conv.getMessages());
+                if (compactMsg != null && !compactMsg.isEmpty()) {
+                    putSafe(queue, new AgentEvent.CompactEvent(compactMsg));
+                }
+                // 压缩把旧消息替换成摘要，旧锚点失效，下次 stream 重新锚定
+                if (conv.size() < sizeBefore) {
+                    usageAnchor = null;
+                    conv.resetLtmInjected();
+                    conv.injectLongTermMemory(instructions, memoryContent);
+                    // 压缩后 conv 已变，重新应用 tool-result budget
+                    newRecords = ToolResultBudget.apply(conv, sessionDir, replacementState);
+                }
+            } catch (Exception ignored) {}
             var tools = iterToolSchemas;
             var streamQueue = client.stream(conv, tools);
             var text = new StringBuilder();
