@@ -1,5 +1,7 @@
 package com.agent.tool;
 
+import com.agent.tool.result.ToolResult;
+
 import java.util.Map;
 
 public interface Tool {

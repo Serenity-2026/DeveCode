@@ -1,4 +1,4 @@
-package com.agent.tool;
+package com.agent.tool.result;
 //成功路径一律用 ToolResult.success() ，失败路径一律用 ToolResult.error() ，代码的一致性非常好。
 public record ToolResult(String output, boolean isError) {
 

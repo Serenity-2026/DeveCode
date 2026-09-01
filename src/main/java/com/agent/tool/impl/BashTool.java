@@ -4,7 +4,7 @@ import com.agent.config.SandboxConfig;
 import com.agent.sandbox.Sandbox;
 import com.agent.tool.Tool;
 import com.agent.tool.ToolCategory;
-import com.agent.tool.ToolResult;
+import com.agent.tool.result.ToolResult;
 
 import java.io.IOException;
 import java.io.InputStream;

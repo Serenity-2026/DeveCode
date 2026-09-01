@@ -2,13 +2,12 @@ package com.agent.tool.impl;
 
 import com.agent.tool.Tool;
 import com.agent.tool.ToolCategory;
-import com.agent.tool.ToolResult;
+import com.agent.tool.result.ToolResult;
 
 import java.io.IOException;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;

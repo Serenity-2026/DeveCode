@@ -2,9 +2,8 @@ package com.agent.tool.impl;
 
 import com.agent.tool.Tool;
 import com.agent.tool.ToolCategory;
-import com.agent.tool.ToolResult;
+import com.agent.tool.result.ToolResult;
 
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
