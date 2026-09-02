@@ -56,6 +56,19 @@ public class Agent {
 
     private PermissionChecker checker;
 
+    public String getSessionId() {
+        return sessionId;
+    }
+
+    public void setSessionId(String sessionId) {
+        this.sessionId = sessionId;
+    }
+
+    private String sessionId;
+    //生成摘要时的熔断器
+    private final ContextCompactor.AutoCompactTrackingState compactTracking = new ContextCompactor.AutoCompactTrackingState();
+    private ContextCompactor.UsageAnchor usageAnchor;
+
     public void setReplacementState(ContentReplacementState replacementState) {
         this.replacementState = replacementState;
     }
@@ -141,6 +154,7 @@ public class Agent {
         //升级标识,只提升一次上限,后续走续写路线
         boolean maxTokensEscalated = false;
         int outputRecoveries = 0;
+        conv.injectLongTermMemory(instructions, memoryContent);
         try{
         for (int iteration = 1; ; iteration++) {
             // 1. 检查迭代上限
@@ -151,9 +165,7 @@ public class Agent {
             }
             // 2. 检查线程中断,已中断线程退出agent循环
             if (Thread.currentThread().isInterrupted()) break;
-            // 3. 每轮注入最新的ltm信息
-            conv.injectLongTermMemory(instructions, memoryContent);
-            // 4. 注入延迟工具清单
+            // 3. 注入延迟工具清单
             var deferredNames = registry.getDeferredToolNames();
             if (!deferredNames.isEmpty()) {
                 var sb = new StringBuilder();
@@ -165,7 +177,7 @@ public class Agent {
                 }
                 conv.addSystemReminder(sb.toString());
             }
-            // 5. 获取工具 schema，调用 LLM
+            // 4. 获取工具 schema，调用 LLM
             var iterToolSchemas = registry.getAllSchemas(protocol);
             if (toolNameFilter != null) {
                 //保留指定name的工具方法
@@ -177,7 +189,7 @@ public class Agent {
                         })
                         .toList();
             }
-            // 可选项:添加plan_mode提示词
+            // 5. 可选项:添加plan_mode提示词
             if (checker != null && checker.getMode() == PermissionMode.PLAN) {
                 String wd = workDir != null ? workDir : System.getProperty("user.dir");
                 String planPath = PlanFile.getOrCreatePlanPath(wd);
@@ -186,7 +198,7 @@ public class Agent {
                 String reminder = PlanModePrompt.buildReminder(planPath, planExists, iteration);
                 conv.addSystemReminder(reminder);
             }
-            // Layer 1: apply tool-result budget（就地修改 conv，Design A）
+            // Layer 1: 裁剪大tool_use
             Path sessionDir = Paths.get(workDir == null ? "." : workDir, ".devecode/session");
             //返回需要新落盘的文件记录,即溢写成功的文件
             List<ContentReplacementRecord> newRecords = ToolResultBudget.apply(conv, sessionDir, replacementState);
@@ -197,10 +209,14 @@ public class Agent {
             }
 
             // Layer 2: auto-compact check
-            // 用 Layer 1 就地裁剪后的 conv 消息估算 token，判断更精确
+            // 用Layer 1就地裁剪后的conv消息估算token，判断更精确
             try {
                 String wd = workDir != null ? workDir : System.getProperty("user.dir");
                 int sizeBefore = conv.size();
+                /**
+                 * compactTracking:熔断器
+                 * usageAnchor:上次API usage的锚点（精确计数）
+                 */
                 String compactMsg = ContextCompactor.manage(
                         conv, client, contextWindow, maxOutput, wd, sessionId, compactTracking,
                         recoveryState, iterToolSchemas, usageAnchor,
@@ -208,13 +224,10 @@ public class Agent {
                 if (compactMsg != null && !compactMsg.isEmpty()) {
                     putSafe(queue, new AgentEvent.CompactEvent(compactMsg));
                 }
-                // 压缩把旧消息替换成摘要，旧锚点失效，下次 stream 重新锚定
+                // 压缩把旧消息替换成摘要，旧锚点失效，下次stream重新锚定
                 if (conv.size() < sizeBefore) {
                     usageAnchor = null;
-                    conv.resetLtmInjected();
                     conv.injectLongTermMemory(instructions, memoryContent);
-                    // 压缩后 conv 已变，重新应用 tool-result budget
-                    newRecords = ToolResultBudget.apply(conv, sessionDir, replacementState);
                 }
             } catch (Exception ignored) {}
             var tools = iterToolSchemas;
@@ -276,23 +289,42 @@ public class Agent {
                 if (event instanceof StreamEvent.StreamEnd || event instanceof StreamEvent.Error) break;
             }
 
-            // 7. 错误恢复
+            // 7. 错误恢复,在错误现场立即裁剪、压缩，如果让下一轮来判断不会触发压缩、裁剪动作
             if (streamError) {
                 if (lastStreamError != null && (lastStreamError.contains("context") || lastStreamError.contains("too long")
                         || lastStreamError.contains("prompt"))) {
                     if (contextRetries < 3) {
                         contextRetries++;
-                        ContextCompactor.forceCompact(conv, client, contextWindow, recoveryState, tools);
-                        continue; // 重试
+                        putSafe(queue, new AgentEvent.RetryEvent("Context too long, compacting...", 0));
+                        // 先裁剪再压缩，确保预算内的结果不会被误压缩
+                        Path forceSessionDir = Paths.get(workDir == null ? "." : workDir, ".devecode/session");
+                        List<ContentReplacementRecord> forceRecords = ToolResultBudget.apply(conv, forceSessionDir, replacementState);
+                        if (!forceRecords.isEmpty()) {
+                            try {
+                                ReplacementRecordsIO.append(forceSessionDir, forceRecords);
+                            } catch (Exception ignored) {}
+                        }
+                        int sizeBeforeForce = conv.size();
+                        try {
+                            String wdForce = workDir != null ? workDir : System.getProperty("user.dir");
+                           ContextCompactor.forceCompact(
+                                    conv, client, contextWindow, wdForce, sessionId,
+                                    recoveryState, iterToolSchemas,
+                                    conv.getMessages());
+                        } catch (Exception ignored) {}
+                        //确实发生了压缩,usage重标
+                        if (conv.size() < sizeBeforeForce) {
+                            usageAnchor = null;
+                            conv.injectLongTermMemory(instructions, memoryContent);
+                        }
+                        continue;
                     }
                 }
                 if (lastStreamError != null && lastStreamError.toLowerCase().contains("rate limit")) {
                     putSafe(queue, new AgentEvent.RetryEvent("Rate limited, waiting 5s...", 5000));
                     try {
                         Thread.sleep(5000);
-                    } catch (InterruptedException e) {
-                        break;
-                    }
+                    } catch (InterruptedException e) { break; }
                     continue;
                 }
                 break;
@@ -300,18 +332,23 @@ public class Agent {
             totalInput += turnInput;
             totalOutput += turnOutput;
             putSafe(queue, new AgentEvent.UsageEvent(totalInput, totalOutput));
-            // 8. max_tokens 恢复
+            // 8. max_tokens 恢复，stopReason=end_turn（正常说完了）、tool_use（要调工具）、max_tokens（输出长度配额用完，被硬掐断）
             if ("max_tokens".equals(stopReason)) {
+                //先永久提高output上限
                 if (!maxTokensEscalated) {
                     maxTokensEscalated = true;
                     client.setMaxOutputTokens(MAX_TOKENS_CEILING);
                     if (!text.isEmpty()) {
+                        //continue回到循环顶部后会发起一次全新的LLM请求，而LLM是无状态的——它不记得自己上一句话说到哪了。所以必须把它被掐断前的半截输出（text + thinkingBlocks）作为assistant消息存进对话
+                        //1.被掐时tool call的JSON可能是残缺的；2.“半截输出 + 完整工具调用”的语义是混乱的 故显示清空工具
                         conv.addAssistantFull(text.toString(), thinkingBlocks, List.of());
                         conv.addUserMessage("Output token limit hit. Resume directly from where you stopped. Do not apologize or repeat previous content. Pick up mid-thought if needed.");
                     }
                     putSafe(queue, new AgentEvent.RetryEvent("max_tokens escalation", 0));
                     continue;
-                } else if (outputRecoveries < MAX_OUTPUT_RECOVERIES) {
+                }
+                //已升级上限,重试
+                else if (outputRecoveries < MAX_OUTPUT_RECOVERIES) {
                     outputRecoveries++;
                     conv.addAssistantFull(text.toString(), thinkingBlocks, List.of());
                     conv.addUserMessage("Output token limit hit. Resume directly from where you stopped. Break remaining work into smaller pieces.");
@@ -324,6 +361,12 @@ public class Agent {
             }
             // 9. 保存 assistant 消息
             conv.addAssistantFull(text.toString(), thinkingBlocks, toolUseBlocks);
+            if (turnInput > 0 || turnOutput > 0 || turnCacheRead > 0 || turnCacheCreation > 0) {
+                int baseline = turnInput + turnCacheRead + turnCacheCreation + turnOutput;
+                //每轮对话结束,记录真实token数和消息条数
+                usageAnchor = new ContextCompactor.UsageAnchor(
+                        baseline, conv.size());
+            }
             // 10. 没有工具调用 → 结束
             if (toolUseBlocks.isEmpty()) {
                 if (fileHistory != null) {
