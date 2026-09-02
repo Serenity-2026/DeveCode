@@ -22,6 +22,7 @@ public sealed interface AgentEvent {
     record UsageEvent(int inputTokens, int outputTokens) implements AgentEvent {}
     //发生错误,携带错误信息
     record ErrorEvent(String message) implements AgentEvent {}
+    //已触发压缩事件
     record CompactEvent(String message) implements AgentEvent {}
     record RetryEvent(String reason, long waitMs) implements AgentEvent {}
     record ThinkingText(String text) implements AgentEvent {}
