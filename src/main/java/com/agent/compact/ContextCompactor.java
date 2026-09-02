@@ -23,6 +23,10 @@ import java.util.concurrent.BlockingQueue;
 public final class ContextCompactor {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final int MAX_CONSECUTIVE_FAILURES = 3;
+    private static final int SUMMARY_OUTPUT_RESERVE = 20_000;
+    private static final int MANUAL_COMPACT_SAFETY_MARGIN = 3_000;
+    private static final int AUTO_COMPACT_SAFETY_MARGIN = 13_000;
 
     // ── PTL retry (summary request itself exceeds context window) ──────
     private static final int MAX_PTL_RETRIES = 3;
@@ -41,6 +45,12 @@ public final class ContextCompactor {
     private static final double RECOVERY_CHARS_PER_TOKEN = 3.5;
     private static final DateTimeFormatter RECOVERY_TS = DateTimeFormatter
             .ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'").withZone(ZoneOffset.UTC);
+
+    /**
+     * 用量锚点类,每轮对话结束后统计截止到anchorCount条消息的api返回的用量信息
+     * @param baselineTokens
+     * @param anchorCount
+     */
     public record UsageAnchor(int baselineTokens, int anchorCount) {}
 
     private static final String SUMMARY_SYSTEM_PROMPT = """
@@ -108,15 +118,37 @@ public final class ContextCompactor {
             9. Optional Next Step:
                [Next step if applicable]
             </summary>""";
+    // ── Circuit Breaker ────────────────────────────────────────────────
 
+    /**
+     * 熔断器,大于等于MAX_CONSECUTIVE_FAILURES视为熔断+
+     */
+    public static class AutoCompactTrackingState {
+        private int consecutiveFailures;
+
+        public boolean isTripped() {
+            return consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
+        }
+
+        public void recordFailure() {
+            consecutiveFailures++;
+        }
+
+        public void reset() {
+            consecutiveFailures = 0;
+        }
+    }
     private ContextCompactor() {}
 
     // ── Public API ──────────────────────────────────────────────────────
-
-    /** Force a full auto-compact regardless of current token usage. */
+    /**
+     * Force a full auto-compact with budget-reduced messages for token estimation.
+     */
     public static String forceCompact(ConversationManager conv, LlmClient client, int contextWindow,
-                                      RecoveryState recovery, List<Map<String, Object>> toolSchemas) {
-        return autoCompact(conv, client, contextWindow, recovery, toolSchemas);
+                                      String workDir, String sessionId,
+                                      RecoveryState recovery, List<Map<String, Object>> toolSchemas,
+                                      List<Message> budgetMessages) {
+        return autoCompact(conv, client, contextWindow, workDir, sessionId, recovery, toolSchemas, budgetMessages);
     }
 
     // ── Token estimation ────────────────────────────────────────────────
@@ -156,7 +188,78 @@ public final class ContextCompactor {
     }
 
     // ── Layer 2: Auto-compact ──────────────────────────────────────────
+    /**
+     * 根据已占用tokens的大小自动选择压缩策略,已用token大于硬边界时强制压缩,小于软边界时不压缩,软硬之间由熔断器控制是否压缩
+     * @return "" or 压缩报告
+     */
+    public static String manage(ConversationManager conv, LlmClient client,
+                                int contextWindow, int maxOutput, String workDir, String sessionId,
+                                AutoCompactTrackingState tracking,
+                                RecoveryState recovery,
+                                List<Map<String, Object>> toolSchemas,
+                                UsageAnchor anchor,
+                                List<Message> budgetMessages) {
+        // Layer 1（工具结果裁剪）已由 ToolResultBudget.apply() 在 Agent 主循环中单独处理，
+        // manage() 只负责 Layer 2（上下文压缩），避免与 ToolResultBudget 重复裁剪。
+        // 当budgetMessages非空时，使用 budget 裁剪后的消息进行token估算
+        List<Message> messagesForEstimate = (budgetMessages != null && !budgetMessages.isEmpty())
+                ? budgetMessages : conv.getMessages();
+        int tokens = currentTokens(messagesForEstimate, anchor);
+        // 软触发:已用 token >= effectiveWindow − 软边距,不用压缩
+        if (tokens < computeCompactThreshold(contextWindow, maxOutput, false)) {
+            return "";
+        }
 
+        // 硬触发:已用 token 逼近上下文窗口极限，强制压缩
+        if (tokens >= computeCompactThreshold(contextWindow, maxOutput, true)) {
+            String hardCompact=forceCompact(conv, client, contextWindow, workDir, sessionId, recovery, toolSchemas, budgetMessages);
+            //硬压缩成功说明已通,熔断器重置
+            if (tracking != null && !hardCompact.isEmpty()) {
+                tracking.reset();
+            }
+            return hardCompact;
+        }
+        // 已用空间在软硬边距之间,使用熔断器控制失败次数,压缩失败也没事，尽力而为
+        if (tracking == null || !tracking.isTripped()) {
+            try {
+                String l2 = autoCompact(conv, client, contextWindow, workDir, sessionId, recovery, toolSchemas, budgetMessages);
+                if (tracking != null) tracking.reset();
+                return l2;
+            } catch (Exception e) {
+                if (tracking != null) tracking.recordFailure();
+            }
+        }
+        return "";
+    }
+    /**
+     * 字符估算是虚高的——prompt cache命中时真实input远低于字符估算值（缓存命中的部分按极低价计费且API报的input可能只算未命中部分）。
+     * 如果全靠字符估算，会过早触发昂贵且不可逆的压缩。锚点方案=“已发送的部分信账单，新追加的部分信估算”，两个世界的误差都最小。
+     */
+    public static int currentTokens(List<Message> messages, UsageAnchor anchor) {
+        if (anchor == null || anchor.anchorCount() < 0
+                //anchorCount>messages.size()（锚点比消息还多=会话被压缩/重写过，锚点已失效）→回退全量估算。
+                || anchor.anchorCount() > messages.size()) {
+            //全量冷启动估算
+            return estimateTokens(messages);
+        }
+        List<Message> appended = messages.subList(anchor.anchorCount(), messages.size());
+        return anchor.baselineTokens() + estimateTokens(appended);
+    }
+    /**
+     * 计算可用空间大小
+     * manual表示使用什么样的边距,manual=true为硬边距有效窗口更大,manual=false为软边距
+     */
+    private static int computeCompactThreshold(int contextWindow, int maxOutput, boolean manual) {
+        //预留窗口=min(maxOutput,SUMMARY_OUTPUT_RESERVE)
+        int reserve = SUMMARY_OUTPUT_RESERVE;
+        if (maxOutput > 0 && maxOutput < reserve) {
+            reserve = maxOutput;
+        }
+        int effectiveWindow = contextWindow - reserve;
+        //估算是近似值(3.5 字符/token只是平均),需要留边距,manual=true为硬边距,manual=false为软边距
+        int margin = manual ? MANUAL_COMPACT_SAFETY_MARGIN : AUTO_COMPACT_SAFETY_MARGIN;
+        return effectiveWindow - margin;
+    }
     /**
      这一步决定"从哪里切"——前面是旧消息（要摘要），后面是近期消息（原样保留）。
      从末尾往前逐条累积 token，满足任一条件就停：
@@ -208,9 +311,14 @@ public final class ContextCompactor {
      * @return “”表示不需要裁剪或者“Compacted: %d -> %d estimated tokens"
      */
     private static String autoCompact(ConversationManager conv, LlmClient client, int contextWindow,
-                                      RecoveryState recovery, List<Map<String, Object>> toolSchemas) {
-        List<Message> messages = conv.getMessages();
+                                      String workDir, String sessionId,
+                                      RecoveryState recovery, List<Map<String, Object>> toolSchemas,
+                                      List<Message> budgetMessages) {
+        // 当 budgetMessages 非空时，使用 budget 裁剪后的消息进行 token 估算和摘要构建，
+        // 但最终仍然重写 conv（原始对话）
         //1.计算已占用token
+        List<Message> messages = (budgetMessages != null && !budgetMessages.isEmpty())
+                ? budgetMessages : conv.getMessages();
         int beforeTokens = estimateTokens(messages);
         //2.找到分割点,keepStartIndex之后的保留,前面的摘要处理
         int keepStartIndex = computeKeepStartIndex(messages);
