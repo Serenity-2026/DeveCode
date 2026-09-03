@@ -53,6 +53,8 @@ public class ConversationManager {
 
     /**、
      * 把项目说明（CLAUDE.md/AGENTS.md 风格）和自动记忆注入到对话开头，作为给 LLM 的背景上下文。
+     * @param instructions:预先写好的项目知识和编码规范，相当于员工的「入职文档」。
+     * @param memories:Agent 在对话中自动积累的经验，比如你的编码偏好、项目的技术细节。
      */
     public void injectLongTermMemory(String instructions, String memories) {
         var sections = new ArrayList<String>();
