@@ -134,6 +134,7 @@ public final class InstructionLoader {
             return content;
         }
         var out = new StringBuilder();
+        //标记是否在代码块内
         boolean inCode = false;
         try (var reader = new BufferedReader(new StringReader(content))) {
             String line;
@@ -141,6 +142,7 @@ public final class InstructionLoader {
                 String trimmed = line.trim();
                 // 检测代码块边界
                 if (trimmed.startsWith("```")) {
+                    //代码块开头和结尾都用```标记，遇到了将incode取反即可是实现对是否为代码块的判断
                     inCode = !inCode;
                     out.append(line).append('\n');
                     continue;
