@@ -692,9 +692,16 @@ public class TerminalUI implements SkillForkHost {
                 String cmdName = text.substring(1, sp);
                 String partial = text.substring(sp + 1);
                 if (partial.contains(" ")) {
-                    // 深层参数阶段：不提示也不重写，Enter 原样提交
-                    cacheKey = null;
-                    result = List.of();
+                    // 深层参数阶段：默认不提示也不重写，Enter 原样提交。
+                    // 例外：/skill exit <partial> 动态列出激活中的 skill 名（前缀过滤 + Tab 补全）
+                    var dynamic = skillExitCandidates(cmdName, partial);
+                    if (dynamic.isEmpty()) {
+                        cacheKey = null;
+                        result = List.of();
+                    } else {
+                        cacheKey = cmdName + " " + partial;
+                        result = dynamic;
+                    }
                 } else {
                     // 子命令阶段："/skill " 空尾也展示全部子命令
                     cacheKey = cmdName + " " + partial;
@@ -727,6 +734,38 @@ public class TerminalUI implements SkillForkHost {
                         new String[0], parent.type(), false, parent.skill(), Map.of()));
             }
         }
+        return result;
+    }
+
+    /**
+     * 深层参数阶段的动态候选（目前仅 /skill exit）：
+     * "/skill exit <partial>" 列出激活中的 skill 名，按 partial 前缀过滤，
+     * 合成 "skill exit <name>" 形式的候选条目——复用命令提示面板的渲染、
+     * ↑↓ 导航、Tab 补全与 Enter 展开全链路。description 取该 skill 的描述首行。
+     */
+    private List<Command> skillExitCandidates(String cmdName, String partial) {
+        if (!"skill".equals(cmdName)) {
+            return List.of();
+        }
+        int sp = partial.indexOf(' ');
+        String sub = sp < 0 ? partial : partial.substring(0, sp);
+        if (!"exit".equals(sub)) {
+            return List.of();
+        }
+        String arg = sp < 0 ? "" : partial.substring(sp + 1);
+        String lower = arg.toLowerCase(Locale.ROOT);
+        List<Command> result = new ArrayList<>();
+        for (String name : agent.getActiveSkillNames()) {
+            if (name.toLowerCase(Locale.ROOT).startsWith(lower)) {
+                String desc = skillCatalog.get(name)
+                        .map(s -> firstLine(s.meta().description()))
+                        .orElse("");
+                result.add(new Command(cmdName + " exit " + name,
+                        desc.isEmpty() ? "deactivate this active skill" : desc,
+                        new String[0], Command.CommandType.LOCAL_UI, false, false, Map.of()));
+            }
+        }
+        result.sort((a, b) -> a.name().compareTo(b.name()));
         return result;
     }
 

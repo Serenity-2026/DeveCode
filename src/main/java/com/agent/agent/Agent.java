@@ -134,6 +134,15 @@ public class Agent implements SkillHost {
         return skillName != null && activeSkillTools.remove(skillName) != null;
     }
 
+    /** 当前处于激活态的 skill 名（inline 白名单集 ∪ 恢复记录），供命令补全列出可退出的 skill。 */
+    public Set<String> getActiveSkillNames() {
+        var names = new HashSet<>(activeSkillTools.keySet());
+        for (var r : recoveryState.snapshotSkills()) {
+            names.add(r.name());
+        }
+        return names;
+    }
+
     /**
      * 当前生效的工具过滤器：所有激活 skill 白名单的并集。
      * 无激活 skill 或并集为空（全部声明空名单）→ null = 不限制（全量工具）。
