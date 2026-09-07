@@ -21,7 +21,7 @@ public class CommandRegistry {
     private final Set<String> nameIndex = new HashSet<>();   // name → ownerName
     private final Map<String, String> aliasIndex = new HashMap<>();  // alias → ownerName
 
-    /** Creates a registry pre-populated with the default MewCode commands. */
+    /** Creates a registry pre-populated with the default DeveCode commands. */
     public CommandRegistry() {
         registerDefaults();
     }
@@ -225,7 +225,7 @@ public class CommandRegistry {
                         new String[]{"s"}, CommandType.LOCAL, false),
                 ctx -> {
                     var sb = new StringBuilder();
-                    sb.append("MewCode Status\n");
+                    sb.append("DeveCode Status\n");
                     sb.append("──────────────\n");
                     sb.append("  Mode:      ").append(ctx.permissionMode().get()).append("\n");
                     int[] tokens = ctx.tokenCount().get();
@@ -308,7 +308,7 @@ public class CommandRegistry {
                         return "Skills reloaded. %d skill(s) available.".formatted(count);
                     }
                     var skills = ctx.skillList().get();
-                    if (skills.isEmpty()) return "No skills installed.\n\nAdd skills to .mewcode/skills/<skill-name>/SKILL.md";
+                    if (skills.isEmpty()) return "No skills installed.\n\nAdd skills to .devecode/skills/<skill-name>/SKILL.md";
                     var sb = new StringBuilder("Installed skills (%d):\n".formatted(skills.size()));
                     for (var s : skills) sb.append("  • ").append(s).append("\n");
                     sb.append("\nType /skills reload to hot-reload skills from disk.");

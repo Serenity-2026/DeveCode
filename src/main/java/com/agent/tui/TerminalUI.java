@@ -41,6 +41,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Objects;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
@@ -88,6 +89,7 @@ public class TerminalUI {
     private static final int PANEL_WIDTH = 36;
     private static final int PANEL_MIN_COLS = 100;  // 终端宽度 >= 此值才显示面板
     private static final long PANEL_REFRESH_MS = 1000;  // 面板周期刷新间隔（CPU/Context 实时更新）
+    private static final int MAX_COMMAND_HINTS = 8;  // 命令提示面板最多显示的候选条数
 
     // ── 终端 ──
     private final Terminal terminal;
@@ -118,6 +120,10 @@ public class TerminalUI {
     // ── 全屏选择器（/resume 会话列表、/rewind 快照列表）──
     private volatile PickerState activePicker;   // null = 无选择器，正常对话界面
     private volatile int pickerIndex;            // 当前选中项（循环导航）
+
+    // ── 命令提示（输入 / 时实时过滤候选命令）──
+    private volatile int commandHintIndex = 0;     // 当前选中候选（循环导航）
+    private volatile String hintTokenCache = null; // 上次计算候选时的命令 token（变化时重置索引）
 
     // ── 手动压缩进行中标志（/compact 后台执行期间禁止提交）──
     private volatile boolean compacting = false;
@@ -609,6 +615,67 @@ public class TerminalUI {
                 needsRedraw = true;
             }
         });
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  命令提示（输入 / 时：实时过滤 + ↑↓ 选择 + Tab 补全 + Enter 执行）
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * 当前输入对应的命令候选列表。
+     *
+     * 激活条件：输入以 "/" 开头且尚未出现空格/换行（还在命令名输入阶段）。
+     * 此时取 "/" 后的 token 调用 {@link CommandRegistry#search} 做前缀过滤
+     * （同时匹配命令名与别名，忽略大小写）；其余情况返回空列表（不提示）。
+     *
+     * 命令 token 变化时惰性重置选中索引为 0（渲染与键盘线程都会经过这里，
+     * 无需在每个输入修改点埋点重置）。
+     */
+    private List<Command> currentCommandCandidates() {
+        String text = inputBuffer.toString();
+        String token;
+        if (!text.startsWith("/")) {
+            token = null;
+        } else {
+            int sp = text.indexOf(' ');
+            String t = (sp < 0 ? text : text.substring(0, sp)).substring(1);
+            token = (t.contains("\n") || t.contains("\t")) ? null : t;
+        }
+        if (!Objects.equals(token, hintTokenCache)) {
+            hintTokenCache = token;
+            commandHintIndex = 0;
+        }
+        if (token == null) return List.of();
+        return commandRegistry.search(token);
+    }
+
+    /** 命令提示导航：循环移动（与全屏选择器一致，到顶再按上跳到最后一条）。 */
+    private void moveCommandHint(int delta) {
+        var cands = currentCommandCandidates();
+        if (cands.isEmpty()) return;
+        int n = cands.size();
+        commandHintIndex = (commandHintIndex + delta + n) % n;
+        needsRedraw = true;
+    }
+
+    /** Tab：把选中候选补全到输入框（命令名后置一个空格，便于继续输入参数）。 */
+    private void completeCommandHint() {
+        var cands = currentCommandCandidates();
+        if (cands.isEmpty()) return;
+        int idx = Math.min(Math.max(commandHintIndex, 0), cands.size() - 1);
+        replaceCommandToken(cands.get(idx).name() + " ");
+        needsRedraw = true;
+    }
+
+    /**
+     * 用完整命令名替换输入中的命令 token。
+     * 提示只在单行、无空格时激活，输入内容就是 "/<token>"，可安全整体重建。
+     */
+    private void replaceCommandToken(String replacement) {
+        inputBuffer.setLength(0);
+        inputBuffer.append('/').append(replacement);
+        cursorCol = replacement.length() + 1;
+        cursorRow = 0;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -1416,10 +1483,12 @@ public class TerminalUI {
                         switch (csi) {
                             case "A" -> {
                                 if (activePicker != null) movePicker(-1);
+                                else if (!currentCommandCandidates().isEmpty()) moveCommandHint(-1);
                                 else if (!streaming) { scrollOffset++; needsRedraw = true; }
                             }
                             case "B" -> {
                                 if (activePicker != null) movePicker(1);
+                                else if (!currentCommandCandidates().isEmpty()) moveCommandHint(1);
                                 else if (!streaming) { scrollOffset = Math.max(0, scrollOffset - 1); needsRedraw = true; }
                             }
                             case "C" -> handleCursorRight();
@@ -1442,10 +1511,12 @@ public class TerminalUI {
                         switch (c3) {
                             case 'A' -> {
                                 if (activePicker != null) movePicker(-1);
+                                else if (!currentCommandCandidates().isEmpty()) moveCommandHint(-1);
                                 else if (!streaming) { scrollOffset++; needsRedraw = true; }
                             }
                             case 'B' -> {
                                 if (activePicker != null) movePicker(1);
+                                else if (!currentCommandCandidates().isEmpty()) moveCommandHint(1);
                                 else if (!streaming) { scrollOffset = Math.max(0, scrollOffset - 1); needsRedraw = true; }
                             }
                             case 'C' -> handleCursorRight();
@@ -1509,6 +1580,11 @@ public class TerminalUI {
                         }
                         continue;
                     }
+                    // 命令提示激活：Tab 补全选中候选（不作为输入字符进入输入框）
+                    if (ch == '\t' && !currentCommandCandidates().isEmpty()) {
+                        completeCommandHint();
+                        continue;
+                    }
                     eventQueue.add(new UIEvent.KeyTyped(ch));
                     needsRedraw = true;
                 }
@@ -1536,6 +1612,14 @@ public class TerminalUI {
             return;
         }
         if (!streaming) {
+            // 命令提示激活：Enter = 选中候选命令（展开完整命令名后提交执行）。
+            // 仅输入 "/" 时不自动执行（避免误触发第一条候选命令）
+            var cands = currentCommandCandidates();
+            String token = hintTokenCache;
+            if (!cands.isEmpty() && token != null && !token.isEmpty()) {
+                int idx = Math.min(Math.max(commandHintIndex, 0), cands.size() - 1);
+                replaceCommandToken(cands.get(idx).name());
+            }
             String text = inputBuffer.toString();
             if (!text.isBlank()) {
                 inputHistory.add(text);
@@ -1645,7 +1729,7 @@ public class TerminalUI {
         int leftCols = showPanel ? cols - panelW - 1 : cols;  // -1 给竖线分隔
         int panelX = showPanel ? cols - panelW : 0;            // 面板起始列
 
-        // 布局：状态行(1) | 分隔(1) | {对话区 | 分隔(1) | 输入区} + 状态面板 | 状态栏(1)
+        // 布局：状态行(1) | 分隔(1) | {对话区 | 命令提示 | 分隔(1) | 输入区} + 状态面板 | 状态栏(1)
         int statusRow = 0;
         int sep1Row = 1;
         int convStart = 2;
@@ -1654,15 +1738,32 @@ public class TerminalUI {
         int inputTop = sep2Row + 1;
         int statusBarRow = rows - 1;
 
+        // 命令提示面板（输入 / 时）：占据对话区底部，对话区至少保留 3 行
+        List<Command> hintCmds = currentCommandCandidates();
+        int hintHeight = 0;
+        if (!hintCmds.isEmpty()) {
+            int maxByList = Math.min(hintCmds.size(), MAX_COMMAND_HINTS) + 2;  // 顶线 + 条目 + 操作提示行
+            int maxBySpace = Math.max(0, sep2Row - convStart - 3);             // 对话区至少留 3 行
+            hintHeight = Math.min(maxByList, maxBySpace);
+            if (hintHeight < 3) hintHeight = 0;   // 空间太小放不下完整面板就不显示
+        }
+
         // 确保对话区至少有 3 行
-        int convEnd = sep2Row - 1;
+        int convEnd = sep2Row - 1 - hintHeight;
         if (convEnd - convStart < 3) {
-            convEnd = convStart + 3;
-            sep2Row = convEnd;
-            inputTop = sep2Row + 1;
-            if (inputTop + inputHeight >= rows) {
-                inputHeight = rows - inputTop - 1;
-                if (inputHeight < 1) inputHeight = 1;
+            // 空间不足：优先放弃命令提示面板
+            if (hintHeight > 0) {
+                hintHeight = 0;
+                convEnd = sep2Row - 1;
+            }
+            if (convEnd - convStart < 3) {
+                convEnd = convStart + 3;
+                sep2Row = convEnd;
+                inputTop = sep2Row + 1;
+                if (inputTop + inputHeight >= rows) {
+                    inputHeight = rows - inputTop - 1;
+                    if (inputHeight < 1) inputHeight = 1;
+                }
             }
         }
 
@@ -1689,6 +1790,11 @@ public class TerminalUI {
         // ── 对话区（左侧）──
         int convWidth = leftCols - 1;
         renderConversation(buf, convStart, convEnd, convWidth, leftCols);
+
+        // ── 命令提示面板（对话区与分隔线2之间，输入 / 时出现）──
+        if (hintHeight > 0) {
+            renderCommandHints(buf, sep2Row - hintHeight, leftCols, hintCmds, hintHeight - 2);
+        }
 
         // ── 分隔线2（仅左侧）──
         moveTo(buf, sep2Row, 0);
@@ -1842,6 +1948,92 @@ public class TerminalUI {
                 }
             }
         }
+    }
+
+    /**
+     * 渲染命令提示面板（输入 / 时出现在对话区底部）。
+     *
+     * 结构：亮天蓝顶线（带 commands 标题）+ 候选条目列表 + 操作提示行。
+     * ● 实心白点标记选中项（↑↓ 循环导航），○ 空心灰点标记未选中项，
+     * 与全屏选择器的视觉惯例保持一致。
+     *
+     * @param startRow   面板首行（顶线）所在行
+     * @param width      左侧区域宽度
+     * @param cands      候选命令列表（已按名称排序）
+     * @param maxVisible 空间允许显示的最大条目数
+     */
+    private void renderCommandHints(StringBuilder buf, int startRow, int width,
+                                     List<Command> cands, int maxVisible) {
+        int n = cands.size();
+        int visible = Math.min(n, Math.min(maxVisible, MAX_COMMAND_HINTS));
+        if (visible <= 0) return;
+        int idx = Math.min(Math.max(commandHintIndex, 0), n - 1);
+
+        // 滚动窗口跟随选中项（尽量居中）
+        int winStart;
+        if (n <= visible) {
+            winStart = 0;
+        } else {
+            winStart = idx - visible / 2;
+            if (winStart < 0) winStart = 0;
+            if (winStart > n - visible) winStart = n - visible;
+        }
+
+        // ── 顶线：╾─ commands ──────（亮天蓝，区别于灰色分隔线）──
+        moveTo(buf, startRow, 0);
+        buf.append("\033[K");
+        String header = " commands ";
+        int fill = Math.max(0, width - header.length() - 2);
+        buf.append(BORDER).append('╾').append(header).append(repeat('─', fill)).append(RESET);
+
+        // ── 条目列表（命令列对齐，描述跟随其后）──
+        // 命令列可见宽度 = max("/name (aliases)")，用于各条目描述列对齐
+        int cmdColW = 0;
+        for (int i = winStart; i < winStart + visible; i++) {
+            cmdColW = Math.max(cmdColW, commandColumnWidth(cands.get(i)));
+        }
+
+        int y = startRow + 1;
+        for (int i = winStart; i < winStart + visible; i++) {
+            Command c = cands.get(i);
+            boolean sel = (i == idx);
+            moveTo(buf, y, 0);
+            buf.append("\033[K");
+
+            // 标记 + 命令名（选中：白粗体；未选中：白色）
+            String marker = sel ? BOLD + WHITE + "● " + RESET : GRAY + "○ " + RESET;
+            String nameColored = (sel ? BOLD + WHITE : WHITE) + "/" + c.name() + RESET;
+            String aliases = "";
+            if (c.aliases().length > 0) {
+                aliases = GRAY + " (" + String.join(", ", c.aliases()) + ")" + RESET;
+            }
+            buf.append(marker).append(nameColored).append(aliases);
+
+            // 描述（灰色，对齐到统一列；空间不足时截断）
+            int used = 2 + commandColumnWidth(c);
+            int descCol = 2 + cmdColW + 2;
+            if (descCol < width - 4) {
+                buf.append(repeat(' ', descCol - used));
+                buf.append(GRAY).append(truncate(c.description(), width - descCol - 1)).append(RESET);
+            }
+            y++;
+        }
+
+        // ── 操作提示行（条目超出窗口时附带位置指示）──
+        moveTo(buf, y, 0);
+        buf.append("\033[K");
+        String hint = GRAY + "  ↑↓ select  ·  Tab complete  ·  Enter run"
+                + (n > visible ? "  ·  " + (idx + 1) + "/" + n : "") + RESET;
+        buf.append(truncate(hint, width));
+    }
+
+    /** 命令条目中命令列（"/name (aliases)"）的可见宽度。 */
+    private static int commandColumnWidth(Command c) {
+        int w = 1 + c.name().length();
+        if (c.aliases().length > 0) {
+            w += 3 + String.join(", ", c.aliases()).length();  // " (" + join + ")"
+        }
+        return w;
     }
 
     // ═══════════════════════════════════════════════════════════════
