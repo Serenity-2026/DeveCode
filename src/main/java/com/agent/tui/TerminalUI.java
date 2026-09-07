@@ -39,6 +39,7 @@ import org.jline.utils.NonBlockingReader;
 
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.io.UncheckedIOException;
 import java.lang.management.ManagementFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -360,12 +361,13 @@ public class TerminalUI implements SkillForkHost {
         toolRegistry.register(new SkillTool(skillCatalog, toolRegistry, this));
         agent.setSkillCatalog(skillCatalog);
         commandRegistry.register(
-                new Command("skill", "Manage skills: list · reload · install <url> · exit <name>",
+                new Command("skill", "Manage skills: list · reload · install <url> · uninstall <name> · exit <name>",
                         new String[0], Command.CommandType.LOCAL_UI, false,
                         Command.subcommands(
                                 "list", "List installed skills",
                                 "reload", "Hot-reload skills from disk",
                                 "install", "Install a skill from GitHub <url>",
+                                "uninstall", "Uninstall an installed skill <name>",
                                 "exit", "Deactivate an active skill <name>")),
                 null);
     }
@@ -693,8 +695,8 @@ public class TerminalUI implements SkillForkHost {
                 String partial = text.substring(sp + 1);
                 if (partial.contains(" ")) {
                     // 深层参数阶段：默认不提示也不重写，Enter 原样提交。
-                    // 例外：/skill exit <partial> 动态列出激活中的 skill 名（前缀过滤 + Tab 补全）
-                    var dynamic = skillExitCandidates(cmdName, partial);
+                    // 例外：/skill exit 与 /skill uninstall 的 <name> 参数动态列出候选（前缀过滤 + Tab 补全）
+                    var dynamic = skillArgCandidates(cmdName, partial);
                     if (dynamic.isEmpty()) {
                         cacheKey = null;
                         result = List.of();
@@ -738,30 +740,45 @@ public class TerminalUI implements SkillForkHost {
     }
 
     /**
-     * 深层参数阶段的动态候选（目前仅 /skill exit）：
-     * "/skill exit <partial>" 列出激活中的 skill 名，按 partial 前缀过滤，
-     * 合成 "skill exit <name>" 形式的候选条目——复用命令提示面板的渲染、
-     * ↑↓ 导航、Tab 补全与 Enter 展开全链路。description 取该 skill 的描述首行。
+     * 深层参数阶段的动态候选：
+     * <ul>
+     *   <li>"/skill exit <partial>"：列出激活中的 skill 名；</li>
+     *   <li>"/skill uninstall <partial>"：列出已安装、可删除（非 builtin）的 skill 名。</li>
+     * </ul>
+     * 按 partial 前缀过滤，合成 "/skill <sub> <name>" 形式的候选条目——复用命令
+     * 提示面板的渲染、↑↓ 导航、Tab 补全与 Enter 展开全链路。
+     * description 取该 skill 的描述首行。
      */
-    private List<Command> skillExitCandidates(String cmdName, String partial) {
+    private List<Command> skillArgCandidates(String cmdName, String partial) {
         if (!"skill".equals(cmdName)) {
             return List.of();
         }
         int sp = partial.indexOf(' ');
         String sub = sp < 0 ? partial : partial.substring(0, sp);
-        if (!"exit".equals(sub)) {
+        boolean exit = "exit".equals(sub);
+        boolean uninstall = "uninstall".equals(sub);
+        if (!exit && !uninstall) {
             return List.of();
         }
         String arg = sp < 0 ? "" : partial.substring(sp + 1);
         String lower = arg.toLowerCase(Locale.ROOT);
+        // exit 列激活中的；uninstall 列已安装且磁盘上有目录（builtin 内嵌，不可删）的
+        java.util.Collection<String> names = exit
+                ? agent.getActiveSkillNames()
+                : skillCatalog.getSkills().keySet().stream()
+                        .filter(n -> skillCatalog.get(n)
+                                .map(s -> s.sourceDir() != null)
+                                .orElse(false))
+                        .toList();
         List<Command> result = new ArrayList<>();
-        for (String name : agent.getActiveSkillNames()) {
+        for (String name : names) {
             if (name.toLowerCase(Locale.ROOT).startsWith(lower)) {
                 String desc = skillCatalog.get(name)
                         .map(s -> firstLine(s.meta().description()))
                         .orElse("");
-                result.add(new Command(cmdName + " exit " + name,
-                        desc.isEmpty() ? "deactivate this active skill" : desc,
+                String fallback = exit ? "deactivate this active skill" : "uninstall this skill";
+                result.add(new Command(cmdName + " " + sub + " " + name,
+                        desc.isEmpty() ? fallback : desc,
                         new String[0], Command.CommandType.LOCAL_UI, false, false, Map.of()));
             }
         }
@@ -1228,7 +1245,7 @@ public class TerminalUI implements SkillForkHost {
         needsRedraw = true;
     }
 
-    /** /skill — skill 管理（skill 包）：/skill list 列出 · /skill reload 热加载 · /skill install 安装 · /skill exit 退出。 */
+    /** /skill — skill 管理（skill 包）：/skill list 列出 · /skill reload 热加载 · /skill install 安装 · /skill uninstall 卸载 · /skill exit 退出。 */
     private void doSkill(String args) {
         String[] parts = (args == null ? "" : args.trim()).split("\\s+");
         String sub = parts[0].isEmpty() ? "" : parts[0];
@@ -1236,6 +1253,7 @@ public class TerminalUI implements SkillForkHost {
             case "list" -> doSkillList();
             case "reload" -> doSkillReload();
             case "install" -> doSkillInstall(parts);
+            case "uninstall" -> doSkillUninstall(parts);
             case "exit" -> doSkillExit(parts);
             default -> printSkillUsage();
         }
@@ -1275,6 +1293,62 @@ public class TerminalUI implements SkillForkHost {
         needsRedraw = true;
     }
 
+    /**
+     * /skill uninstall <name> — 卸载指定 skill：若正在激活中先退出（清白名单/恢复记录/停用提示），
+     * 然后递归删除其安装目录并热重载目录 + 同步命令注册。builtin 层（内嵌 resources，无磁盘目录）不可卸载。
+     */
+    private void doSkillUninstall(String[] parts) {
+        if (parts.length < 2 || parts[1].isEmpty()) {
+            printSkillUsage();
+            return;
+        }
+        String name = parts[1];
+        var opt = skillCatalog.get(name);
+        if (opt.isEmpty()) {
+            appendMessage(UIMessage.error("Skill not found: " + name));
+            scrollToBottom();
+            needsRedraw = true;
+            return;
+        }
+        Path dir = opt.get().sourceDir();
+        String src = skillCatalog.source(name);
+        if (dir == null || "builtin".equals(src)) {
+            appendMessage(UIMessage.system(YELLOW
+                    + "Built-in skill '" + name + "' cannot be uninstalled." + RESET));
+            scrollToBottom();
+            needsRedraw = true;
+            return;
+        }
+        // 激活中先退出：清工具白名单贡献 + 压缩恢复记录，避免卸载后残留激活态
+        deactivateSkill(name);
+        try {
+            deleteRecursively(dir);
+            skillCatalog.reload(workDir);
+            syncSkillCommands();
+            appendMessage(UIMessage.system(GREEN + "✔ Skill uninstalled: " + RESET + WHITE + name + RESET
+                    + GRAY + " · removed " + dir + " (" + src + ")" + RESET));
+        } catch (Exception e) {
+            appendMessage(UIMessage.error("Skill uninstall failed: "
+                    + (e.getMessage() == null ? e.toString() : e.getMessage())));
+        }
+        scrollToBottom();
+        needsRedraw = true;
+    }
+
+    /** 递归删除目录（skill 卸载用）：walk 逆序保证先删文件再删父目录。 */
+    private static void deleteRecursively(Path dir) throws IOException {
+        try (var walk = Files.walk(dir)) {
+            walk.sorted(java.util.Comparator.reverseOrder())
+                    .forEach(p -> {
+                        try {
+                            Files.delete(p);
+                        } catch (IOException e) {
+                            throw new UncheckedIOException(e);
+                        }
+                    });
+        }
+    }
+
     /** /skill reload — 从磁盘热重载 skill 目录并同步命令注册。 */
     private void doSkillReload() {
         skillCatalog.reload(workDir);
@@ -1287,12 +1361,13 @@ public class TerminalUI implements SkillForkHost {
 
     private void printSkillUsage() {
         appendMessage(UIMessage.system(GRAY
-                + "Usage: /skill list | reload | install <url> [--project] | exit <name>\n"
+                + "Usage: /skill list | reload | install <url> [--project] | uninstall <name> | exit <name>\n"
                 + "  list        show installed skill names\n"
                 + "  reload      hot-reload skills from disk\n"
                 + "  install <url> [--project]\n"
                 + "    url     github.com/<owner>/<repo>[.git] · github.com/…/tree/<ref>/<subpath> · skills.sh/<owner>/<repo>/<name>\n"
                 + "    default installs to ~/.devecode/skills (user level); --project installs to .devecode/skills\n"
+                + "  uninstall <name>  remove an installed skill from disk (active skills are deactivated first)\n"
                 + "  exit <name>  deactivate an active skill (release tool restrictions)" + RESET));
         scrollToBottom();
         needsRedraw = true;
