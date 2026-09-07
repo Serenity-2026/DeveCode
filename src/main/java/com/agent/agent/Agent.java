@@ -100,6 +100,11 @@ public class Agent {
         this.fileHistory = fileHistory;
     }
 
+    /** 手动 /compact 时由 UI 取用：压缩摘要需附带文件/skill 恢复快照 */
+    public RecoveryState getRecoveryState() {
+        return recoveryState;
+    }
+
 
     public Agent(LlmClient client, ToolRegistry registry, ProviderConfig providerConfig) {
         this.client = client;

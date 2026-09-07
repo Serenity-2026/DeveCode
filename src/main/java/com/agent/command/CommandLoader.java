@@ -59,9 +59,9 @@ public final class CommandLoader {
 
         String home = System.getProperty("user.home");
         if (home != null && !home.isEmpty()) {
-            dirs.add(Path.of(home, ".mewcode", "commands").toString());
+            dirs.add(Path.of(home, ".devecode", "commands").toString());
         }
-        dirs.add(Path.of(workDir, ".mewcode", "commands").toString());
+        dirs.add(Path.of(workDir, ".devecode", "commands").toString());
 
         // 按名称去重，后来的覆盖先来的
         Map<String, CommandWithHandler> merged = new LinkedHashMap<>();

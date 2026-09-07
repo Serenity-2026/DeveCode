@@ -2,16 +2,25 @@ package com.agent.tui;
 
 import com.agent.agent.Agent;
 import com.agent.agent.AgentEvent;
+import com.agent.command.Command;
+import com.agent.command.CommandContext;
+import com.agent.command.CommandLoader;
+import com.agent.command.CommandRegistry;
+import com.agent.compact.ContextCompactor;
 import com.agent.config.McpServerConfig;
 import com.agent.history.ConversationManager;
 import com.agent.hook.HookEngine;
 import com.agent.infra.ProviderConfig;
 import com.agent.llm.LlmClient;
+import com.agent.llm.StreamEvent;
 import com.agent.mcp.McpManager;
+import com.agent.memory.MemoryManager;
+import com.agent.memory.MemoryRecall;
 import com.agent.permission.PermissionChecker;
 import com.agent.permission.PermissionMode;
 import com.agent.permission.PermissionResponse;
 import com.agent.prompt.PromptBuilder;
+import com.agent.session.SessionManager;
 import com.agent.tool.ToolRegistry;
 import com.agent.tool.FileHistory;
 import com.agent.tool.FileStateCache;
@@ -26,14 +35,18 @@ import java.lang.management.ManagementFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalTime;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import com.sun.management.OperatingSystemMXBean;
 
@@ -85,12 +98,29 @@ public class TerminalUI {
     private final LlmClient client;              // LLM 流式客户端（由 Agent 使用）
     private final ConversationManager conversation; // 对话历史管理器
     private final ToolRegistry toolRegistry;     // 工具注册中心
-    private final FileHistory fileHistory;       // 文件编辑历史（备份/快照/回退）
+    private FileHistory fileHistory;             // 文件编辑历史（备份/快照/回退，随会话切换重建）
     private final FileStateCache fileStateCache; // 先读后改强制缓存
     private final PermissionChecker permissionChecker; // 多层权限裁决器
     private final HookEngine hookEngine;         // Hook 引擎（生命周期钩子）
     private final Agent agent;                   // 后端 agent（事件驱动）
-    private final String sessionId;              // 会话 ID（快照目录/面板显示）
+    private volatile String sessionId;           // 会话 ID（session 包持久化 / 快照目录 / 面板显示）
+    private final String workDir;                // 工作目录（session/memory/command 存储根）
+
+    // ── 上下文管理（session 包）：.devecode/sessions/<id>.jsonl 持久化 ──
+
+    // ── 记忆系统（memory 包）──
+    private final MemoryManager memoryManager;   // 记忆文件管理（提取/索引/注入）
+    private final Set<String> surfacedMemories = new HashSet<>(); // 已注入过的记忆路径（去重）
+
+    // ── 命令系统（command 包）──
+    private final CommandRegistry commandRegistry; // 斜杠命令注册中心（含 .devecode/commands/ 自定义命令）
+
+    // ── 全屏选择器（/resume 会话列表、/rewind 快照列表）──
+    private volatile PickerState activePicker;   // null = 无选择器，正常对话界面
+    private volatile int pickerIndex;            // 当前选中项（循环导航）
+
+    // ── 手动压缩进行中标志（/compact 后台执行期间禁止提交）──
+    private volatile boolean compacting = false;
 
     // ── MCP（providers.yaml mcp_servers 段）──
     private final McpManager mcpManager;                    // null = 未配置任何 MCP server
@@ -161,6 +191,9 @@ public class TerminalUI {
     private static final String WHITE   = ESC + "[97m";
     private static final String REVERSE = ESC + "[7m";
 
+    // ── 边框专用色：256 色亮天蓝 (75)，与欢迎屏一致 ──
+    private static final String BORDER  = ESC + "[38;5;75m";
+
     // ── 入口 ──
 
     /**
@@ -197,6 +230,7 @@ public class TerminalUI {
      */
     private TerminalUI(ProviderConfig provider, List<McpServerConfig> mcpServerConfigs) throws IOException {
         this.provider = provider;
+        this.workDir = System.getProperty("user.dir");
         // 步骤 2：JLine Terminal — JNA 提供原生终端控制，SIG_IGN 防止 Ctrl+C 直接杀进程
         this.terminal = TerminalBuilder.builder()
                 .jna(true)
@@ -215,16 +249,15 @@ public class TerminalUI {
         // FileStateCache — 记录 ReadFile 读取过的文件内容和 mtime，EditFile/WriteFile 据此强制"先读后改"
         this.fileStateCache = new FileStateCache();
         // FileHistory — 文件编辑备份/快照管理，每次 AI 轮次结束时打快照，支持回退
-        this.sessionId = java.util.UUID.randomUUID().toString().substring(0, 8);
-        this.fileHistory = new FileHistory(System.getProperty("user.dir"), sessionId);
+        // sessionId 由 session 包生成（yyyyMMdd-HHmmss-xxxx），同时作为 .jsonl 持久化文件名
+        this.sessionId = SessionManager.newId();
+        this.fileHistory = new FileHistory(workDir, sessionId);
+        // 启动时清理超过 30 天的过期会话文件（尽力而为，失败静默）
+        SessionManager.cleanExpiredSessions(workDir);
         // ToolRegistry — 用 createDefault() 创建所有工具，再通过 getTool() 注入依赖
         this.toolRegistry = ToolRegistry.createDefault();
         // 向需要文件依赖的工具注入 FileHistory / FileStateCache
-        ((com.agent.tool.impl.ReadFileTool) toolRegistry.getTool("ReadFile")).setFileStateCache(fileStateCache);
-        ((com.agent.tool.impl.EditFileTool) toolRegistry.getTool("EditFile")).setFileHistory(fileHistory);
-        ((com.agent.tool.impl.EditFileTool) toolRegistry.getTool("EditFile")).setFileStateCache(fileStateCache);
-        ((com.agent.tool.impl.WriteFileTool) toolRegistry.getTool("WriteFile")).setFileHistory(fileHistory);
-        ((com.agent.tool.impl.WriteFileTool) toolRegistry.getTool("WriteFile")).setFileStateCache(fileStateCache);
+        attachFileHistoryToTools();
         // ToolSearchTool 需要持有 registry 引用，用于延迟工具发现
         toolRegistry.register(new ToolSearchTool(toolRegistry, provider.getProtocol()));
         // 步骤 6：MCP — 依次连接配置的 server（stdio 子进程 / Streamable HTTP），
@@ -247,14 +280,14 @@ public class TerminalUI {
         }
         // 步骤 7：system prompt — 由 prompt 包（PromptBuilder + PromptSections）按优先级组装：
         // 身份/系统/任务/执行/工具/语气/输出/环境 8 个固定段落
-        // + 工作目录 DEVECODE.md / CLAUDE.md 自定义指令
         // + 已连接 MCP server 上报的 instructions
+        // （自定义指令与记忆改由 Agent 的 injectLongTermMemory 以 system-reminder 注入，避免重复）
         this.systemPrompt = buildSystemPrompt();
         // LlmClient.create — 根据 provider 的 protocol（anthropic/openai）创建对应客户端
         this.client = LlmClient.create(provider, systemPrompt);
         // 步骤 8：权限裁决器 — 多层规则（Plan模式 → 安全命令 → 危险命令 → 路径沙箱 → YAML 规则 → 模式矩阵）
         this.permissionChecker = new PermissionChecker(
-                PermissionMode.DEFAULT, Path.of(System.getProperty("user.dir")));
+                PermissionMode.DEFAULT, Path.of(workDir));
         // Hook 引擎 — 生命周期钩子（默认无 hook，可通过 loadHooks 注入）
         this.hookEngine = new HookEngine();
         // 组装 Agent — 后端事件驱动的 agent 循环，UI 只消费 AgentEvent
@@ -262,8 +295,34 @@ public class TerminalUI {
         agent.setChecker(permissionChecker);
         agent.setHookEngine(hookEngine);
         agent.setFileHistory(fileHistory);
-        agent.setWorkDir(System.getProperty("user.dir"));
+        agent.setWorkDir(workDir);
         agent.setMaxIterations(30);
+        agent.setSessionId(sessionId);
+        // ── 记忆系统接入（memory 包）──
+        // 指令注入：InstructionLoader 全量发现（用户级/项目级/@include），CLAUDE.md 兼容回退
+        String instructions = MemoryManager.loadInstructions(workDir);
+        if (instructions == null || instructions.isEmpty()) {
+            String legacy = loadCustomInstructions();
+            instructions = legacy == null ? "" : legacy;
+        }
+        agent.setInstructions(instructions);
+        // 记忆索引注入：MEMORY.md（用户级 + 项目级）作为 autoMemory 常驻上下文
+        this.memoryManager = new MemoryManager(workDir);
+        agent.setMemoryContent(memoryManager.buildSystemReminder());
+        // ── 命令系统接入（command 包）──
+        // 默认命令（/help /status /memory /plan …）+ .devecode/commands/ 自定义 .md 命令
+        this.commandRegistry = new CommandRegistry();
+        CommandLoader.registerUserCommands(commandRegistry, workDir);
+        // TUI 生命周期命令：/exit 退出、/prompt 查看系统提示词
+        commandRegistry.register(
+                new Command("exit", "Quit DeveCode", new String[]{"quit"},
+                        Command.CommandType.LOCAL_UI, false), null);
+        commandRegistry.register(
+                new Command("prompt", "Show current system prompt summary",
+                        new String[0], Command.CommandType.LOCAL, false),
+                ctx -> "System prompt (" + systemPrompt.length() + " chars · "
+                        + mcpServers.size() + " MCP server(s))\n\n"
+                        + (systemPrompt.length() > 800 ? systemPrompt.substring(0, 800) + "\n…" : systemPrompt));
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -273,12 +332,15 @@ public class TerminalUI {
     /**
      * 组装完整 system prompt：
      *   1. {@link PromptBuilder#buildSystemPrompt} 的 8 个固定段落（按优先级排序拼接）
-     *   2. 工作目录下 DEVECODE.md / CLAUDE.md 的自定义指令（CustomInstructions 段，优先级 80）
-     *   3. 已连接 MCP server 上报的 instructions（追加 "# MCP Servers" 段）
+     *   2. 已连接 MCP server 上报的 instructions（追加 "# MCP Servers" 段）
+     *
+     * 自定义指令（DEVECODE.md/AGENTS.md）与记忆不再拼进 system prompt：
+     * 由 Agent 的 injectLongTermMemory 以 system-reminder 形式注入对话开头，
+     * 每轮刷新且支持 @include 展开（见构造函数中 agent.setInstructions/setMemoryContent）。
      */
     private String buildSystemPrompt() {
         var env = PromptBuilder.detectEnvironment(provider.getModel());
-        var options = new PromptBuilder.BuildOptions(null, loadCustomInstructions(), null);
+        var options = new PromptBuilder.BuildOptions(null, null, null);
         String prompt = PromptBuilder.buildSystemPrompt(env, options);
 
         if (!mcpServers.isEmpty()) {
@@ -412,8 +474,9 @@ public class TerminalUI {
                 if (!streaming) submitMessage(s.text());
             }
             case UIEvent.KeyTyped kt -> {
-                if (!streaming) handleKeyTyped(kt.ch());
+                if (!streaming && activePicker == null) handleKeyTyped(kt.ch());
             }
+            case UIEvent.PickerConfirm pc -> confirmPicker();
             case UIEvent.TerminalResize r -> {
                 termWidth = r.cols();
                 termHeight = r.rows();
@@ -479,36 +542,49 @@ public class TerminalUI {
      * 在虚拟线程中消费事件并更新界面。LLM 调用、工具执行（权限检查/hook/并发分批）、
      * 上下文压缩、错误恢复全部由后端 Agent 完成。
      *
+     * 斜杠命令（/ 开头）先经命令系统（command 包）派发：
+     * LOCAL 输出结果、LOCAL_UI 触发界面动作、PROMPT 展开为提示词后继续正常提交。
+     *
      * @param text 用户输入的文本
      */
     private void submitMessage(String text) {
         if (text == null || text.isBlank()) return;
-
-        // /exit 命令
-        if (text.trim().equals("/exit")) {
-            running = false;
+        if (compacting) {
+            appendMessage(UIMessage.system(YELLOW + "Compacting in progress, please wait…" + RESET));
+            needsRedraw = true;
             return;
         }
 
-        // /mcp — 查看 MCP server 连接状态
-        if (text.trim().equals("/mcp")) {
-            showMcpStatus();
-            return;
-        }
-
-        // /prompt — 查看当前 system prompt 概要
-        if (text.trim().equals("/prompt")) {
-            showPromptInfo();
-            return;
+        // 斜杠命令：命令系统统一派发
+        if (text.trim().startsWith("/")) {
+            text = text.trim();
+            String prompt = handleCommand(text);
+            if (prompt == null) return;   // LOCAL / LOCAL_UI / 未知命令：已处理完毕
+            text = prompt;                // PROMPT 命令：展开后的提示词继续走提交流程
         }
 
         // 添加用户消息到 UI 列表 + ConversationManager
         synchronized (messages) { messages.add(UIMessage.user(text)); }
         conversation.addUserMessage(text);
+        // session 包：持久化用户消息到 .devecode/sessions/<sessionId>.jsonl
+        SessionManager.saveMessage(workDir, sessionId, "user", text);
         inputBuffer.setLength(0);
         cursorCol = 0;
         cursorRow = 0;
         scrollToBottom();
+
+        // memory 包：记忆召回 prefetch —— 与主 LLM 调用并行，
+        // Agent 在首轮工具执行后非阻塞检查 future 并把召回内容注入为 system-reminder
+        CompletableFuture<String> recallFuture = new CompletableFuture<>();
+        final String query = text;
+        Thread.startVirtualThread(() -> {
+            try {
+                recallFuture.complete(recallMemories(query));
+            } catch (Exception e) {
+                recallFuture.complete("");  // 召回失败 → 无记忆注入，不影响主流程
+            }
+        });
+        agent.setMemoryRecallFuture(recallFuture);
 
         // 启动流式状态
         streaming = true;
@@ -536,42 +612,476 @@ public class TerminalUI {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    //  斜杠命令
+    //  斜杠命令（command 包接入）
     // ═══════════════════════════════════════════════════════════════
 
-    /** /mcp — 在对话区列出已连接的 MCP server、各自注册的工具数和连接失败的错误。 */
-    private void showMcpStatus() {
+    /**
+     * 斜杠命令统一入口：解析 name/args → registry 查找 → 按命令类型派发。
+     *
+     * @return PROMPT 命令展开后的提示词（继续提交给 Agent）；其余情况返回 null
+     */
+    private String handleCommand(String input) {
+        String body = input.substring(1);
+        String[] parts = body.split("\\s+", 2);
+        String name = parts[0];
+        String args = parts.length > 1 ? parts[1] : "";
+
+        // 输入框统一清空（旧实现对 /mcp 等命令存在残留 bug）
+        inputBuffer.setLength(0);
+        cursorCol = 0;
+        cursorRow = 0;
+
+        Optional<Command> found = commandRegistry.find(name);
+        if (found.isEmpty()) {
+            appendMessage(UIMessage.system(
+                    RED + "Unknown command: /" + name + RESET + GRAY
+                            + " — type /help for available commands" + RESET));
+            scrollToBottom();
+            needsRedraw = true;
+            return null;
+        }
+        Command cmd = found.get();
+        CommandContext ctx = buildCommandContext(args);
+
+        switch (cmd.type()) {
+            case LOCAL -> {
+                String output = commandRegistry.execute(name, ctx);
+                String echo = CYAN + "/" + cmd.name() + RESET
+                        + (args.isBlank() ? "" : GRAY + " " + args + RESET);
+                appendMessage(UIMessage.system(echo));
+                if (output != null && !output.isBlank()) {
+                    appendMessage(UIMessage.system(UIMessage.grayLines(output.strip())));
+                }
+                scrollToBottom();
+                needsRedraw = true;
+                return null;
+            }
+            case LOCAL_UI -> {
+                dispatchUiCommand(cmd.name(), args);
+                return null;
+            }
+            case PROMPT -> {
+                String prompt = commandRegistry.execute(name, ctx);
+                if (prompt == null || prompt.isBlank()) {
+                    appendMessage(UIMessage.system(YELLOW
+                            + "Command /" + cmd.name() + " produced an empty prompt." + RESET));
+                    needsRedraw = true;
+                    return null;
+                }
+                // UI 显示命令回显（真实展开内容过长，不重复展示）
+                appendMessage(UIMessage.system(CYAN + "/" + cmd.name() + RESET
+                        + (args.isBlank() ? "" : GRAY + " " + args + RESET)
+                        + GRAY + " → prompt sent" + RESET));
+                needsRedraw = true;
+                return prompt;
+            }
+        }
+        return null;
+    }
+
+    /** LOCAL_UI 命令派发：命令层与 UI 层职责分离，界面动作在此实现。 */
+    private void dispatchUiCommand(String name, String args) {
+        switch (name) {
+            case "exit" -> running = false;
+            case "clear" -> doClear();
+            case "compact" -> doCompact();
+            case "plan" -> doPlan();
+            case "resume" -> doResume(args);
+            case "rewind" -> doRewind();
+            default -> appendMessage(UIMessage.system(GRAY
+                    + "Command /" + name + " is not available in this UI yet." + RESET));
+        }
+        needsRedraw = true;
+    }
+
+    /**
+     * 装配命令运行时上下文：全部用 Supplier/IntSupplier/Runnable 惰性求值，
+     * handler 执行时才读取最新状态（命令层因此不依赖 TUI 具体类）。
+     */
+    private CommandContext buildCommandContext(String args) {
+        return new CommandContext(
+                args,
+                workDir,
+                provider.getModel(),
+                () -> permissionChecker.getMode().name().toLowerCase(Locale.ROOT),
+                () -> toolRegistry.getAllSchemas(provider.getProtocol()).size(),
+                () -> new int[]{usageInTokens, usageOutTokens},
+                () -> memoryManager.getMemories(),
+                () -> memoryManager.clear(),
+                () -> sessionId + " · " + conversation.size() + " message(s)",
+                List::of,   // skills 尚未接入 TUI
+                () -> 0,
+                this::buildMcpInfo,
+                () -> permissionChecker.isSandboxEnabled() ? "enabled" : "disabled",
+                this::switchSandbox
+        );
+    }
+
+    /** /mcp 与状态展示共用的 MCP 连接摘要 */
+    private String buildMcpInfo() {
+        if (mcpServers.isEmpty() && mcpErrors.isEmpty()) return "";
+        var sb = new StringBuilder();
+        for (var s : mcpServers) {
+            sb.append(s.name()).append(": ")
+              .append(mcpToolCounts.getOrDefault(s.name(), 0)).append(" tool(s)\n");
+        }
+        for (var err : mcpErrors) {
+            sb.append("error: ").append(err).append('\n');
+        }
+        return sb.toString().stripTrailing();
+    }
+
+    /** /sandbox 模式切换：1=沙箱+自动放行 2=沙箱+常规权限 3=关闭 */
+    private void switchSandbox(Integer mode) {
+        if (mode == null) return;
+        switch (mode) {
+            case 1 -> {
+                permissionChecker.setSandboxEnabled(true);
+                permissionChecker.setMode(PermissionMode.ACCEPT_EDITS);
+            }
+            case 2 -> {
+                permissionChecker.setSandboxEnabled(true);
+                permissionChecker.setMode(PermissionMode.DEFAULT);
+            }
+            case 3 -> permissionChecker.setSandboxEnabled(false);
+            default -> { /* 无效选项由命令层提示 */ }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  记忆召回（memory 包：查询时按需注入相关记忆）
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * memory 包：查询时记忆召回 —— 扫描两级记忆目录，selector LLM 挑选
+     * 最多 5 条相关记忆，返回渲染后的 system-reminder 文本（空串 = 无相关记忆）。
+     * 已召回过的记忆（surfacedMemories）不再重复注入。
+     */
+    private String recallMemories(String query) {
+        List<MemoryRecall.RelevantMemory> selected = MemoryRecall.findRelevantMemories(
+                query,
+                memoryManager.userMemDir(),
+                memoryManager.projectMemDir(),
+                null,                       // recentTools：TUI 暂不跟踪近期工具
+                surfacedMemories,
+                this::selectMemories);
+        for (var m : selected) {
+            surfacedMemories.add(m.path());
+        }
+        return MemoryRecall.renderReminder(selected);
+    }
+
+    /**
+     * MemoryRecall.SelectorFn 实现：专用侧查询 —— 把 selector 提示词与
+     * 候选清单拼成一次性对话，经主 client 流式调用取回原始回复。
+     */
+    private String selectMemories(String systemPrompt, String userMessage) {
+        ConversationManager selConv = new ConversationManager();
+        selConv.addUserMessage(systemPrompt + "\n\n" + userMessage);
+        BlockingQueue<StreamEvent> events = client.stream(selConv, null);
+        var sb = new StringBuilder();
+        try {
+            while (true) {
+                StreamEvent event = events.take();
+                if (event instanceof StreamEvent.TextDelta td) {
+                    sb.append(td.text());
+                } else if (event instanceof StreamEvent.StreamEnd
+                        || event instanceof StreamEvent.Error) {
+                    break;
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return sb.toString();
+    }
+
+    /** Markdown 渲染的安全包装（渲染失败回退原文，用于会话恢复时的历史消息展示）。 */
+    private static String renderMarkdownSafe(String text) {
+        if (text == null || text.isEmpty()) return "";
+        try {
+            return MarkdownRenderer.render(text);
+        } catch (Exception e) {
+            return text;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  LOCAL_UI 命令实现（/clear /compact /plan /resume /rewind）
+    // ═══════════════════════════════════════════════════════════════
+
+    /** /clear — 清空对话并开启新会话（session 包）。 */
+    private void doClear() {
+        startNewSession();
+        appendMessage(UIMessage.system(CYAN + "✦ New session started" + RESET
+                + GRAY + " — conversation cleared · " + sessionId + RESET));
+        scrollToBottom();
+    }
+
+    /** 开启新会话：新 sessionId + 空对话 + 独立的文件快照历史。 */
+    private void startNewSession() {
+        sessionId = SessionManager.newId();
+        agent.setSessionId(sessionId);
+        conversation.truncateTo(0);
         synchronized (messages) {
-            if (mcpServers.isEmpty() && mcpErrors.isEmpty()) {
-                messages.add(UIMessage.system(GRAY
-                        + "No MCP servers configured. Add an 'mcp_servers' section to providers.yaml." + RESET));
+            messages.clear();
+            messages.add(UIMessage.banner());
+        }
+        usageInTokens = 0;
+        usageOutTokens = 0;
+        surfacedMemories.clear();
+        // 新会话使用独立的 .devecode/file-history/<sessionId>/ 快照目录
+        this.fileHistory = new FileHistory(workDir, sessionId);
+        attachFileHistoryToTools();
+        agent.setFileHistory(fileHistory);
+        scrollToBottom();
+        needsRedraw = true;
+    }
+
+    /** 向编辑类工具注入最新的 FileHistory / FileStateCache（会话切换后重绑）。 */
+    private void attachFileHistoryToTools() {
+        ((com.agent.tool.impl.ReadFileTool) toolRegistry.getTool("ReadFile")).setFileStateCache(fileStateCache);
+        ((com.agent.tool.impl.EditFileTool) toolRegistry.getTool("EditFile")).setFileHistory(fileHistory);
+        ((com.agent.tool.impl.EditFileTool) toolRegistry.getTool("EditFile")).setFileStateCache(fileStateCache);
+        ((com.agent.tool.impl.WriteFileTool) toolRegistry.getTool("WriteFile")).setFileHistory(fileHistory);
+        ((com.agent.tool.impl.WriteFileTool) toolRegistry.getTool("WriteFile")).setFileStateCache(fileStateCache);
+    }
+
+    /** /compact — 手动压缩上下文（后台执行，避免阻塞渲染循环）。 */
+    private void doCompact() {
+        if (streaming) {
+            appendMessage(UIMessage.system(YELLOW
+                    + "Cannot compact while streaming — wait or press Esc to interrupt." + RESET));
+            return;
+        }
+        if (conversation.size() == 0) {
+            appendMessage(UIMessage.system(GRAY + "Nothing to compact — conversation is empty." + RESET));
+            return;
+        }
+        compacting = true;
+        appendMessage(UIMessage.system(CYAN + "⤾ Compacting…" + RESET));
+        scrollToBottom();
+        needsRedraw = true;
+        Thread.startVirtualThread(() -> {
+            String report;
+            try {
+                report = ContextCompactor.forceCompact(
+                        conversation, client, provider.resolvedContextWindow(),
+                        workDir, sessionId, agent.getRecoveryState(),
+                        toolRegistry.getAllSchemas(provider.getProtocol()), null);
+            } catch (Exception e) {
+                report = "";
+                appendMessage(UIMessage.error("Compact failed: " + e.getMessage()));
+            } finally {
+                compacting = false;
             }
-            for (var s : mcpServers) {
-                messages.add(UIMessage.system(
-                        GREEN + "●" + RESET + " MCP " + CYAN + s.name() + RESET
-                        + GRAY + " — " + mcpToolCounts.getOrDefault(s.name(), 0) + " tool(s)" + RESET
-                        + (s.instructions().isEmpty() ? "" : GRAY + " (has instructions)" + RESET)));
+            if (report != null && !report.isEmpty()) {
+                // session 包：写入压缩边界书签，resume 时据此跳过边界之前的旧记录
+                saveCompactBoundaryFromConversation();
+                appendMessage(UIMessage.system(
+                        CYAN + "⤾ Context compacted" + RESET + GRAY + ": " + report + RESET));
+            } else {
+                appendMessage(UIMessage.system(GRAY
+                        + "Nothing to compact — conversation too short." + RESET));
             }
-            for (var err : mcpErrors) {
-                messages.add(UIMessage.system(RED + "○ " + err + RESET));
+            needsRedraw = true;
+        });
+    }
+
+    /**
+     * 把当前对话状态写入 CompactBoundary 书签：
+     * 跳过开头的 system-reminder（压缩后 Agent 会重新注入），首条普通消息即摘要，
+     * 其余为保留消息。rebuildConversation 重放时据此还原压缩后的状态。
+     */
+    private void saveCompactBoundaryFromConversation() {
+        List<com.agent.llm.Message> msgs = conversation.getMessages();
+        int i = 0;
+        while (i < msgs.size() && msgs.get(i).getContent() != null
+                && msgs.get(i).getContent().startsWith("<system-reminder>")) {
+            i++;
+        }
+        if (i >= msgs.size()) return;
+        String summary = msgs.get(i).getContent();
+        List<SessionManager.KeepMessage> keep = new ArrayList<>();
+        for (int j = i + 1; j < msgs.size(); j++) {
+            keep.add(new SessionManager.KeepMessage(msgs.get(j).getRole(), msgs.get(j).getContent()));
+        }
+        SessionManager.saveCompactBoundary(workDir, sessionId, summary, keep);
+    }
+
+    /** /plan — 切换计划模式（只读，AI 只能调研和写计划文件）。 */
+    private void doPlan() {
+        if (permissionChecker.getMode() == PermissionMode.PLAN) {
+            permissionChecker.setMode(PermissionMode.DEFAULT);
+            appendMessage(UIMessage.system(YELLOW + "⌥ Plan mode off" + RESET
+                    + GRAY + " — back to default permissions" + RESET));
+        } else {
+            permissionChecker.setMode(PermissionMode.PLAN);
+            appendMessage(UIMessage.system(GREEN + "⌥ Plan mode on" + RESET + GRAY
+                    + " — read-only, AI drafts its plan into .devecode/plans/plan.md" + RESET));
+        }
+        scrollToBottom();
+    }
+
+    /** /resume — 恢复历史会话（session 包）：带搜索参数直接匹配，多结果弹选择器。 */
+    private void doResume(String args) {
+        if (streaming) {
+            appendMessage(UIMessage.system(YELLOW
+                    + "Cannot resume while streaming." + RESET));
+            return;
+        }
+        List<SessionManager.SessionInfo> sessions = SessionManager.listSessions(workDir);
+        if (args != null && !args.isBlank()) {
+            sessions = sessions.stream()
+                    .filter(s -> SessionManager.matchesSearch(s, args))
+                    .toList();
+        }
+        if (sessions.isEmpty()) {
+            appendMessage(UIMessage.system(GRAY
+                    + "No saved sessions found in .devecode/sessions/" + RESET));
+            scrollToBottom();
+            return;
+        }
+        if (sessions.size() == 1 && args != null && !args.isBlank()) {
+            // 搜索词唯一命中：直接恢复
+            resumeSession(sessions.getFirst());
+            return;
+        }
+        // 多个会话：打开全屏选择器
+        List<PickerItem> items = new ArrayList<>();
+        for (var s : sessions) {
+            String first = s.firstMessage().isEmpty() ? "(no messages)" : s.firstMessage();
+            String meta = "%d msg · %s · %s".formatted(
+                    s.messageCount(), SessionManager.formatFileSize(s.fileSize()),
+                    SessionManager.formatRelativeTime(s.modTime()));
+            items.add(new PickerItem(s.id(), first, meta, s));
+        }
+        openPicker("session", "Resume Session", items);
+    }
+
+    /** 恢复指定会话：重建对话历史 + 重建 UI 消息 + 重绑文件快照目录。 */
+    private void resumeSession(SessionManager.SessionInfo info) {
+        List<SessionManager.SessionMessage> msgs = SessionManager.loadSession(workDir, info.id());
+        if (msgs.isEmpty()) {
+            appendMessage(UIMessage.system(RED + "Session has no messages: " + info.id() + RESET));
+            return;
+        }
+        // session 包：rebuildConversation 处理 CompactBoundary（有书签 → 摘要+保留消息，无 → 全量重放）
+        ConversationManager rebuilt = SessionManager.rebuildConversation(msgs);
+        conversation.truncateTo(0);
+        conversation.getMessagesMutable().addAll(rebuilt.getMessages());
+
+        sessionId = info.id();
+        agent.setSessionId(sessionId);
+        this.fileHistory = new FileHistory(workDir, sessionId);
+        attachFileHistoryToTools();
+        agent.setFileHistory(fileHistory);
+
+        // 重建 UI 消息列表
+        synchronized (messages) {
+            messages.clear();
+            messages.add(UIMessage.banner());
+            messages.add(UIMessage.system(CYAN + "⤺ Resumed session " + RESET
+                    + GRAY + info.id() + " · " + msgs.size() + " record(s)" + RESET));
+            for (var m : msgs) {
+                if (m.isCompactBoundary()) continue;
+                if ("assistant".equals(m.role())) {
+                    messages.add(UIMessage.assistant(renderMarkdownSafe(m.content()), null));
+                } else if ("user".equals(m.role())) {
+                    messages.add(UIMessage.user(m.content()));
+                }
+                // system 角色记录（压缩边界等）不展示
             }
         }
         scrollToBottom();
         needsRedraw = true;
     }
 
-    /** /prompt — 显示当前 system prompt 的长度和开头内容（截断到 800 字符）。 */
-    private void showPromptInfo() {
-        String head = systemPrompt.length() > 800
-                ? systemPrompt.substring(0, 800) + "\n…"
-                : systemPrompt;
-        synchronized (messages) {
-            messages.add(UIMessage.system(
-                    CYAN + "System prompt" + RESET + GRAY + " (" + systemPrompt.length() + " chars · "
-                    + mcpServers.size() + " MCP server(s))" + RESET + "\n"
-                    + UIMessage.grayLines(head)));
+    /** /rewind — 回退到某一轮对话结束时的文件检查点（FileHistory 快照选择器）。 */
+    private void doRewind() {
+        if (streaming) {
+            appendMessage(UIMessage.system(YELLOW
+                    + "Cannot rewind while streaming." + RESET));
+            return;
         }
+        var snaps = fileHistory.getSnapshots();
+        if (snaps.isEmpty()) {
+            appendMessage(UIMessage.system(GRAY
+                    + "No checkpoints yet — snapshots are taken after each AI turn that edits files." + RESET));
+            scrollToBottom();
+            return;
+        }
+        // 最新快照在前（回退通常想去最近的检查点）
+        List<PickerItem> items = new ArrayList<>();
+        for (int i = snaps.size() - 1; i >= 0; i--) {
+            var snap = snaps.get(i);
+            String title = (snap.userText() == null || snap.userText().isBlank())
+                    ? "(turn checkpoint)" : snap.userText();
+            String meta = "%d file(s) · %s".formatted(
+                    snap.backups().size(),
+                    snap.timestamp().atZone(ZoneId.systemDefault())
+                            .format(DateTimeFormatter.ofPattern("MM-dd HH:mm")));
+            items.add(new PickerItem(String.valueOf(i), title, meta, i));
+        }
+        openPicker("snapshot", "Rewind to Checkpoint", items);
+    }
+
+    /** 回退到指定快照：还原文件 + 截断对话到检查点。 */
+    private void rewindTo(int snapshotIndex) {
+        var snaps = fileHistory.getSnapshots();
+        if (snapshotIndex < 0 || snapshotIndex >= snaps.size()) return;
+        var snap = snaps.get(snapshotIndex);
+        List<String> changed = fileHistory.rewind(snapshotIndex);
+        // 对话回退到检查点对应的消息位置
+        if (snap.messageIndex() >= 0 && snap.messageIndex() <= conversation.size()) {
+            conversation.truncateTo(snap.messageIndex());
+        }
+        appendMessage(UIMessage.system(YELLOW + "⏪ Rewound" + RESET + GRAY + " — "
+                + changed.size() + " file(s) restored, conversation truncated to checkpoint" + RESET));
         scrollToBottom();
+        needsRedraw = true;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  全屏选择器（/resume 会话列表、/rewind 快照列表）
+    // ═══════════════════════════════════════════════════════════════
+
+    /** 打开全屏选择器（覆盖正常对话界面，Esc/q 取消，Enter 确认）。 */
+    private void openPicker(String kind, String title, List<PickerItem> items) {
+        activePicker = new PickerState(kind, title, List.copyOf(items));
+        pickerIndex = 0;
+        needsRedraw = true;
+    }
+
+    /** 选择器导航：循环移动（到顶再按上 → 跳到最后一条，反之亦然）。 */
+    private void movePicker(int delta) {
+        PickerState p = activePicker;
+        if (p == null || p.items().isEmpty()) return;
+        int n = p.items().size();
+        pickerIndex = (pickerIndex + delta + n) % n;
+        needsRedraw = true;
+    }
+
+    /** 确认选择器当前选中项（主线程执行，避免与渲染循环竞争）。 */
+    private void confirmPicker() {
+        PickerState p = activePicker;
+        activePicker = null;
+        if (p == null || p.items().isEmpty()) return;
+        int idx = Math.min(Math.max(pickerIndex, 0), p.items().size() - 1);
+        PickerItem item = p.items().get(idx);
+        switch (p.kind()) {
+            case "session" -> {
+                if (item.payload() instanceof SessionManager.SessionInfo info) {
+                    resumeSession(info);
+                }
+            }
+            case "snapshot" -> {
+                if (item.payload() instanceof Integer snapIdx) {
+                    rewindTo(snapIdx);
+                }
+            }
+            default -> { }
+        }
         needsRedraw = true;
     }
 
@@ -628,6 +1138,9 @@ public class TerminalUI {
                     needsRedraw = true;
                 }
                 case AgentEvent.CompactEvent c -> {
+                    // session 包：自动压缩已重写对话 → 写入边界书签，
+                    // resume 时 rebuildConversation 据此跳过边界之前的旧记录
+                    saveCompactBoundaryFromConversation();
                     appendMessage(UIMessage.system(
                             CYAN + "⤾ Context compacted" + RESET + GRAY +
                             (c.message() == null || c.message().isEmpty() ? "" : ": " + c.message()) + RESET));
@@ -718,6 +1231,17 @@ public class TerminalUI {
         }
         scrollToBottom();
         needsRedraw = true;
+
+        // memory 包：每 EXTRACTION_INTERVAL 轮自动从对话提取记忆（后台执行，不阻塞 UI）
+        if (totalTurns > 0 && memoryManager.shouldExtract()) {
+            Thread.startVirtualThread(() -> {
+                try {
+                    memoryManager.extract(client, conversation);
+                } catch (Exception ignored) {
+                    // 提取失败不影响主流程
+                }
+            });
+        }
     }
 
     /** 回答挂起的权限询问（由 inputLoop 的按键直接调用）。 */
@@ -798,6 +1322,10 @@ public class TerminalUI {
 
         String finalText = streamAccum.toString();
         String thinkText = thinkingAccum.toString();
+        // session 包：持久化助手消息（纯文本，resume 时按 role 重放）
+        if (!finalText.isBlank()) {
+            SessionManager.saveMessage(workDir, sessionId, "assistant", finalText);
+        }
         String rendered;
         try {
             rendered = MarkdownRenderer.render(finalText);
@@ -858,8 +1386,14 @@ public class TerminalUI {
                     // 30ms 超时区分"独立 Esc 键"和"转义序列首字节"
                     int c2 = reader.read(30L);
                     if (c2 == NonBlockingReader.READ_EXPIRED) {
-                        // 独立 Esc：流式期间中断当前 agent 循环
-                        if (streaming) interruptAgent();
+                        if (activePicker != null) {
+                            // 选择器激活：Esc 取消选择，返回对话界面
+                            activePicker = null;
+                            needsRedraw = true;
+                        } else if (streaming) {
+                            // 独立 Esc：流式期间中断当前 agent 循环
+                            interruptAgent();
+                        }
                         continue;
                     }
                     if (c2 == -1) break;
@@ -880,8 +1414,14 @@ public class TerminalUI {
 
                         String csi = csiParams.toString();
                         switch (csi) {
-                            case "A" -> { if (!streaming) { scrollOffset++; needsRedraw = true; } }
-                            case "B" -> { if (!streaming) { scrollOffset = Math.max(0, scrollOffset - 1); needsRedraw = true; } }
+                            case "A" -> {
+                                if (activePicker != null) movePicker(-1);
+                                else if (!streaming) { scrollOffset++; needsRedraw = true; }
+                            }
+                            case "B" -> {
+                                if (activePicker != null) movePicker(1);
+                                else if (!streaming) { scrollOffset = Math.max(0, scrollOffset - 1); needsRedraw = true; }
+                            }
                             case "C" -> handleCursorRight();
                             case "D" -> handleCursorLeft();
                             case "H" -> handleHome();
@@ -900,8 +1440,14 @@ public class TerminalUI {
                         int c3 = reader.read();
                         if (c3 == -1) break;
                         switch (c3) {
-                            case 'A' -> { if (!streaming) { scrollOffset++; needsRedraw = true; } }
-                            case 'B' -> { if (!streaming) { scrollOffset = Math.max(0, scrollOffset - 1); needsRedraw = true; } }
+                            case 'A' -> {
+                                if (activePicker != null) movePicker(-1);
+                                else if (!streaming) { scrollOffset++; needsRedraw = true; }
+                            }
+                            case 'B' -> {
+                                if (activePicker != null) movePicker(1);
+                                else if (!streaming) { scrollOffset = Math.max(0, scrollOffset - 1); needsRedraw = true; }
+                            }
                             case 'C' -> handleCursorRight();
                             case 'D' -> handleCursorLeft();
                             case 'H' -> handleHome();
@@ -955,6 +1501,14 @@ public class TerminalUI {
 
                 // --- Printable characters (incl. CJK) ---
                 if (ch >= 32 || ch == '\t') {
+                    if (activePicker != null) {
+                        // 选择器激活：q 取消，其余按键不进入输入框
+                        if (ch == 'q' || ch == 'Q') {
+                            activePicker = null;
+                            needsRedraw = true;
+                        }
+                        continue;
+                    }
                     eventQueue.add(new UIEvent.KeyTyped(ch));
                     needsRedraw = true;
                 }
@@ -974,8 +1528,13 @@ public class TerminalUI {
     /**
      * 处理 Enter 键提交：将输入缓冲区内容封装为 Submit 事件推入队列。
      * 由 inputLoop 直接调用（不经过 KeyTyped 事件，避免 Windows CRLF 双触发）。
+     * 选择器激活时 Enter 转为 PickerConfirm 事件（动作由主线程执行）。
      */
     private void handleEnter() {
+        if (activePicker != null) {
+            eventQueue.add(new UIEvent.PickerConfirm());
+            return;
+        }
         if (!streaming) {
             String text = inputBuffer.toString();
             if (!text.isBlank()) {
@@ -1065,6 +1624,16 @@ public class TerminalUI {
     private void render() {
         StringBuilder buf = new StringBuilder(4096);
         buf.append(CURSOR_HIDE);
+
+        // 全屏选择器激活时：覆盖正常界面，只渲染选择器
+        if (activePicker != null) {
+            buf.append(CLEAR).append(HOME);
+            renderPicker(buf, termWidth, termHeight);
+            writer.print(buf.toString());
+            writer.flush();
+            return;
+        }
+
         buf.append(HOME);
 
         int rows = termHeight;
@@ -1455,6 +2024,137 @@ public class TerminalUI {
     }
 
     // ═══════════════════════════════════════════════════════════════
+    //  全屏选择器渲染
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * 渲染全屏选择器（与欢迎屏同一视觉语言：75 号天蓝边框、●/○ 选中标记、
+     * ↑↓ 循环导航、居中盒子布局）。
+     *
+     * 条目超过可视高度时以选中项为中心滚动窗口。
+     */
+    private void renderPicker(StringBuilder buf, int w, int h) {
+        PickerState p = activePicker;
+        if (p == null) return;
+        int n = p.items().size();
+
+        // ── 计算盒子尺寸 ──
+        int maxItemW = 0;
+        for (var item : p.items()) {
+            int len = Math.max(visibleLength(item.id()), Math.max(
+                    item.title().length(), item.subtitle().length()));
+            if (len > maxItemW) maxItemW = len;
+        }
+        int hintLen = 44;  // "↑↓ navigate · Enter select · Esc/q cancel"
+        int innerW = Math.min(Math.max(Math.max(maxItemW + 6, p.title().length() + 4), hintLen), Math.max(40, w - 4));
+        int boxW = innerW + 2;
+        if (boxW > w) { boxW = w; innerW = boxW - 2; }
+
+        int visible = Math.min(n, Math.max(3, h - 10));   // 可视条目窗口
+        int boxH = Math.min(h, 2 /*边框*/ + 2 /*标题+空行*/ + visible * 2 + 1 /*空行*/ + 1 /*提示*/ + 2 /*留白*/);
+
+        int boxX = Math.max(0, (w - boxW) / 2);
+        int boxY = Math.max(0, (h - boxH) / 2);
+        int left = boxX;
+        int right = boxX + boxW - 1;
+
+        // ── 滚动窗口：保持选中项可见（尽量居中） ──
+        int winStart;
+        if (n <= visible) {
+            winStart = 0;
+        } else {
+            winStart = pickerIndex - visible / 2;
+            if (winStart < 0) winStart = 0;
+            if (winStart > n - visible) winStart = n - visible;
+        }
+
+        // ── 边框 ──
+        moveTo(buf, boxY, left);
+        buf.append(BORDER).append('╭').append(repeat('─', innerW)).append('╮').append(RESET);
+
+        int y = boxY + 1;
+        // 标题（青色粗体，左对齐带缩进）
+        moveTo(buf, y, left);
+        buf.append(BORDER).append('│').append(RESET);
+        moveTo(buf, y, right);
+        buf.append(BORDER).append('│').append(RESET);
+        moveTo(buf, y, left + 2);
+        buf.append(BOLD).append(CYAN).append(truncate(p.title(), innerW - 2)).append(RESET);
+        y++;
+
+        // 空行
+        y = pickerBlankRow(buf, y, left, right);
+        y = pickerBlankRow(buf, y, left, right);
+
+        // ── 条目列表：● 实心白点选中 / ○ 空心灰点未选中 ──
+        for (int i = winStart; i < winStart + visible && i < n; i++) {
+            var item = p.items().get(i);
+            boolean sel = (i == pickerIndex);
+
+            // 第一行：标记 + 标题
+            moveTo(buf, y, left);
+            buf.append(BORDER).append('│').append(RESET);
+            moveTo(buf, y, right);
+            buf.append(BORDER).append('│').append(RESET);
+            moveTo(buf, y, left + 1);
+            String prefix = sel ? BOLD + WHITE + "● " + RESET : GRAY + "○ " + RESET;
+            String titleColored = sel
+                    ? BOLD + WHITE + truncate(item.title(), innerW - 4) + RESET
+                    : WHITE + truncate(item.title(), innerW - 4) + RESET;
+            buf.append(prefix).append(titleColored);
+            y++;
+
+            // 第二行：id + 元信息（灰色）
+            moveTo(buf, y, left);
+            buf.append(BORDER).append('│').append(RESET);
+            moveTo(buf, y, right);
+            buf.append(BORDER).append('│').append(RESET);
+            moveTo(buf, y, left + 3);
+            String meta = GRAY + truncate(item.id() + " · " + item.subtitle(), innerW - 4) + RESET;
+            buf.append(meta);
+            y++;
+        }
+
+        // ── 空行 + 操作提示 ──
+        y = pickerBlankRow(buf, y, left, right);
+        moveTo(buf, y, left);
+        buf.append(BORDER).append('│').append(RESET);
+        moveTo(buf, y, right);
+        buf.append(BORDER).append('│').append(RESET);
+        String hint = GRAY + "↑↓ navigate  ·  Enter select  ·  Esc/q cancel" + RESET;
+        int hintX = left + 1 + Math.max(0, (innerW - visibleLength(hint)) / 2);
+        moveTo(buf, y, hintX);
+        buf.append(hint);
+        y++;
+
+        // 滚动指示（条目超出窗口时显示）
+        if (n > visible) {
+            y = pickerBlankRow(buf, y, left, right);
+            moveTo(buf, y, left);
+            buf.append(BORDER).append('│').append(RESET);
+            moveTo(buf, y, right);
+            buf.append(BORDER).append('│').append(RESET);
+            String pos = DIM + (pickerIndex + 1) + " / " + n + RESET;
+            moveTo(buf, y, left + 1 + Math.max(0, (innerW - visibleLength(pos)) / 2));
+            buf.append(pos);
+            y++;
+        }
+
+        // ── 底边框（固定在内容行之后）──
+        moveTo(buf, y, left);
+        buf.append(BORDER).append('╰').append(repeat('─', innerW)).append('╯').append(RESET);
+    }
+
+    /** 选择器盒子内的空行（只画左右边框）。 */
+    private static int pickerBlankRow(StringBuilder buf, int y, int left, int right) {
+        moveTo(buf, y, left);
+        buf.append(BORDER).append('│').append(RESET);
+        moveTo(buf, y, right);
+        buf.append(BORDER).append('│').append(RESET);
+        return y + 1;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     //  工具方法
     // ═══════════════════════════════════════════════════════════════
 
@@ -1805,7 +2505,16 @@ public class TerminalUI {
     private sealed interface UIEvent {
         record KeyTyped(int ch) implements UIEvent {}
         record Submit(String text) implements UIEvent {}
+        record PickerConfirm() implements UIEvent {}
         record TerminalResize(int cols, int rows) implements UIEvent {}
         record Exit() implements UIEvent {}
     }
+
+    // ── 全屏选择器数据类型 ──────────────────────────────────────────
+
+    /** 选择器条目：id（会话 ID / 序号）、title（主标题）、subtitle（元信息行）、payload（原始数据） */
+    private record PickerItem(String id, String title, String subtitle, Object payload) {}
+
+    /** 选择器状态：kind（"session" / "snapshot"，决定确认后的动作）、标题、条目列表 */
+    private record PickerState(String kind, String title, List<PickerItem> items) {}
 }
