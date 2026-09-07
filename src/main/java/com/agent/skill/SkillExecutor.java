@@ -70,7 +70,6 @@ public final class SkillExecutor {
      */
     public static String executeInline(SkillCatalog.Skill skill, String args, SkillHost host) {
         String body = substituteArguments(skill.promptBody(), args);
-        host.activateSkill(skill.meta().name(), body);
         if (!skill.meta().allowedTools().isEmpty()) {
             host.setToolFilter(skill.meta().allowedTools()::contains);
         }

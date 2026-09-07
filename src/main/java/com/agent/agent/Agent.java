@@ -122,12 +122,7 @@ public class Agent implements SkillHost {
 
     // ── SkillHost：inline skill 激活时宿主要提供的能力 ──
     // Agent 即 inline skill 的宿主：SkillTool / 用户命令激活 skill 时回调这里。
-
-    /** inline 正文经 Skill 工具结果自然进入对话，宿主无需额外处理。 */
-    @Override
-    public void activateSkill(String name, String body) {
-        // no-op：正文已在对话中，激活仅作为通知
-    }
+    // （inline 正文经 Skill 工具结果自然进入对话，激活无需通知宿主。）
 
     /**
      * inline skill 声明了 allowedTools 时设置工具过滤：

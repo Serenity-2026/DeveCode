@@ -3,7 +3,6 @@ package com.agent.compact;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -23,7 +22,8 @@ public final class RecoveryState {
 
     private final ConcurrentHashMap<String, FileReadRecord> files = new ConcurrentHashMap<>();
 
-    private final Map<String, SkillInvocationRecord> skills = new HashMap<>();
+    // recordSkillInvocation 在工具执行线程（虚拟线程并行批次）被调用，须与 files 一致用并发容器
+    private final Map<String, SkillInvocationRecord> skills = new ConcurrentHashMap<>();
 
     /** 记录文件读取 */
     public void recordFileRead(String path, String content) {

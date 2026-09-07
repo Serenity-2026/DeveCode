@@ -1,5 +1,8 @@
-package com.agent.skill;
+package com.agent.tool.impl;
 
+import com.agent.skill.SkillCatalog;
+import com.agent.skill.SkillExecutor;
+import com.agent.skill.SkillForkHost;
 import com.agent.tool.Tool;
 import com.agent.tool.ToolCategory;
 import com.agent.tool.ToolRegistry;

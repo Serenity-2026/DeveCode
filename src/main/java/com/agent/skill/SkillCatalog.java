@@ -227,27 +227,6 @@ public class SkillCatalog {
         }
     }
 
-    // ── Context building ───────────────────────────────────────────────
-
-    /**
-     * 构建已激活的skill上下文
-     */
-    public String buildActiveContext(Set<String> activeSkillNames) {
-        if (activeSkillNames == null || activeSkillNames.isEmpty()) {
-            return "";
-        }
-        var sb = new StringBuilder();
-        sb.append("## Active Skills\n\n");
-        for (var name : activeSkillNames) {
-            var skill = skills.get(name);
-            if (skill != null) {
-                sb.append("### ").append(name).append("\n");
-                sb.append(skill.promptBody()).append("\n\n");
-            }
-        }
-        return sb.toString();
-    }
-
     // ── Loading internals ───────────────────────────────────────────────
 
     /**

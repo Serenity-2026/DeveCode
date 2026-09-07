@@ -28,7 +28,7 @@ import com.agent.skill.SkillInstallReport;
 import com.agent.skill.SkillInstaller;
 import com.agent.skill.SkillSource;
 import com.agent.skill.SkillExecutor;
-import com.agent.skill.SkillTool;
+import com.agent.tool.impl.SkillTool;
 import com.agent.tool.ToolRegistry;
 import com.agent.tool.FileHistory;
 import com.agent.tool.FileStateCache;
@@ -1368,16 +1368,20 @@ public class TerminalUI implements SkillForkHost {
     //  SkillForkHost：fork 模式宿主（inline 部分委托给主 Agent）
     // ═══════════════════════════════════════════════════════════════
 
-    /** inline skill 激活通知（SkillHost）——委托主 Agent。 */
-    @Override
-    public void activateSkill(String name, String body) {
-        agent.activateSkill(name, body);
-    }
-
     /** inline skill 的 allowedTools 过滤（SkillHost）——委托主 Agent。 */
     @Override
     public void setToolFilter(Predicate<String> filter) {
         agent.setToolFilter(filter);
+    }
+
+    /**
+     * skill 调用存档（SkillHost）——转发进主 Agent 的 RecoveryState，
+     * 压缩后由 ContextCompactor 拼回 "Active skills" 恢复段落。
+     * inline/fork 两条路径（含 /skillname 命令）的宿主都是本类，一处覆盖全部。
+     */
+    @Override
+    public void recordSkillInvocation(String name, String body) {
+        agent.getRecoveryState().recordSkillInvocation(name, body);
     }
 
     /** 父对话消息快照（不是引用）：子 Agent 启动那一刻的冻结版本。 */
