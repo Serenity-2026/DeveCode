@@ -27,7 +27,10 @@ public class SkillCatalog {
             String mode,
             String model,
             //控制fork子Agent继承多少父对话上下文
-            String forkContext
+            String forkContext,
+            //工具白名单：空 = 不限制（全量工具，向后兼容 + 信任环境）；
+            //非空 = 只允许点名的工具（fork 子Agent用过滤后的registry，inline在当前loop过滤）
+            List<String> allowedTools
     ) {}
 
     public record Skill(SkillMeta meta, String promptBody, Path sourceDir) {
@@ -326,7 +329,7 @@ public class SkillCatalog {
             }
             meta = new SkillMeta(meta.name(), description != null ? description : "",
                     meta.whenToUse(), meta.tags(),
-                    meta.mode(), meta.model(), meta.forkContext());
+                    meta.mode(), meta.model(), meta.forkContext(), meta.allowedTools());
         }
 
         return new Skill(meta, body, dir);
@@ -365,6 +368,14 @@ public class SkillCatalog {
             forkContext = "none";
         }
 
+        // 工具白名单：allowed-tools（kebab，业界惯例）/ allowed_tools（snake）双键名兼容
+        List<String> allowedTools = List.of();
+        Object rawAllowed = map.containsKey("allowed-tools")
+                ? map.get("allowed-tools") : map.get("allowed_tools");
+        if (rawAllowed instanceof List<?> list) {
+            allowedTools = list.stream().map(Object::toString).toList();
+        }
+
         return new SkillMeta(
                 name,
                 description != null ? description : "",
@@ -372,7 +383,8 @@ public class SkillCatalog {
                 tags,
                 mode,
                 model != null ? model : "",
-                forkContext
+                forkContext,
+                allowedTools
         );
     }
 

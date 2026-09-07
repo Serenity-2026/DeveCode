@@ -12,6 +12,7 @@ import com.agent.history.ConversationManager;
 import com.agent.hook.HookEngine;
 import com.agent.infra.ProviderConfig;
 import com.agent.llm.LlmClient;
+import com.agent.llm.Message;
 import com.agent.llm.StreamEvent;
 import com.agent.mcp.McpManager;
 import com.agent.memory.MemoryManager;
@@ -22,6 +23,7 @@ import com.agent.permission.PermissionResponse;
 import com.agent.prompt.PromptBuilder;
 import com.agent.session.SessionManager;
 import com.agent.skill.SkillCatalog;
+import com.agent.skill.SkillForkHost;
 import com.agent.skill.SkillInstallReport;
 import com.agent.skill.SkillInstaller;
 import com.agent.skill.SkillSource;
@@ -55,6 +57,9 @@ import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 import com.sun.management.OperatingSystemMXBean;
 
 /**
@@ -86,7 +91,7 @@ import com.sun.management.OperatingSystemMXBean;
  *   <li>Agent 线程（虚拟）：由 Agent.run 创建，执行后端 agent 循环</li>
  * </ul>
  */
-public class TerminalUI {
+public class TerminalUI implements SkillForkHost {
 
     private static final String APP_NAME    = "DeveCode";
     private static final String APP_VERSION = "v1.0.0";
@@ -126,6 +131,11 @@ public class TerminalUI {
     // ── Skill 系统（skill 包）──
     private final SkillCatalog skillCatalog;       // builtin/user/project 三层 skill 目录
     private volatile boolean skillInstalling = false; // /skill install 后台执行期间禁止重复安装
+    // fork 嵌套深度（子Agent 内再 fork 最多一层，防止 fork-skill 递归爆炸）
+    private final AtomicInteger forkDepth = new AtomicInteger();
+    // fork 子Agent 复用的注入内容（构造时从主 Agent 保存）
+    private String loadedInstructions = "";
+    private String loadedMemoryReminder = "";
 
     // ── 全屏选择器（/resume 会话列表、/rewind 快照列表）──
     private volatile PickerState activePicker;   // null = 无选择器，正常对话界面
@@ -322,9 +332,11 @@ public class TerminalUI {
             instructions = legacy == null ? "" : legacy;
         }
         agent.setInstructions(instructions);
+        this.loadedInstructions = instructions;
         // 记忆索引注入：MEMORY.md（用户级 + 项目级）作为 autoMemory 常驻上下文
         this.memoryManager = new MemoryManager(workDir);
-        agent.setMemoryContent(memoryManager.buildSystemReminder());
+        this.loadedMemoryReminder = memoryManager.buildSystemReminder();
+        agent.setMemoryContent(loadedMemoryReminder);
         // ── 命令系统接入（command 包）──
         // 默认命令（/help /status /memory /plan …）+ .devecode/commands/ 自定义 .md 命令
         this.commandRegistry = new CommandRegistry();
@@ -344,8 +356,8 @@ public class TerminalUI {
         this.skillCatalog = SkillCatalog.loadCatalog(workDir);
         syncSkillCommands();
         // Skill 工具：模型经 Agent Loop 感知 skill 清单（name+description），调用激活后
-        // 完整 prompt body 作为工具结果返回（参照 Claude Code 的 Skill 机制）
-        toolRegistry.register(new SkillTool(skillCatalog));
+        // 按模式分发——inline 正文作为工具结果返回；fork 在隔离子 Agent 执行后只回摘要
+        toolRegistry.register(new SkillTool(skillCatalog, toolRegistry, this));
         agent.setSkillCatalog(skillCatalog);
         commandRegistry.register(
                 new Command("skill", "Manage skills: list · reload · install <url> [--project]",
@@ -1299,6 +1311,8 @@ public class TerminalUI {
      * 出现在命令提示面板与 /help 列表中（带 [skill] 标识），可直接 /<skill-name> 调用。
      * 与静态命令重名的 skill 会被跳过（静态命令优先）。
      * catalog 变更（reload / install）后需重新调用。
+     * fork 模式的 skill 在后台隔离执行（返回摘要进主对话），inline 模式经
+     * executeInline 激活（allowedTools 过滤生效）后作为 prompt 提交。
      */
     private void syncSkillCommands() {
         commandRegistry.clearSkillCommands();
@@ -1309,9 +1323,157 @@ public class TerminalUI {
             commandRegistry.registerSkill(cmd, ctx -> {
                 var opt = skillCatalog.getFull(skillName);
                 if (opt.isEmpty()) return "Skill not found: " + skillName;
-                return SkillExecutor.substituteArguments(opt.get().promptBody(), ctx.args());
+                if ("fork".equals(opt.get().meta().mode())) {
+                    // fork：后台隔离执行，摘要返回主对话；返回 null 表示命令已处理完毕
+                    runForkSkillFromCommand(opt.get(), ctx.args());
+                    return null;
+                }
+                // inline：激活（含 allowedTools 过滤设置）后作为 prompt 注入当前对话
+                return SkillExecutor.executeInline(opt.get(), ctx.args(), this);
             });
         }
+    }
+
+    /**
+     * 用户经 /skillname 直接调用 fork 模式 skill：后台隔离子 Agent 执行，
+     * 结果摘要以 assistant 消息形式返回主对话并持久化到 session。
+     */
+    private void runForkSkillFromCommand(SkillCatalog.Skill skill, String args) {
+        Thread.startVirtualThread(() -> {
+            String skillName = skill.meta().name();
+            // streaming=true：fork 执行期间锁定输入 + 启用权限询问的 y/n 应答
+            streaming = true;
+            try {
+                String summary = SkillExecutor.dispatch(skill, args, this, toolRegistry);
+                // 摘要返回主对话（fork 结果不进父上下文经子 Agent 隔离，
+                // 但用户主动调用的结果对主对话可见）
+                synchronized (messages) {
+                    messages.add(UIMessage.assistant(renderMarkdownSafe(summary), null));
+                }
+                conversation.addAssistantMessage(summary);
+                SessionManager.saveMessage(workDir, sessionId, "assistant", summary);
+            } catch (Exception e) {
+                appendMessage(UIMessage.error("Skill fork failed: "
+                        + (e.getMessage() == null ? e.toString() : e.getMessage())));
+            } finally {
+                streaming = false;
+                pendingPermission = null;
+                scrollToBottom();
+                needsRedraw = true;
+            }
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  SkillForkHost：fork 模式宿主（inline 部分委托给主 Agent）
+    // ═══════════════════════════════════════════════════════════════
+
+    /** inline skill 激活通知（SkillHost）——委托主 Agent。 */
+    @Override
+    public void activateSkill(String name, String body) {
+        agent.activateSkill(name, body);
+    }
+
+    /** inline skill 的 allowedTools 过滤（SkillHost）——委托主 Agent。 */
+    @Override
+    public void setToolFilter(Predicate<String> filter) {
+        agent.setToolFilter(filter);
+    }
+
+    /** 父对话消息快照（不是引用）：子 Agent 启动那一刻的冻结版本。 */
+    @Override
+    public List<Message> snapshotParentMessages() {
+        return new ArrayList<>(conversation.getMessages());
+    }
+
+    /**
+     * fork 模式核心：跑一个隔离子 Agent（独立 ConversationManager + 过滤后的工具 registry），
+     * 只返回最终文本摘要。子 Agent 的事件以 fork 前缀（│）渲染进当前界面，
+     * 权限询问复用主输入线程的 y/n 应答。
+     */
+    @Override
+    public String runSubAgent(String skillName, String body, List<Message> seed,
+                               String model, ToolRegistry tools) {
+        if (forkDepth.get() >= 2) {
+            return "Error: fork depth limit reached (max 2) — nested fork skills are not allowed";
+        }
+        forkDepth.incrementAndGet();
+        appendMessage(UIMessage.system(
+                CYAN + "⑂" + RESET + " fork skill '" + skillName + "' started in isolated context"
+                + GRAY + " (parent conversation untouched)" + RESET));
+        scrollToBottom();
+        needsRedraw = true;
+        var finalText = new StringBuilder();
+        try {
+            // 1. 隔离会话：seed 为父对话快照副本（fork_context: none/recent/full 控制继承量）
+            var subConv = new ConversationManager();
+            subConv.getMessagesMutable().addAll(seed);
+            subConv.addUserMessage(body);
+            // 2. 子 Agent：共享 client/checker/hook/文件历史，独立 conv + registry
+            var forkCfg = forkProviderConfig(model);
+            var subClient = (forkCfg == provider) ? client : LlmClient.create(forkCfg, systemPrompt);
+            var sub = new Agent(subClient, tools, forkCfg);
+            sub.setChecker(permissionChecker);
+            sub.setHookEngine(hookEngine);
+            sub.setFileHistory(fileHistory);
+            sub.setWorkDir(workDir);
+            sub.setMaxIterations(30);
+            sub.setInstructions(loadedInstructions);
+            sub.setMemoryContent(loadedMemoryReminder);
+            sub.setSkillCatalog(skillCatalog);
+            // 3. 消费子 Agent 事件流：进度渲染 + 最终文本收集
+            BlockingQueue<AgentEvent> queue = sub.run(subConv);
+            while (true) {
+                AgentEvent ev = queue.take();
+                if (ev instanceof AgentEvent.StreamText st) {
+                    finalText.append(st.text());
+                } else if (ev instanceof AgentEvent.ToolUseEvent tu) {
+                    appendMessage(UIMessage.system(GRAY + "│ ⚙ " + tu.toolName() + RESET));
+                    needsRedraw = true;
+                } else if (ev instanceof AgentEvent.ToolResultEvent tr) {
+                    appendMessage(UIMessage.system(GRAY + "│ " + (tr.isError() ? "✗" : "✔") + " "
+                            + tr.toolName() + " (" + String.format("%.1f", tr.elapsed()) + "s)" + RESET));
+                    needsRedraw = true;
+                } else if (ev instanceof AgentEvent.PermissionRequestEvent pr) {
+                    // 权限询问复用主输入线程的 y/n 应答（inputLoop 在 streaming 期间生效）
+                    handlePermissionRequest(pr);
+                    try {
+                        pr.future().get(5, TimeUnit.MINUTES);
+                    } catch (Exception e) {
+                        pr.future().complete(PermissionResponse.DENY);
+                    }
+                } else if (ev instanceof AgentEvent.ErrorEvent e) {
+                    appendMessage(UIMessage.error("│ " + e.message()));
+                    needsRedraw = true;
+                } else if (ev instanceof AgentEvent.LoopComplete lc) {
+                    appendMessage(UIMessage.system(GRAY + "⑂ fork '" + skillName
+                            + "' done in " + lc.totalTurns() + " turn(s)" + RESET));
+                    scrollToBottom();
+                    needsRedraw = true;
+                    return finalText.toString();
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return finalText.toString();
+        } catch (Exception e) {
+            return "Error: fork sub-agent failed: "
+                    + (e.getMessage() == null ? e.toString() : e.getMessage());
+        } finally {
+            forkDepth.decrementAndGet();
+        }
+    }
+
+    /** fork 子 Agent 的 provider 配置：model 为空 = 复用主 provider。 */
+    private ProviderConfig forkProviderConfig(String model) {
+        if (model == null || model.isBlank() || model.equals(provider.getModel())) {
+            return provider;
+        }
+        var cfg = new ProviderConfig(provider.getName(), provider.getProtocol(),
+                provider.getBaseUrl(), model, provider.getApiKey(), provider.isThinking());
+        cfg.setContextWindow(provider.getContextWindow());
+        cfg.setMaxOutputTokens(provider.getMaxOutputTokens());
+        return cfg;
     }
 
     /** 取多行文本的第一个非空行（skill 描述常为多行 YAML，命令面板需单行）。 */

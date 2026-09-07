@@ -18,6 +18,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
+import java.util.function.Predicate;
 
 /**
  并发工具执行器，将工具调用分为只读（并行）和写入/命令（顺序）批处理。
@@ -36,6 +37,10 @@ public class StreamingExecutor {
     //与UI/主循环通信的事件队列，所有ToolResult/PermissionRequest都从这里流出
     private final BlockingQueue<AgentEvent> eventQueue;
     private final RecoveryState recoveryState;
+    //工具名过滤器（inline skill 的 allowedTools）：null = 不过滤。
+    //schema 侧由 Agent 在每轮迭代过滤，这里做执行侧硬拦截——
+    //即使模型幻觉调用被过滤的工具名，也不会真正执行。
+    private final Predicate<String> toolFilter;
     /**
      *- concurrent=true：该批可并行执行（只读工具集合）
      *- concurrent=false：该批必须串行执行（写/命令工具）
@@ -47,17 +52,25 @@ public class StreamingExecutor {
 
     public StreamingExecutor(ToolRegistry registry, PermissionChecker checker,
                              HookEngine hookEngine, BlockingQueue<AgentEvent> eventQueue) {
-        this(registry, checker, hookEngine, eventQueue, null);
+        this(registry, checker, hookEngine, eventQueue, null, null);
     }
 
     public StreamingExecutor(ToolRegistry registry, PermissionChecker checker,
                              HookEngine hookEngine, BlockingQueue<AgentEvent> eventQueue,
                              RecoveryState recoveryState) {
+        this(registry, checker, hookEngine, eventQueue, recoveryState, null);
+    }
+
+    public StreamingExecutor(ToolRegistry registry, PermissionChecker checker,
+                             HookEngine hookEngine, BlockingQueue<AgentEvent> eventQueue,
+                             RecoveryState recoveryState,
+                             Predicate<String> toolFilter) {
         this.registry = registry;
         this.checker = checker;
         this.hookEngine = hookEngine;
         this.eventQueue = eventQueue;
         this.recoveryState = recoveryState;
+        this.toolFilter = toolFilter;
     }
 
     /**
@@ -147,6 +160,14 @@ public class StreamingExecutor {
         if (tool == null) {
             putSafe(new AgentEvent.ToolResultEvent(call.toolId(), call.toolName(), "Unknown tool", true, 0));
             return new ToolResultBlock(call.toolId(), "Error: unknown tool '" + call.toolName() + "'", true);
+        }
+        // 执行侧硬拦截：inline skill 的 allowedTools 白名单（schema 侧已过滤，
+        // 这里兜住模型幻觉调用的白名单外工具名）
+        if (toolFilter != null && !toolFilter.test(call.toolName())) {
+            String msg = "Tool '" + call.toolName()
+                    + "' is not allowed by the active skill's allowed-tools list";
+            putSafe(new AgentEvent.ToolResultEvent(call.toolId(), call.toolName(), msg, true, 0));
+            return new ToolResultBlock(call.toolId(), "Error: " + msg, true);
         }
         // 权限检查优先于hook：先拦截无权操作，再让 hook 介入
         if (checker != null) {

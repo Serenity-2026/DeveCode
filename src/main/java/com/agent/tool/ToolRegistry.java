@@ -135,4 +135,25 @@ public class ToolRegistry {
     public void markDiscovered(String name) {
         discoveredTools.add(name);
     }
+
+    /**
+     * 按白名单构建过滤后的注册中心（skill allowedTools 权限限制用）：
+     * 只把点名的工具从主 registry 登记（同一 Tool 实例），其余全部丢掉。
+     * 显式点名的延迟工具直接标记为已发现——既然被白名单点名，
+     * 无需再让子Agent走 ToolSearch 搜索发现流程。
+     * 注意：返回的是新实例，与主 registry 的 discovered 状态互不影响。
+     */
+    public ToolRegistry filteredSubset(List<String> allowedNames) {
+        var filtered = new ToolRegistry();
+        for (String name : allowedNames) {
+            Tool tool = tools.get(name);
+            if (tool != null) {
+                filtered.register(tool);
+                if (tool.shouldDefer()) {
+                    filtered.markDiscovered(tool.name());
+                }
+            }
+        }
+        return filtered;
+    }
 }

@@ -4,6 +4,7 @@ import com.agent.compact.ContextCompactor;
 import com.agent.compact.RecoveryState;
 import com.agent.history.ConversationManager;
 import com.agent.skill.SkillCatalog;
+import com.agent.skill.SkillHost;
 import com.agent.hook.HookEngine;
 import com.agent.infra.ProviderConfig;
 import com.agent.llm.*;
@@ -29,7 +30,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 
-public class Agent {
+public class Agent implements SkillHost {
     private final LlmClient client;
     private final ToolRegistry registry;
     private final String protocol;
@@ -118,6 +119,26 @@ public class Agent {
     public void setMaxIterations(int maxIterations) {
         if(maxIterations>0)this.maxIterations = maxIterations;
     }
+
+    // ── SkillHost：inline skill 激活时宿主要提供的能力 ──
+    // Agent 即 inline skill 的宿主：SkillTool / 用户命令激活 skill 时回调这里。
+
+    /** inline 正文经 Skill 工具结果自然进入对话，宿主无需额外处理。 */
+    @Override
+    public void activateSkill(String name, String body) {
+        // no-op：正文已在对话中，激活仅作为通知
+    }
+
+    /**
+     * inline skill 声明了 allowedTools 时设置工具过滤：
+     * 作用于当前 Agent Loop 的剩余部分（schema 侧 + 执行侧双重拦截），
+     * loop 结束时在 finally 中重置，下一条用户消息恢复全量工具。
+     */
+    @Override
+    public void setToolFilter(Predicate<String> filter) {
+        this.toolNameFilter = filter;
+    }
+
     public void setWorkDir(String workDir) { this.workDir = workDir; }
 
     // ── 依赖注入（UI/宿主组装 Agent 时调用）──
@@ -129,9 +150,6 @@ public class Agent {
     }
     public void setMemoryContent(String memoryContent) {
         this.memoryContent = memoryContent == null ? "" : memoryContent;
-    }
-    public void setToolNameFilter(Predicate<String> toolNameFilter) {
-        this.toolNameFilter = toolNameFilter;
     }
 
     // ── 中断支持：UI 按 Esc 时可停止当前 agent 循环 ──
@@ -388,8 +406,8 @@ public class Agent {
                 loopCompleted = true;
                 break;
             }
-            // 11. 执行工具 + 收集结果
-            var executor = new StreamingExecutor(registry, checker, hookEngine, queue, recoveryState);
+            // 11. 执行工具 + 收集结果（toolNameFilter：inline skill 的 allowedTools，执行侧硬拦截）
+            var executor = new StreamingExecutor(registry, checker, hookEngine, queue, recoveryState, toolNameFilter);
             var results = executor.executeAll(toolUseBlocks);
             // Add results to conversation
             conv.addToolResultsMessage(results);
@@ -410,6 +428,9 @@ public class Agent {
             }
         }
     } finally {
+            // inline skill 的 allowedTools 过滤只作用于本次 Loop，
+            // 结束时重置，下一条用户消息恢复全量工具
+            toolNameFilter = null;
             // 12. turn_end 通知，使用loopCompleted
             if (!loopCompleted) {
                 putSafe(queue, new AgentEvent.LoopComplete(0));
