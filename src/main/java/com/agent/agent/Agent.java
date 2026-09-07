@@ -3,6 +3,7 @@ package com.agent.agent;
 import com.agent.compact.ContextCompactor;
 import com.agent.compact.RecoveryState;
 import com.agent.history.ConversationManager;
+import com.agent.skill.SkillCatalog;
 import com.agent.hook.HookEngine;
 import com.agent.infra.ProviderConfig;
 import com.agent.llm.*;
@@ -45,6 +46,7 @@ public class Agent {
 
     private String instructions = "";
     private String memoryContent = "";
+    private SkillCatalog skillCatalog;
 
     private record ToolCallInfo(String toolId, String toolName, Map<String, Object> args) {}
     private record ToolCallResult(String toolId, String output, boolean isError) {}
@@ -121,6 +123,7 @@ public class Agent {
     // ── 依赖注入（UI/宿主组装 Agent 时调用）──
     public void setChecker(PermissionChecker checker) { this.checker = checker; }
     public void setHookEngine(HookEngine hookEngine) { this.hookEngine = hookEngine; }
+    public void setSkillCatalog(SkillCatalog skillCatalog) { this.skillCatalog = skillCatalog; }
     public void setInstructions(String instructions) {
         this.instructions = instructions == null ? "" : instructions;
     }
@@ -159,7 +162,10 @@ public class Agent {
         //升级标识,只提升一次上限,后续走续写路线
         boolean maxTokensEscalated = false;
         int outputRecoveries = 0;
-        conv.injectLongTermMemory(instructions, memoryContent);
+        // Skill 元数据（name + description）注入上下文：模型据此判断任务是否匹配
+        // 某个 skill，再通过 Skill 工具激活（完整 prompt body 按需加载，不常驻）。
+        // 每次 agentLoop 重读 catalog，skill 安装/热更新后下一条消息即生效。
+        conv.injectLongTermMemory(instructions, memoryContent, buildSkillSection());
         try{
         for (int iteration = 1; ; iteration++) {
             // 1. 检查迭代上限
@@ -232,7 +238,7 @@ public class Agent {
                 // 压缩把旧消息替换成摘要，旧锚点失效，下次stream重新锚定
                 if (conv.size() < sizeBefore) {
                     usageAnchor = null;
-                    conv.injectLongTermMemory(instructions, memoryContent);
+                    conv.injectLongTermMemory(instructions, memoryContent, buildSkillSection());
                 }
             } catch (Exception ignored) {}
             var tools = iterToolSchemas;
@@ -320,7 +326,7 @@ public class Agent {
                         //确实发生了压缩,usage重标
                         if (conv.size() < sizeBeforeForce) {
                             usageAnchor = null;
-                            conv.injectLongTermMemory(instructions, memoryContent);
+                            conv.injectLongTermMemory(instructions, memoryContent, buildSkillSection());
                         }
                         continue;
                     }
@@ -417,5 +423,32 @@ public class Agent {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    /**
+     * 构建 skill 清单 section（参照 Claude Code 的 Skill 机制）：
+     * 只注入 name + description 让模型感知可用能力，命中任务时模型调用
+     * Skill 工具按需加载完整 prompt body，避免 skill 正文常驻上下文。
+     */
+    private String buildSkillSection() {
+        if (skillCatalog == null) return "";
+        var metas = skillCatalog.list();
+        if (metas.isEmpty()) return "";
+        var sb = new StringBuilder();
+        sb.append("# Skills\n")
+          .append("Skills are named capability modules available via the Skill tool. ")
+          .append("When the user's task matches one of the skills below, activate it with the Skill tool ")
+          .append("before proceeding, and follow the instructions it returns.\n\n");
+        for (var meta : metas) {
+            sb.append("- ").append(meta.name()).append(": ")
+              .append(oneLine(meta.description())).append('\n');
+        }
+        return sb.toString();
+    }
+
+    /** 多行描述压成单行（system-reminder 中保持清单格式紧凑）。 */
+    private static String oneLine(String s) {
+        if (s == null || s.isBlank()) return "(no description)";
+        return s.strip().replaceAll("\\s*\\n\\s*", " ");
     }
 }

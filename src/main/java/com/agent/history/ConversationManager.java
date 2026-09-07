@@ -51,18 +51,22 @@ public class ConversationManager {
         history.add(msg);
     }
 
-    /**、
-     * 把项目说明（CLAUDE.md/AGENTS.md 风格）和自动记忆注入到对话开头，作为给 LLM 的背景上下文。
+    /**
+     * 把项目说明（CLAUDE.md/AGENTS.md 风格）、自动记忆和 skill 清单注入到对话开头，作为给 LLM 的背景上下文。
      * @param instructions:预先写好的项目知识和编码规范，相当于员工的「入职文档」。
      * @param memories:Agent 在对话中自动积累的经验，比如你的编码偏好、项目的技术细节。
+     * @param skills:skill 清单 section（name + description，由 Agent 构建）；压缩后重注入可保证不丢失。
      */
-    public void injectLongTermMemory(String instructions, String memories) {
+    public void injectLongTermMemory(String instructions, String memories, String skills) {
         var sections = new ArrayList<String>();
         if (instructions != null && !instructions.isEmpty()) {
             sections.add("# devecodeMd\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\n" + instructions);
         }
         if (memories != null && !memories.isEmpty()) {
             sections.add("# autoMemory\n" + memories);
+        }
+        if (skills != null && !skills.isEmpty()) {
+            sections.add(skills);
         }
         if (sections.isEmpty()) return;
         //注入当前日期，让 LLM 知道"今天是几号"。这对回答"最近"、"上周"这类相对时间问题很关键--LLM 的训练数据有截止日期，不告诉它今天几号它会瞎猜。

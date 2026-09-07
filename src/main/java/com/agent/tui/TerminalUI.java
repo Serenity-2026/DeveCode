@@ -26,6 +26,7 @@ import com.agent.skill.SkillInstallReport;
 import com.agent.skill.SkillInstaller;
 import com.agent.skill.SkillSource;
 import com.agent.skill.SkillExecutor;
+import com.agent.skill.SkillTool;
 import com.agent.tool.ToolRegistry;
 import com.agent.tool.FileHistory;
 import com.agent.tool.FileStateCache;
@@ -342,6 +343,10 @@ public class TerminalUI {
         // 三层目录（builtin → ~/.devecode/skills → .devecode/skills），安装后可 /skill reload 热加载
         this.skillCatalog = SkillCatalog.loadCatalog(workDir);
         syncSkillCommands();
+        // Skill 工具：模型经 Agent Loop 感知 skill 清单（name+description），调用激活后
+        // 完整 prompt body 作为工具结果返回（参照 Claude Code 的 Skill 机制）
+        toolRegistry.register(new SkillTool(skillCatalog));
+        agent.setSkillCatalog(skillCatalog);
         commandRegistry.register(
                 new Command("skill", "Manage skills: list · reload · install <url> [--project]",
                         new String[0], Command.CommandType.LOCAL_UI, false,

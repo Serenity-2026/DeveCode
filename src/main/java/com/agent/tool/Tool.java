@@ -14,4 +14,9 @@ public interface Tool {
     default boolean shouldDefer() {
         return false;
     }
+    //本工具输出的截断上限（字符）。默认全局 10k；需要注入大块内容的工具
+    //（如 Skill 激活返回完整 prompt body）可覆盖为更大的值。
+    default int maxOutputChars() {
+        return ToolRegistry.MAX_OUTPUT_CHARS;
+    }
 }

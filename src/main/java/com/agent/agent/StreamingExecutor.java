@@ -207,8 +207,9 @@ public class StreamingExecutor {
         snapshotForRecovery(call, result);
 
         String output = result.output();
-        if (output.length() > ToolRegistry.MAX_OUTPUT_CHARS) {
-            output = output.substring(0, ToolRegistry.MAX_OUTPUT_CHARS) + "\n... (truncated)";
+        int outputCap = tool.maxOutputChars();
+        if (output.length() > outputCap) {
+            output = output.substring(0, outputCap) + "\n... (truncated)";
         }
 
         putSafe(new AgentEvent.ToolResultEvent(call.toolId(), call.toolName(), output, result.isError(), elapsed));
