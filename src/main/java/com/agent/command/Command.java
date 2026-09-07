@@ -1,6 +1,10 @@
 
 package com.agent.command;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 /**
  * 命令定义
  * @param name        canonical name without the leading slash (e.g. "help")
@@ -9,6 +13,8 @@ package com.agent.command;
  * @param type        how the command is dispatched
  * @param hidden      if true, omitted from /help listings
  * @param skill       true 表示该命令由 skill catalog 动态提供（列表/提示面板中带 [skill] 标识）
+ * @param subcommands 子命令名 → 简短描述（保持声明顺序）；输入 "/<cmd> <partial>" 时
+ *                    用于命令提示面板的子命令候选与 Tab 补全
  */
 public record Command(
         String name,
@@ -16,12 +22,33 @@ public record Command(
         String[] aliases,
         CommandType type,
         boolean hidden,
-        boolean skill
+        boolean skill,
+        Map<String, String> subcommands
 ) {
 
-    /** 静态命令使用的便利构造器（skill = false）。 */
+    /** 静态命令使用的便利构造器（skill = false，无子命令）。 */
     public Command(String name, String description, String[] aliases, CommandType type, boolean hidden) {
-        this(name, description, aliases, type, hidden, false);
+        this(name, description, aliases, type, hidden, false, Map.of());
+    }
+
+    /** skill 命令使用的便利构造器（无子命令）。 */
+    public Command(String name, String description, String[] aliases, CommandType type, boolean hidden, boolean skill) {
+        this(name, description, aliases, type, hidden, skill, Map.of());
+    }
+
+    /** 带子命令的静态命令使用的便利构造器（skill = false）。 */
+    public Command(String name, String description, String[] aliases, CommandType type, boolean hidden,
+                   Map<String, String> subcommands) {
+        this(name, description, aliases, type, hidden, false, subcommands);
+    }
+
+    /** 按声明顺序构建子命令表（参数为 name, description 成对传入）。 */
+    public static Map<String, String> subcommands(String... pairs) {
+        var m = new LinkedHashMap<String, String>();
+        for (int i = 0; i + 1 < pairs.length; i += 2) {
+            m.put(pairs[i], pairs[i + 1]);
+        }
+        return Collections.unmodifiableMap(m);
     }
 
     /** Dispatch style for a command. */

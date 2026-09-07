@@ -344,7 +344,12 @@ public class TerminalUI {
         syncSkillCommands();
         commandRegistry.register(
                 new Command("skill", "Manage skills: list · reload · install <url> [--project]",
-                        new String[0], Command.CommandType.LOCAL_UI, false), null);
+                        new String[0], Command.CommandType.LOCAL_UI, false,
+                        Command.subcommands(
+                                "list", "List installed skills",
+                                "reload", "Hot-reload skills from disk",
+                                "install", "Install a skill from GitHub <url>")),
+                null);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -638,31 +643,73 @@ public class TerminalUI {
     // ═══════════════════════════════════════════════════════════════
 
     /**
-     * 当前输入对应的命令候选列表。
+     * 当前输入对应的命令候选列表，三种激活形态：
+     * <ol>
+     *   <li>命令名阶段（"/<token>"，无空格）：{@link CommandRegistry#search} 前缀过滤
+     *       （匹配命令名与别名，忽略大小写）。裸 "/" 时 cacheKey 为空串——候选照常
+     *       展示，但 Enter 不会自动执行（见 handleEnter）；</li>
+     *   <li>子命令阶段（"/<cmd> <partial>"，partial 不含空格）：命令已确定且有注册
+     *       subcommands 时，按前缀过滤子命令，合成为 "/<cmd> <sub>" 形式的候选；</li>
+     *   <li>深层参数阶段（如 "/skill install <url>"）：无候选，Enter 原样提交整行，
+     *       保证参数不被候选展开逻辑覆盖。</li>
+     * </ol>
      *
-     * 激活条件：输入以 "/" 开头且尚未出现空格/换行（还在命令名输入阶段）。
-     * 此时取 "/" 后的 token 调用 {@link CommandRegistry#search} 做前缀过滤
-     * （同时匹配命令名与别名，忽略大小写）；其余情况返回空列表（不提示）。
-     *
-     * 命令 token 变化时惰性重置选中索引为 0（渲染与键盘线程都会经过这里，
+     * 候选 key 变化时惰性重置选中索引为 0（渲染与键盘线程都会经过这里，
      * 无需在每个输入修改点埋点重置）。
      */
     private List<Command> currentCommandCandidates() {
         String text = inputBuffer.toString();
-        String token;
-        if (!text.startsWith("/")) {
-            token = null;
+        String cacheKey;
+        List<Command> result;
+        if (!text.startsWith("/") || text.contains("\n") || text.contains("\t")) {
+            cacheKey = null;
+            result = List.of();
         } else {
             int sp = text.indexOf(' ');
-            String t = (sp < 0 ? text : text.substring(0, sp)).substring(1);
-            token = (t.contains("\n") || t.contains("\t")) ? null : t;
+            if (sp < 0) {
+                // 命令名阶段：取 "/" 后的 token 做前缀过滤
+                cacheKey = text.substring(1);
+                result = commandRegistry.search(cacheKey);
+            } else {
+                String cmdName = text.substring(1, sp);
+                String partial = text.substring(sp + 1);
+                if (partial.contains(" ")) {
+                    // 深层参数阶段：不提示也不重写，Enter 原样提交
+                    cacheKey = null;
+                    result = List.of();
+                } else {
+                    // 子命令阶段："/skill " 空尾也展示全部子命令
+                    cacheKey = cmdName + " " + partial;
+                    result = subcommandCandidates(cmdName, partial);
+                }
+            }
         }
-        if (!Objects.equals(token, hintTokenCache)) {
-            hintTokenCache = token;
+        if (!Objects.equals(cacheKey, hintTokenCache)) {
+            hintTokenCache = cacheKey;
             commandHintIndex = 0;
         }
-        if (token == null) return List.of();
-        return commandRegistry.search(token);
+        return result;
+    }
+
+    /**
+     * 子命令阶段候选：命令已确定时，把注册的 subcommands 按前缀过滤，
+     * 合成为 "/<cmd> <sub>" 形式的候选条目（复用命令提示面板的渲染与导航）。
+     */
+    private List<Command> subcommandCandidates(String cmdName, String partial) {
+        Optional<Command> cmdOpt = commandRegistry.find(cmdName);
+        if (cmdOpt.isEmpty() || cmdOpt.get().subcommands().isEmpty()) {
+            return List.of();
+        }
+        Command parent = cmdOpt.get();
+        String lower = partial.toLowerCase(Locale.ROOT);
+        List<Command> result = new ArrayList<>();
+        for (var entry : parent.subcommands().entrySet()) {
+            if (entry.getKey().toLowerCase(Locale.ROOT).startsWith(lower)) {
+                result.add(new Command(parent.name() + " " + entry.getKey(), entry.getValue(),
+                        new String[0], parent.type(), false, parent.skill(), Map.of()));
+            }
+        }
+        return result;
     }
 
     /** 命令提示导航：循环移动（与全屏选择器一致，到顶再按上跳到最后一条）。 */
@@ -1775,8 +1822,9 @@ public class TerminalUI {
             return;
         }
         if (!streaming) {
-            // 命令提示激活：Enter = 选中候选命令（展开完整命令名后提交执行）。
-            // 仅输入 "/" 时不自动执行（避免误触发第一条候选命令）
+            // 命令提示激活（命令名阶段或子命令阶段）：Enter = 展开选中候选后提交执行。
+            // 仅输入 "/" 时（cacheKey 为空串）不自动执行，避免误触发第一条候选命令；
+            // 深层参数阶段无候选，整行原样提交——参数不会被候选展开覆盖。
             var cands = currentCommandCandidates();
             String token = hintTokenCache;
             if (!cands.isEmpty() && token != null && !token.isEmpty()) {

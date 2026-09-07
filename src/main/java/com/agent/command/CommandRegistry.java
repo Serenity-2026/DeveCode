@@ -301,7 +301,10 @@ public class CommandRegistry {
         // /memory (LOCAL)
         register(
                 new Command("memory", "Manage auto-memories",
-                        new String[]{}, CommandType.LOCAL, false),
+                        new String[]{}, CommandType.LOCAL, false,
+                        Command.subcommands(
+                                "list", "Show stored memories",
+                                "clear", "Clear all memories")),
                 ctx -> {
                     String args = ctx.args();
                     String sub = (args == null || args.isBlank()) ? "list" : args.strip().split("\\s+", 2)[0].toLowerCase(Locale.ROOT);
@@ -330,7 +333,10 @@ public class CommandRegistry {
         // /permission (LOCAL, alias: perm)
         register(
                 new Command("permission", "Permission management",
-                        new String[]{"perm"}, CommandType.LOCAL, false),
+                        new String[]{"perm"}, CommandType.LOCAL, false,
+                        Command.subcommands(
+                                "info", "Show current permission mode",
+                                "mode", "Usage: /permission mode <mode>")),
                 ctx -> {
                     String args = ctx.args();
                     String sub = (args == null || args.isBlank()) ? "info" : args.strip().split("\\s+", 2)[0].toLowerCase(Locale.ROOT);
