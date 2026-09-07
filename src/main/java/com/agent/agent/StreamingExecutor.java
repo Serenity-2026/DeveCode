@@ -37,10 +37,10 @@ public class StreamingExecutor {
     //与UI/主循环通信的事件队列，所有ToolResult/PermissionRequest都从这里流出
     private final BlockingQueue<AgentEvent> eventQueue;
     private final RecoveryState recoveryState;
-    //工具名过滤器（inline skill 的 allowedTools）：null = 不过滤。
+    //工具名过滤器（激活 skill 白名单的并集）：null = 不过滤。
     //schema 侧由 Agent 在每轮迭代过滤，这里做执行侧硬拦截——
     //即使模型幻觉调用被过滤的工具名，也不会真正执行。
-    private final Predicate<String> toolFilter;
+    private final java.util.function.Predicate<String> toolFilter;
     /**
      *- concurrent=true：该批可并行执行（只读工具集合）
      *- concurrent=false：该批必须串行执行（写/命令工具）

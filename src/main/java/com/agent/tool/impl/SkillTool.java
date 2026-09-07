@@ -28,12 +28,14 @@ import java.util.Map;
 public class SkillTool implements Tool {
 
     private static final String DESCRIPTION = """
-            Activate a skill by name. Skills are named capability modules \
+            Activate or deactivate a skill by name. Skills are named capability modules \
             (reusable prompts) installed in this environment — the available skills \
             and their descriptions are listed in the system context.
 
             When the user's task matches a skill, activate it BEFORE responding, \
-            then follow the instructions it returns.
+            then follow the instructions it returns. Once active, a skill stays in \
+            effect (including its tool restrictions) until the task is done or the \
+            user asks to stop — then deactivate it.
 
             The tool result contains either the skill's full instructions (inline mode) \
             or a result summary from an isolated sub-agent (fork mode).""";
@@ -90,6 +92,12 @@ public class SkillTool implements Tool {
                                         "type", "string",
                                         "description",
                                         "Optional task-specific arguments. Substituted into the skill's $ARGUMENTS placeholder."
+                                ),
+                                "deactivate", Map.of(
+                                        "type", "boolean",
+                                        "description",
+                                        "Set to true to deactivate the skill: stop following its instructions "
+                                                + "and release its tool restrictions."
                                 )
                         ),
                         "required", List.of("skill")
@@ -102,6 +110,10 @@ public class SkillTool implements Tool {
         String skillName = stringArg(args, "skill", "");
         if (skillName.isEmpty()) {
             return ToolResult.error("Error: skill name is required");
+        }
+        // 退出分支：不查 catalog（skill 可能已被删除也要能退出），只清激活状态
+        if (Boolean.TRUE.equals(args.get("deactivate"))) {
+            return ToolResult.success(host.deactivateSkill(skillName));
         }
         var opt = catalog.getFull(skillName);
         if (opt.isEmpty()) {

@@ -66,13 +66,12 @@ public final class SkillExecutor {
 
     /**
      * 以inline模式激活 skill——正文注入当前对话，返回渲染后的 prompt。
-     * allowedTools 非空时通过宿主设置工具过滤，作用于当前 Agent Loop 的剩余部分。
+     * 白名单贡献并入宿主激活集（并集、跨 loop 持久，退出时经 deactivateSkill 移除）；
+     * 空 allowedTools 也登记（无贡献、不限制），保证生命周期统一。
      */
     public static String executeInline(SkillCatalog.Skill skill, String args, SkillHost host) {
         String body = substituteArguments(skill.promptBody(), args);
-        if (!skill.meta().allowedTools().isEmpty()) {
-            host.setToolFilter(skill.meta().allowedTools()::contains);
-        }
+        host.addSkillTools(skill.meta().name(), skill.meta().allowedTools());
         host.recordSkillInvocation(skill.meta().name(), body);
         return body;
     }

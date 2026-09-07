@@ -21,13 +21,8 @@ import com.agent.tool.result.ToolResultBudget;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.function.Predicate;
 
 public class Agent implements SkillHost {
@@ -36,7 +31,10 @@ public class Agent implements SkillHost {
     private final String protocol;
     private final int contextWindow;
     private final int maxOutput;
-    private Predicate<String> toolNameFilter;
+    // 激活中的 inline skill 工具白名单（skill name → allowedTools）。
+    // 跨 Agent Loop 持久（skill = 模式语义，激活后一直生效），退出（deactivateSkill）时
+    // 移除该 skill 的贡献；实际过滤 = 所有激活 skill 白名单的并集，并集为空 = 不限制。
+    private final Map<String, List<String>> activeSkillTools = new ConcurrentHashMap<>();
     private final RecoveryState recoveryState = new RecoveryState();
 
     private FileHistory fileHistory;
@@ -124,14 +122,29 @@ public class Agent implements SkillHost {
     // Agent 即 inline skill 的宿主：SkillTool / 用户命令激活 skill 时回调这里。
     // （inline 正文经 Skill 工具结果自然进入对话，激活无需通知宿主。）
 
-    /**
-     * inline skill 声明了 allowedTools 时设置工具过滤：
-     * 作用于当前 Agent Loop 的剩余部分（schema 侧 + 执行侧双重拦截），
-     * loop 结束时在 finally 中重置，下一条用户消息恢复全量工具。
-     */
+    /** 激活 skill 的白名单贡献（并集语义，同名重复激活覆盖，跨 loop 持久）。 */
     @Override
-    public void setToolFilter(Predicate<String> filter) {
-        this.toolNameFilter = filter;
+    public void addSkillTools(String skillName, List<String> allowedTools) {
+        if (skillName == null || skillName.isEmpty()) return;
+        activeSkillTools.put(skillName, allowedTools == null ? List.of() : allowedTools);
+    }
+
+    /** 退出 skill：移除其白名单贡献，返回该 skill 此前是否处于激活态。 */
+    public boolean removeSkillTools(String skillName) {
+        return skillName != null && activeSkillTools.remove(skillName) != null;
+    }
+
+    /**
+     * 当前生效的工具过滤器：所有激活 skill 白名单的并集。
+     * 无激活 skill 或并集为空（全部声明空名单）→ null = 不限制（全量工具）。
+     * 每轮迭代取一次快照，中途退出下一轮生效。
+     */
+    private Predicate<String> currentToolFilter() {
+        Set<String> union = new HashSet<>();
+        for (var tools : activeSkillTools.values()) {
+            union.addAll(tools);
+        }
+        return union.isEmpty() ? null : union::contains;
     }
 
     public void setWorkDir(String workDir) { this.workDir = workDir; }
@@ -201,15 +214,16 @@ public class Agent implements SkillHost {
                 }
                 conv.addSystemReminder(sb.toString());
             }
-            // 4. 获取工具 schema，调用 LLM
+            // 4. 获取工具 schema，调用 LLM（激活 skill 白名单并集过滤 schema 侧）
             var iterToolSchemas = registry.getAllSchemas(protocol);
-            if (toolNameFilter != null) {
+            var toolFilter = currentToolFilter();
+            if (toolFilter != null) {
                 //保留指定name的工具方法
                 iterToolSchemas = iterToolSchemas.stream()
                         .filter(schema -> {
                             Object name = schema.get("name");
                             //没有 "name" 字段（即 name == null），则默认放行
-                            return name == null || toolNameFilter.test(name.toString());
+                            return name == null || toolFilter.test(name.toString());
                         })
                         .toList();
             }
@@ -401,8 +415,8 @@ public class Agent implements SkillHost {
                 loopCompleted = true;
                 break;
             }
-            // 11. 执行工具 + 收集结果（toolNameFilter：inline skill 的 allowedTools，执行侧硬拦截）
-            var executor = new StreamingExecutor(registry, checker, hookEngine, queue, recoveryState, toolNameFilter);
+            // 11. 执行工具 + 收集结果（激活 skill 白名单并集：执行侧硬拦截）
+            var executor = new StreamingExecutor(registry, checker, hookEngine, queue, recoveryState, toolFilter);
             var results = executor.executeAll(toolUseBlocks);
             // Add results to conversation
             conv.addToolResultsMessage(results);
@@ -423,10 +437,9 @@ public class Agent implements SkillHost {
             }
         }
     } finally {
-            // inline skill 的 allowedTools 过滤只作用于本次 Loop，
-            // 结束时重置，下一条用户消息恢复全量工具
-            toolNameFilter = null;
             // 12. turn_end 通知，使用loopCompleted
+            // （skill 工具白名单跨 Loop 持久——skill 是模式语义，激活到退出；
+            //  由 deactivateSkill 清理，不在此重置）
             if (!loopCompleted) {
                 putSafe(queue, new AgentEvent.LoopComplete(0));
             }

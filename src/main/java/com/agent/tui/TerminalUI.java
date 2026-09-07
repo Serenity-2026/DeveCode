@@ -360,12 +360,13 @@ public class TerminalUI implements SkillForkHost {
         toolRegistry.register(new SkillTool(skillCatalog, toolRegistry, this));
         agent.setSkillCatalog(skillCatalog);
         commandRegistry.register(
-                new Command("skill", "Manage skills: list · reload · install <url> [--project]",
+                new Command("skill", "Manage skills: list · reload · install <url> · exit <name>",
                         new String[0], Command.CommandType.LOCAL_UI, false,
                         Command.subcommands(
                                 "list", "List installed skills",
                                 "reload", "Hot-reload skills from disk",
-                                "install", "Install a skill from GitHub <url>")),
+                                "install", "Install a skill from GitHub <url>",
+                                "exit", "Deactivate an active skill <name>")),
                 null);
     }
 
@@ -1188,7 +1189,7 @@ public class TerminalUI implements SkillForkHost {
         needsRedraw = true;
     }
 
-    /** /skill — skill 管理（skill 包）：/skill list 列出 · /skill reload 热加载 · /skill install 安装。 */
+    /** /skill — skill 管理（skill 包）：/skill list 列出 · /skill reload 热加载 · /skill install 安装 · /skill exit 退出。 */
     private void doSkill(String args) {
         String[] parts = (args == null ? "" : args.trim()).split("\\s+");
         String sub = parts[0].isEmpty() ? "" : parts[0];
@@ -1196,8 +1197,20 @@ public class TerminalUI implements SkillForkHost {
             case "list" -> doSkillList();
             case "reload" -> doSkillReload();
             case "install" -> doSkillInstall(parts);
+            case "exit" -> doSkillExit(parts);
             default -> printSkillUsage();
         }
+    }
+
+    /** /skill exit <name> — 退出激活中的 skill：清工具白名单 + 恢复记录，注入停用提示。 */
+    private void doSkillExit(String[] parts) {
+        if (parts.length < 2 || parts[1].isEmpty()) {
+            appendMessage(UIMessage.system(GRAY + "Usage: /skill exit <name>" + RESET));
+            scrollToBottom();
+            needsRedraw = true;
+            return;
+        }
+        deactivateSkill(parts[1]);
     }
 
     /** /skill list — 列出所有已安装 skill 名（含来源层级：builtin / user / project）。 */
@@ -1235,12 +1248,13 @@ public class TerminalUI implements SkillForkHost {
 
     private void printSkillUsage() {
         appendMessage(UIMessage.system(GRAY
-                + "Usage: /skill list | reload | install <url> [--project]\n"
+                + "Usage: /skill list | reload | install <url> [--project] | exit <name>\n"
                 + "  list        show installed skill names\n"
                 + "  reload      hot-reload skills from disk\n"
                 + "  install <url> [--project]\n"
                 + "    url     github.com/<owner>/<repo>[.git] · github.com/…/tree/<ref>/<subpath> · skills.sh/<owner>/<repo>/<name>\n"
-                + "    default installs to ~/.devecode/skills (user level); --project installs to .devecode/skills" + RESET));
+                + "    default installs to ~/.devecode/skills (user level); --project installs to .devecode/skills\n"
+                + "  exit <name>  deactivate an active skill (release tool restrictions)" + RESET));
         scrollToBottom();
         needsRedraw = true;
     }
@@ -1368,10 +1382,10 @@ public class TerminalUI implements SkillForkHost {
     //  SkillForkHost：fork 模式宿主（inline 部分委托给主 Agent）
     // ═══════════════════════════════════════════════════════════════
 
-    /** inline skill 的 allowedTools 过滤（SkillHost）——委托主 Agent。 */
+    /** inline skill 的 allowedTools 并入激活集（SkillHost）——委托主 Agent（并集、跨 loop 持久）。 */
     @Override
-    public void setToolFilter(Predicate<String> filter) {
-        agent.setToolFilter(filter);
+    public void addSkillTools(String skillName, List<String> allowedTools) {
+        agent.addSkillTools(skillName, allowedTools);
     }
 
     /**
@@ -1382,6 +1396,28 @@ public class TerminalUI implements SkillForkHost {
     @Override
     public void recordSkillInvocation(String name, String body) {
         agent.getRecoveryState().recordSkillInvocation(name, body);
+    }
+
+    /**
+     * 退出 skill（SkillHost，与 addSkillTools 对称）：三层清理——
+     * ①工具白名单贡献移除（未声明 allowedTools 的 skill 本来无贡献，自然跳过）
+     * ②压缩恢复记录清除（此后压缩不再把 SOP 挂回）
+     * ③停用提示注入对话（压过历史里的 skill 正文，告知模型停止遵循）
+     * 入口：/skill exit 命令、模型调 SkillTool(deactivate=true)。
+     */
+    @Override
+    public String deactivateSkill(String name) {
+        boolean wasActive = agent.removeSkillTools(name);
+        boolean hadRecord = agent.getRecoveryState().removeSkill(name);
+        conversation.addSystemReminder(
+                "Skill '" + name + "' has been deactivated. Stop following its instructions; "
+                        + "its tool restrictions no longer apply (other active skills may still restrict tools).");
+        String note = wasActive || hadRecord ? "" : " (was not active)";
+        appendMessage(UIMessage.system(CYAN + "◎" + RESET + " skill '" + name + "' deactivated" + GRAY + note + RESET));
+        scrollToBottom();
+        needsRedraw = true;
+        return "Skill '" + name + "' deactivated: instructions no longer apply, its tool "
+                + "restrictions are released, and it will not be restored after context compaction.";
     }
 
     /** 父对话消息快照（不是引用）：子 Agent 启动那一刻的冻结版本。 */

@@ -38,6 +38,12 @@ public final class RecoveryState {
         skills.put(name, new SkillInvocationRecord(name, body, Instant.now()));
     }
 
+    /** 退出 skill：清除恢复记录，此后压缩不再把该 SOP 挂回 "Active skills" 段落。 */
+    public boolean removeSkill(String name) {
+        if (name == null || name.isEmpty()) return false;
+        return skills.remove(name) != null;
+    }
+
     /**
      * 获取文件快照
      * @param limit 需要获取的最近的文件快照数目
