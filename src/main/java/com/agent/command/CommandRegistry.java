@@ -5,6 +5,7 @@ package com.agent.command;
 
 import com.agent.command.Command.CommandType;
 import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -14,6 +15,9 @@ import java.util.stream.Collectors;
 public class CommandRegistry {
 
     private final List<Command> commands = new ArrayList<>();
+    // 由 skill catalog 动态注册的命令（PROMPT 类型）：CopyOnWriteArrayList 保证
+    // 后台 install/reload 线程同步时，渲染线程的 search() 快照遍历不会抛 CME
+    private final List<Command> skillCommands = new CopyOnWriteArrayList<>();
     //key包含name与alias,值为对应的handler
 
     private final Map<String, Function<CommandContext, String>> handlers = new HashMap<>();
@@ -95,20 +99,59 @@ public class CommandRegistry {
         return false;
     }
 
+    // ------------------------------------------------------------------
+    // 动态 skill 命令
+    // ------------------------------------------------------------------
+
     /**
-     * Returns all non-hidden commands whose name starts with {@code prefix}
-     * (case-insensitive comparison).
+     * 注册一个由 skill catalog 提供的动态命令（通常为 PROMPT 类型）。
+     * 与静态命令或已注册 skill 命令重名时静默跳过（静态命令优先），
+     * 避免动态加载触发 register 的冲突异常。
+     */
+    public void registerSkill(Command cmd, Function<CommandContext, String> handler) {
+        if (find(cmd.name()).isPresent()) {
+            return;
+        }
+        skillCommands.add(cmd);
+        if (handler != null) {
+            handlers.put(cmd.name(), handler);
+            for (var alias : cmd.aliases()) {
+                handlers.put(alias, handler);
+            }
+        }
+    }
+
+    /** 清除全部动态 skill 命令及其 handler（catalog reload 前调用）。 */
+    public void clearSkillCommands() {
+        for (Command c : skillCommands) {
+            handlers.remove(c.name());
+            for (var alias : c.aliases()) {
+                handlers.remove(alias);
+            }
+        }
+        skillCommands.clear();
+    }
+
+    /**
+     * 按前缀过滤候选命令：静态命令在前、skill 命令在后，各自按名称排序
+     * （命令提示面板的显示顺序约定）。
      */
     public List<Command> search(String prefix) {
         String lower = prefix.toLowerCase();
-        return commands.stream()
+        List<Command> result = new ArrayList<>(matchByPrefix(commands, lower));
+        result.addAll(matchByPrefix(skillCommands, lower));
+        return result;
+    }
+
+    private static List<Command> matchByPrefix(List<Command> source, String lowerPrefix) {
+        return source.stream()
                 .filter(c -> !c.hidden())
                 .filter(c -> {
-                    if (c.name().toLowerCase().startsWith(lower)) {
+                    if (c.name().toLowerCase().startsWith(lowerPrefix)) {
                         return true;
                     }
                     for (var alias : c.aliases()) {
-                        if (alias.toLowerCase().startsWith(lower)) {
+                        if (alias.toLowerCase().startsWith(lowerPrefix)) {
                             return true;
                         }
                     }
@@ -118,9 +161,15 @@ public class CommandRegistry {
                 .collect(Collectors.toList());
     }
 
-    /** Finds a command by exact name or alias match. */
+    /** Finds a command by exact name or alias match（静态命令优先于 skill 命令）。 */
     public Optional<Command> find(String name) {
-        return commands.stream()
+        Optional<Command> cmd = commands.stream()
+                .filter(c -> c.matches(name))
+                .findFirst();
+        if (cmd.isPresent()) {
+            return cmd;
+        }
+        return skillCommands.stream()
                 .filter(c -> c.matches(name))
                 .findFirst();
     }
@@ -145,12 +194,18 @@ public class CommandRegistry {
         return Collections.unmodifiableList(commands);
     }
 
-    /** Returns all non-hidden commands, sorted by name. */
+    /** Returns all non-hidden commands：静态命令在前、skill 命令在后，各自按名称排序。 */
     public List<Command> listVisible() {
-        return commands.stream()
+        List<Command> result = new ArrayList<>(
+                commands.stream()
+                        .filter(c -> !c.hidden())
+                        .sorted(Comparator.comparing(Command::name))
+                        .collect(Collectors.toList()));
+        result.addAll(skillCommands.stream()
                 .filter(c -> !c.hidden())
                 .sorted(Comparator.comparing(Command::name))
-                .collect(Collectors.toList());
+                .collect(Collectors.toList()));
+        return result;
     }
 
     // ------------------------------------------------------------------
@@ -178,7 +233,7 @@ public class CommandRegistry {
                         }
                         return sb.toString();
                     }
-                    //模式二:无参 → 全量列表
+                    //模式二:无参 → 全量列表（静态命令在前、skill 命令在后，均按名称排序）
                     var sb = new StringBuilder();
                     sb.append("Available commands:\n\n");
                     for (var cmd : listVisible()) {
@@ -186,7 +241,11 @@ public class CommandRegistry {
                         if (cmd.aliases().length > 0) {
                             aliases = ", /" + String.join(", /", cmd.aliases());
                         }
-                        sb.append("  /").append(cmd.name()).append(aliases).append("\n");
+                        sb.append("  /").append(cmd.name()).append(aliases);
+                        if (cmd.skill()) {
+                            sb.append("  [skill]");
+                        }
+                        sb.append('\n');
                         sb.append("    ").append(cmd.description()).append("\n");
                     }
                     sb.append("\nType /help <command> for details.");
@@ -296,24 +355,6 @@ public class CommandRegistry {
                 new Command("rewind", "Rewind to a previous checkpoint",
                         new String[]{}, CommandType.LOCAL_UI, false),
                 null
-        );
-
-        // /skills (LOCAL) — supports /skills reload subcommand
-        register(
-                new Command("skills", "List available skills (use '/skills reload' to hot-reload)",
-                        new String[]{}, CommandType.LOCAL, false),
-                ctx -> {
-                    if (ctx.args() != null && ctx.args().strip().equals("reload")) {
-                        int count = ctx.skillReload().getAsInt();
-                        return "Skills reloaded. %d skill(s) available.".formatted(count);
-                    }
-                    var skills = ctx.skillList().get();
-                    if (skills.isEmpty()) return "No skills installed.\n\nAdd skills to .devecode/skills/<skill-name>/SKILL.md";
-                    var sb = new StringBuilder("Installed skills (%d):\n".formatted(skills.size()));
-                    for (var s : skills) sb.append("  • ").append(s).append("\n");
-                    sb.append("\nType /skills reload to hot-reload skills from disk.");
-                    return sb.toString();
-                }
         );
 
         // /review (PROMPT)

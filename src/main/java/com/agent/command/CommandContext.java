@@ -23,8 +23,6 @@ public record CommandContext(
         Supplier<List<String>> memoryList,
         Runnable memoryClear,
         Supplier<String> sessionInfo,
-        Supplier<List<String>> skillList,
-        IntSupplier skillReload,
         Supplier<String> mcpInfo,
         Supplier<String> sandboxStatus,
         Consumer<Integer> sandboxSwitch

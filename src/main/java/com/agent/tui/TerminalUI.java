@@ -21,6 +21,11 @@ import com.agent.permission.PermissionMode;
 import com.agent.permission.PermissionResponse;
 import com.agent.prompt.PromptBuilder;
 import com.agent.session.SessionManager;
+import com.agent.skill.SkillCatalog;
+import com.agent.skill.SkillInstallReport;
+import com.agent.skill.SkillInstaller;
+import com.agent.skill.SkillSource;
+import com.agent.skill.SkillExecutor;
 import com.agent.tool.ToolRegistry;
 import com.agent.tool.FileHistory;
 import com.agent.tool.FileStateCache;
@@ -116,6 +121,10 @@ public class TerminalUI {
 
     // ── 命令系统（command 包）──
     private final CommandRegistry commandRegistry; // 斜杠命令注册中心（含 .devecode/commands/ 自定义命令）
+
+    // ── Skill 系统（skill 包）──
+    private final SkillCatalog skillCatalog;       // builtin/user/project 三层 skill 目录
+    private volatile boolean skillInstalling = false; // /skill install 后台执行期间禁止重复安装
 
     // ── 全屏选择器（/resume 会话列表、/rewind 快照列表）──
     private volatile PickerState activePicker;   // null = 无选择器，正常对话界面
@@ -329,6 +338,13 @@ public class TerminalUI {
                 ctx -> "System prompt (" + systemPrompt.length() + " chars · "
                         + mcpServers.size() + " MCP server(s))\n\n"
                         + (systemPrompt.length() > 800 ? systemPrompt.substring(0, 800) + "\n…" : systemPrompt));
+        // ── Skill 系统接入（skill 包）──
+        // 三层目录（builtin → ~/.devecode/skills → .devecode/skills），安装后可 /skill reload 热加载
+        this.skillCatalog = SkillCatalog.loadCatalog(workDir);
+        syncSkillCommands();
+        commandRegistry.register(
+                new Command("skill", "Manage skills: list · reload · install <url> [--project]",
+                        new String[0], Command.CommandType.LOCAL_UI, false), null);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -755,6 +771,7 @@ public class TerminalUI {
             case "plan" -> doPlan();
             case "resume" -> doResume(args);
             case "rewind" -> doRewind();
+            case "skill" -> doSkill(args);
             default -> appendMessage(UIMessage.system(GRAY
                     + "Command /" + name + " is not available in this UI yet." + RESET));
         }
@@ -776,8 +793,6 @@ public class TerminalUI {
                 () -> memoryManager.getMemories(),
                 () -> memoryManager.clear(),
                 () -> sessionId + " · " + conversation.size() + " message(s)",
-                List::of,   // skills 尚未接入 TUI
-                () -> 0,
                 this::buildMcpInfo,
                 () -> permissionChecker.isSandboxEnabled() ? "enabled" : "disabled",
                 this::switchSandbox
@@ -1107,6 +1122,154 @@ public class TerminalUI {
                 + changed.size() + " file(s) restored, conversation truncated to checkpoint" + RESET));
         scrollToBottom();
         needsRedraw = true;
+    }
+
+    /** /skill — skill 管理（skill 包）：/skill list 列出 · /skill reload 热加载 · /skill install 安装。 */
+    private void doSkill(String args) {
+        String[] parts = (args == null ? "" : args.trim()).split("\\s+");
+        String sub = parts[0].isEmpty() ? "" : parts[0];
+        switch (sub) {
+            case "list" -> doSkillList();
+            case "reload" -> doSkillReload();
+            case "install" -> doSkillInstall(parts);
+            default -> printSkillUsage();
+        }
+    }
+
+    /** /skill list — 列出所有已安装 skill 名（含来源层级：builtin / user / project）。 */
+    private void doSkillList() {
+        var skills = skillCatalog.getSkills();
+        String out;
+        if (skills.isEmpty()) {
+            out = "No skills installed.\n\n"
+                    + "Add skills to .devecode/skills/<skill-name>/SKILL.md\n"
+                    + "or install one from GitHub: /skill install <url>";
+        } else {
+            var sb = new StringBuilder("Installed skills (%d):\n".formatted(skills.size()));
+            for (var name : skills.keySet()) {
+                sb.append("  • ").append(name);
+                String src = skillCatalog.source(name);
+                if (!src.isEmpty()) sb.append(" (").append(src).append(")");
+                sb.append('\n');
+            }
+            out = sb.toString();
+        }
+        appendMessage(UIMessage.system(UIMessage.grayLines(out.strip())));
+        scrollToBottom();
+        needsRedraw = true;
+    }
+
+    /** /skill reload — 从磁盘热重载 skill 目录并同步命令注册。 */
+    private void doSkillReload() {
+        skillCatalog.reload(workDir);
+        syncSkillCommands();
+        appendMessage(UIMessage.system(UIMessage.grayLines(
+                "Skills reloaded. " + skillCatalog.list().size() + " skill(s) available.")));
+        scrollToBottom();
+        needsRedraw = true;
+    }
+
+    private void printSkillUsage() {
+        appendMessage(UIMessage.system(GRAY
+                + "Usage: /skill list | reload | install <url> [--project]\n"
+                + "  list        show installed skill names\n"
+                + "  reload      hot-reload skills from disk\n"
+                + "  install <url> [--project]\n"
+                + "    url     github.com/<owner>/<repo>[.git] · github.com/…/tree/<ref>/<subpath> · skills.sh/<owner>/<repo>/<name>\n"
+                + "    default installs to ~/.devecode/skills (user level); --project installs to .devecode/skills" + RESET));
+        scrollToBottom();
+        needsRedraw = true;
+    }
+
+    /** /skill install — 从 GitHub 安装 skill，默认装到用户级 ~/.devecode/skills。 */
+    private void doSkillInstall(String[] parts) {
+        if (parts.length < 2) {
+            printSkillUsage();
+            return;
+        }
+        String url = parts[1];
+        boolean projectScope = false;
+        for (int i = 2; i < parts.length; i++) {
+            if ("--project".equals(parts[i])) projectScope = true;
+        }
+        if (skillInstalling) {
+            appendMessage(UIMessage.system(YELLOW
+                    + "A skill install is already in progress, please wait…" + RESET));
+            return;
+        }
+
+        // 先解析 URL（同步，本地操作）：格式错误立即反馈，不进后台线程
+        SkillSource src;
+        try {
+            src = SkillInstaller.parseSkillURL(url);
+        } catch (IllegalArgumentException e) {
+            appendMessage(UIMessage.error("Invalid skill URL: " + e.getMessage()));
+            scrollToBottom();
+            return;
+        }
+
+        skillInstalling = true;
+        appendMessage(UIMessage.system(CYAN + "⤓ Installing skill " + RESET
+                + GRAY + src.owner() + "/" + src.repo()
+                + (src.subpath().isEmpty() ? "" : "/" + src.subpath()) + RESET));
+        scrollToBottom();
+        needsRedraw = true;
+
+        final boolean toProject = projectScope;
+        Thread.startVirtualThread(() -> {
+            try {
+                String root = toProject
+                        ? Path.of(workDir, ".devecode", "skills").toString()
+                        : SkillInstaller.userSkillsRoot();
+                SkillInstallReport report = new SkillInstaller().install(src, root);
+                skillCatalog.reload(workDir);  // 立即可用，无需重启
+                syncSkillCommands();           // 新 skill 同步为可调用的命令
+                appendMessage(UIMessage.system(
+                        GREEN + "✔ Skill installed: " + RESET + WHITE + report.skillName() + RESET
+                        + GRAY + " · " + report.fileCount() + " file(s)"
+                        + (report.skippedFiles() > 0
+                                ? " · " + report.skippedFiles() + " large file(s) skipped" : "")
+                        + " · " + formatTokens((int) report.totalBytes()) + "B → " + report.targetDir()
+                        + (toProject ? " (project)" : " (user)") + RESET));
+            } catch (Exception e) {
+                appendMessage(UIMessage.error("Skill install failed: "
+                        + (e.getMessage() == null ? e.toString() : e.getMessage())));
+            } finally {
+                skillInstalling = false;
+                needsRedraw = true;
+            }
+            scrollToBottom();
+        });
+    }
+
+    /**
+     * 将 skillCatalog 中全部 skill 同步注册为 PROMPT 命令：
+     * 出现在命令提示面板与 /help 列表中（带 [skill] 标识），可直接 /<skill-name> 调用。
+     * 与静态命令重名的 skill 会被跳过（静态命令优先）。
+     * catalog 变更（reload / install）后需重新调用。
+     */
+    private void syncSkillCommands() {
+        commandRegistry.clearSkillCommands();
+        for (var meta : skillCatalog.list()) {
+            String skillName = meta.name();
+            Command cmd = new Command(skillName, firstLine(meta.description()),
+                    new String[0], Command.CommandType.PROMPT, false, true);
+            commandRegistry.registerSkill(cmd, ctx -> {
+                var opt = skillCatalog.getFull(skillName);
+                if (opt.isEmpty()) return "Skill not found: " + skillName;
+                return SkillExecutor.substituteArguments(opt.get().promptBody(), ctx.args());
+            });
+        }
+    }
+
+    /** 取多行文本的第一个非空行（skill 描述常为多行 YAML，命令面板需单行）。 */
+    private static String firstLine(String s) {
+        if (s == null) return "";
+        for (String line : s.split("\n")) {
+            String t = line.strip();
+            if (!t.isEmpty()) return t;
+        }
+        return "";
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -2000,14 +2163,15 @@ public class TerminalUI {
             moveTo(buf, y, 0);
             buf.append("\033[K");
 
-            // 标记 + 命令名（选中：白粗体；未选中：白色）
+            // 标记 + 命令名（选中：白粗体；未选中：白色）；skill 命令附带青色 [skill] 标识
             String marker = sel ? BOLD + WHITE + "● " + RESET : GRAY + "○ " + RESET;
             String nameColored = (sel ? BOLD + WHITE : WHITE) + "/" + c.name() + RESET;
             String aliases = "";
             if (c.aliases().length > 0) {
                 aliases = GRAY + " (" + String.join(", ", c.aliases()) + ")" + RESET;
             }
-            buf.append(marker).append(nameColored).append(aliases);
+            String skillTag = c.skill() ? CYAN + " [skill]" + RESET : "";
+            buf.append(marker).append(nameColored).append(aliases).append(skillTag);
 
             // 描述（灰色，对齐到统一列；空间不足时截断）
             int used = 2 + commandColumnWidth(c);
@@ -2027,11 +2191,14 @@ public class TerminalUI {
         buf.append(truncate(hint, width));
     }
 
-    /** 命令条目中命令列（"/name (aliases)"）的可见宽度。 */
+    /** 命令条目中命令列（"/name (aliases) [skill]"）的可见宽度。 */
     private static int commandColumnWidth(Command c) {
         int w = 1 + c.name().length();
         if (c.aliases().length > 0) {
             w += 3 + String.join(", ", c.aliases()).length();  // " (" + join + ")"
+        }
+        if (c.skill()) {
+            w += 7;  // " [skill]"
         }
         return w;
     }

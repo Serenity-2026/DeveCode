@@ -8,14 +8,21 @@ package com.agent.command;
  * @param aliases     alternative names (e.g. {"h", "?"} for help)
  * @param type        how the command is dispatched
  * @param hidden      if true, omitted from /help listings
+ * @param skill       true 表示该命令由 skill catalog 动态提供（列表/提示面板中带 [skill] 标识）
  */
 public record Command(
         String name,
         String description,
         String[] aliases,
         CommandType type,
-        boolean hidden
+        boolean hidden,
+        boolean skill
 ) {
+
+    /** 静态命令使用的便利构造器（skill = false）。 */
+    public Command(String name, String description, String[] aliases, CommandType type, boolean hidden) {
+        this(name, description, aliases, type, hidden, false);
+    }
 
     /** Dispatch style for a command. */
     public enum CommandType {

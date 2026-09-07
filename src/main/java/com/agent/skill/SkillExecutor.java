@@ -44,7 +44,7 @@ public final class SkillExecutor {
      * @param args
      * @return
      */
-    static String substituteArguments(String body, String args) {
+    public static String substituteArguments(String body, String args) {
         if (args == null || args.isBlank()) {
             return body;
         }
