@@ -447,8 +447,6 @@ public class Agent implements SkillHost {
         }
     } finally {
             // 12. turn_end 通知，使用loopCompleted
-            // （skill 工具白名单跨 Loop 持久——skill 是模式语义，激活到退出；
-            //  由 deactivateSkill 清理，不在此重置）
             if (!loopCompleted) {
                 putSafe(queue, new AgentEvent.LoopComplete(0));
             }

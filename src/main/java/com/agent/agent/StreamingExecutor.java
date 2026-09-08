@@ -6,6 +6,7 @@ import com.agent.llm.ToolResultBlock;
 import com.agent.llm.ToolUseBlock;
 import com.agent.permission.PermissionChecker;
 import com.agent.permission.PermissionResponse;
+import com.agent.tool.impl.AskUserQuestionTool;
 import com.agent.tool.Tool;
 import com.agent.tool.ToolCategory;
 import com.agent.tool.ToolRegistry;
@@ -169,6 +170,11 @@ public class StreamingExecutor {
             putSafe(new AgentEvent.ToolResultEvent(call.toolId(), call.toolName(), msg, true, 0));
             return new ToolResultBlock(call.toolId(), "Error: " + msg, true);
         }
+        // AskUserQuestion 元工具：不经过权限检查/hook（交互对象是用户而非文件系统），
+        // 直接发结构化问卷事件给 UI 并阻塞等待答案，语义与下方权限询问一致。
+        if (AskUserQuestionTool.NAME.equals(call.toolName())) {
+            return executeAskUserQuestions(call);
+        }
         // 权限检查优先于hook：先拦截无权操作，再让 hook 介入
         if (checker != null) {
             var check = checker.check(tool, call.arguments());
@@ -243,6 +249,97 @@ public class StreamingExecutor {
         }
 
         return new ToolResultBlock(call.toolId(), output, result.isError());
+    }
+
+    /**
+     * AskUserQuestion 工具的真实执行路径：
+     * 解析 arguments 中的 questions → 发 AskUserRequestEvent 给 UI（全屏问卷）→
+     * 阻塞等待 future（最长 5 分钟）→ 把用户答案格式化成工具结果返回给模型。
+     * 用户取消/超时按“拒绝回答”处理，提示模型改用假设推进，而不是原样重问。
+     */
+    private ToolResultBlock executeAskUserQuestions(ToolUseBlock call) {
+        var questions = parseAskQuestions(call.arguments());
+        if (questions.isEmpty()) {
+            return failedResult(call,
+                    "AskUserQuestion requires a non-empty 'questions' array (each item needs a 'question' string).");
+        }
+        if (questions.size() > 4) {
+            return failedResult(call,
+                    "AskUserQuestion supports at most 4 questions per call, got " + questions.size() + ".");
+        }
+        for (int i = 0; i < questions.size(); i++) {
+            if (questions.get(i).options().size() > 6) {
+                return failedResult(call,
+                        "Question " + (i + 1) + " has " + questions.get(i).options().size()
+                                + " options; at most 6 are supported.");
+            }
+        }
+        //UI的consumeAgentEvents()正在这个队列上take()阻塞，拿到事件后调用handleAskUserRequest()，弹出全屏问卷，用户作答后答案会放入future中,future.complete()
+        var future = new CompletableFuture<Map<String, String>>();
+        putSafe(new AgentEvent.AskUserRequestEvent(questions, future));
+        Map<String, String> answers;
+        try {
+            answers = future.get(5, TimeUnit.MINUTES);
+        } catch (Exception e) {
+            answers = Map.of();
+        }
+        //超时用户没有作答
+        if (answers == null || answers.isEmpty()) {
+            String msg = "User declined to answer the questions (dialog cancelled or unanswered). "
+                    + "Do not ask the same questions again; proceed with explicit reasonable assumptions "
+                    + "or a different approach.";
+            //立刻通知前端,并由ToolResultBlock向模型返回结果
+            putSafe(new AgentEvent.ToolResultEvent(
+                    call.toolId(), call.toolName(), msg, true, 0));
+            return new ToolResultBlock(call.toolId(), "Error: " + msg, true);
+        }
+        String output = formatAskAnswers(questions, answers);
+        putSafe(new AgentEvent.ToolResultEvent(
+                call.toolId(), call.toolName(), output, false, 0));
+        return new ToolResultBlock(call.toolId(), output, false);
+    }
+
+    /** 把 AskUserQuestion 的 arguments（questions 数组）解析为结构化 Question 列表。 */
+    private static List<AgentEvent.AskUserRequestEvent.Question> parseAskQuestions(Map<String, Object> args) {
+        var questions = new ArrayList<AgentEvent.AskUserRequestEvent.Question>();
+        if (args == null) return questions;
+        if (!(args.get("questions") instanceof List<?> rawList)) return questions;
+        for (Object item : rawList) {
+            if (!(item instanceof Map<?, ?> qm)) continue;
+            String question = asString(qm.get("question"));
+            if (question == null || question.isBlank()) continue;
+            String header = asString(qm.get("header"));
+            var options = new ArrayList<AgentEvent.AskUserRequestEvent.Option>();
+            if (qm.get("options") instanceof List<?> rawOptions) {
+                for (Object o : rawOptions) {
+                    if (!(o instanceof Map<?, ?> om)) continue;
+                    String label = asString(om.get("label"));
+                    if (label == null || label.isBlank()) continue;
+                    options.add(new AgentEvent.AskUserRequestEvent.Option(label, asString(om.get("description"))));
+                }
+            }
+            questions.add(new AgentEvent.AskUserRequestEvent.Question(
+                    question, header, List.copyOf(options)));
+        }
+        return questions;
+    }
+
+    /** 把答案映射格式化为模型易读的 Q&A 文本（答案键 = 1-based 题号）。 */
+    private static String formatAskAnswers(
+            List<AgentEvent.AskUserRequestEvent.Question> questions,
+            Map<String, String> answers) {
+        var sb = new StringBuilder("User answers to your questions:\n");
+        for (int i = 0; i < questions.size(); i++) {
+            sb.append(i + 1).append(". ").append(questions.get(i).question()).append('\n')
+              .append("   Answer: ")
+              .append(answers.getOrDefault(String.valueOf(i + 1), "(no answer)"))
+              .append('\n');
+        }
+        return sb.toString().stripTrailing();
+    }
+
+    private static String asString(Object o) {
+        return o == null ? null : o.toString().trim();
     }
 
     private void putSafe(AgentEvent event) {

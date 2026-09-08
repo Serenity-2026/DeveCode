@@ -9,6 +9,7 @@ import com.agent.command.CommandRegistry;
 import com.agent.compact.ContextCompactor;
 import com.agent.config.McpServerConfig;
 import com.agent.history.ConversationManager;
+import com.agent.history.HistoryStore;
 import com.agent.hook.HookEngine;
 import com.agent.infra.ProviderConfig;
 import com.agent.llm.LlmClient;
@@ -28,11 +29,10 @@ import com.agent.skill.SkillInstallReport;
 import com.agent.skill.SkillInstaller;
 import com.agent.skill.SkillSource;
 import com.agent.skill.SkillExecutor;
-import com.agent.tool.impl.SkillTool;
+import com.agent.tool.impl.*;
 import com.agent.tool.ToolRegistry;
 import com.agent.tool.FileHistory;
 import com.agent.tool.FileStateCache;
-import com.agent.tool.impl.ToolSearchTool;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 import org.jline.utils.NonBlockingReader;
@@ -49,11 +49,13 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -166,7 +168,11 @@ public class TerminalUI implements SkillForkHost {
    private final StringBuilder inputBuffer = new StringBuilder();
    private int cursorCol = 0;
    private int cursorRow = 0;  // 多行光标行号（相对于输入第一行）
-   private final List<String> inputHistory = new ArrayList<>();
+
+    // ── 输入历史（HistoryStore：~/.devecode/prompt_history.jsonl 持久化）──
+    private final HistoryStore historyStore;
+    private int historyIndex = -1;   // 正在浏览的历史位置（0=最新一条），-1=未浏览（自由编辑）
+    private String historyDraft = ""; // 按下 ↑ 之前输入框原有内容，↓ 回到底部时恢复
 
     // ── 流式状态 ──
     private volatile boolean streaming = false;
@@ -176,8 +182,12 @@ public class TerminalUI implements SkillForkHost {
     private long streamStartMs;
     private long firstTokenMs;
 
-    // ── 权限询问（Agent → UI）──
-    private volatile AgentEvent.PermissionRequestEvent pendingPermission;
+    // ── 权限询问（Agent → UI）：并发工具可能同时触发多条请求，排队逐条应答 ──
+    private final Queue<AgentEvent.PermissionRequestEvent> permissionQueue = new LinkedList<>();
+    private volatile AgentEvent.PermissionRequestEvent pendingPermission; // 当前待应答请求（=队首）
+
+    // ── 结构化问卷（AskUserQuestion → UI，全屏对话框）──
+    private volatile AskUserRequestState pendingAsk;
 
     // ── token 用量（UsageEvent 累计）──
     private volatile int usageInTokens;
@@ -272,6 +282,9 @@ public class TerminalUI implements SkillForkHost {
         this.writer = terminal.writer();
         // 步骤 4：ConversationManager — 管理对话历史，每次 addUserMessage/addAssistantMessage 会追加到内部列表
         this.conversation = new ConversationManager();
+        // 输入历史：跨启动持久化到 ~/.devecode/prompt_history.jsonl（启动时载入旧记录）
+        this.historyStore = new HistoryStore();
+        this.historyStore.load();
         // 步骤 5：初始化工具基础设施
         // FileStateCache — 记录 ReadFile 读取过的文件内容和 mtime，EditFile/WriteFile 据此强制"先读后改"
         this.fileStateCache = new FileStateCache();
@@ -287,6 +300,9 @@ public class TerminalUI implements SkillForkHost {
         attachFileHistoryToTools();
         // ToolSearchTool 需要持有 registry 引用，用于延迟工具发现
         toolRegistry.register(new ToolSearchTool(toolRegistry, provider.getProtocol()));
+        // AskUserQuestion — 结构化问卷元工具（deferred，经 ToolSearch "select:AskUserQuestion" 加载；
+        // 调用由 StreamingExecutor 拦截并路由到本 UI 的全屏问卷对话框）
+        toolRegistry.register(new AskUserQuestionTool());
         // 步骤 6：MCP — 依次连接配置的 server（stdio 子进程 / Streamable HTTP），
         // 把 MCP 工具包装成 mcp__<server>__<tool> 注册进 ToolRegistry（延迟加载，经 ToolSearch 发现）
         if (mcpServerConfigs == null || mcpServerConfigs.isEmpty()) {
@@ -541,13 +557,15 @@ public class TerminalUI implements SkillForkHost {
      * 不会到达此方法。此处只处理 ch >= 32 的可打印字符（含中日韩）。
      */
     private void handleKeyTyped(int ch) {
-        inputHistory.removeIf(String::isEmpty);
+        // 编辑已召回的历史文本后即退出历史浏览态，防止继续按 ↓ 覆盖当前输入
+        if (historyIndex >= 0) historyIndex = -1;
         inputBuffer.insert(linearPos(), String.valueOf((char) ch));
         cursorCol++;
         needsRedraw = true;
     }
 
     private void handleBackspace() {
+        if (historyIndex >= 0) historyIndex = -1;
         int pos = linearPos();
         if (pos > 0) {
             inputBuffer.deleteCharAt(pos - 1);
@@ -652,7 +670,7 @@ public class TerminalUI implements SkillForkHost {
                 appendMessage(UIMessage.error("UI error: " + e.getMessage()));
             } finally {
                 streaming = false;
-                pendingPermission = null;
+                clearPendingPermissions();
                 needsRedraw = true;
             }
         });
@@ -1043,11 +1061,11 @@ public class TerminalUI implements SkillForkHost {
 
     /** 向编辑类工具注入最新的 FileHistory / FileStateCache（会话切换后重绑）。 */
     private void attachFileHistoryToTools() {
-        ((com.agent.tool.impl.ReadFileTool) toolRegistry.getTool("ReadFile")).setFileStateCache(fileStateCache);
-        ((com.agent.tool.impl.EditFileTool) toolRegistry.getTool("EditFile")).setFileHistory(fileHistory);
-        ((com.agent.tool.impl.EditFileTool) toolRegistry.getTool("EditFile")).setFileStateCache(fileStateCache);
-        ((com.agent.tool.impl.WriteFileTool) toolRegistry.getTool("WriteFile")).setFileHistory(fileHistory);
-        ((com.agent.tool.impl.WriteFileTool) toolRegistry.getTool("WriteFile")).setFileStateCache(fileStateCache);
+        ((ReadFileTool) toolRegistry.getTool("ReadFile")).setFileStateCache(fileStateCache);
+        ((EditFileTool) toolRegistry.getTool("EditFile")).setFileHistory(fileHistory);
+        ((EditFileTool) toolRegistry.getTool("EditFile")).setFileStateCache(fileStateCache);
+        ((WriteFileTool) toolRegistry.getTool("WriteFile")).setFileHistory(fileHistory);
+        ((WriteFileTool) toolRegistry.getTool("WriteFile")).setFileStateCache(fileStateCache);
     }
 
     /** /compact — 手动压缩上下文（后台执行，避免阻塞渲染循环）。 */
@@ -1485,7 +1503,7 @@ public class TerminalUI implements SkillForkHost {
                         + (e.getMessage() == null ? e.toString() : e.getMessage())));
             } finally {
                 streaming = false;
-                pendingPermission = null;
+                clearPendingPermissions();
                 scrollToBottom();
                 needsRedraw = true;
             }
@@ -1597,6 +1615,14 @@ public class TerminalUI implements SkillForkHost {
                         pr.future().get(5, TimeUnit.MINUTES);
                     } catch (Exception e) {
                         pr.future().complete(PermissionResponse.DENY);
+                    }
+                } else if (ev instanceof AgentEvent.AskUserRequestEvent aq) {
+                    // 子 Agent 的问卷复用同一套全屏问卷（主输入线程应答）
+                    handleAskUserRequest(aq);
+                    try {
+                        aq.future().get(5, TimeUnit.MINUTES);
+                    } catch (Exception e) {
+                        aq.future().complete(Map.of());
                     }
                 } else if (ev instanceof AgentEvent.ErrorEvent e) {
                     appendMessage(UIMessage.error("│ " + e.message()));
@@ -1774,6 +1800,7 @@ public class TerminalUI implements SkillForkHost {
                     needsRedraw = true;
                 }
                 case AgentEvent.PermissionRequestEvent pr -> handlePermissionRequest(pr);
+                case AgentEvent.AskUserRequestEvent aq -> handleAskUserRequest(aq);
                 case AgentEvent.TurnComplete t -> { /* 后端当前未发送，预留 */ }
                 case AgentEvent.LoopComplete lc -> {
                     finishLoop(lc.totalTurns());
@@ -1818,9 +1845,25 @@ public class TerminalUI implements SkillForkHost {
         needsRedraw = true;
     }
 
-    /** 收到权限询问：在对话区渲染问题并挂起等待用户按键（y/a/n）。 */
+    /**
+     * 收到权限询问：先入队。队列为空（当前无激活请求）时立即激活并渲染；
+     * 若已有请求在等，则排队——答完当前请求后会自动激活并显示下一条。
+     * 避免多个并发工具同时要权限时，后到的请求覆盖先到的导致无人应答、Agent 永久等待。
+     */
     private void handlePermissionRequest(AgentEvent.PermissionRequestEvent pr) {
-        pendingPermission = pr;
+        boolean activate;
+        synchronized (permissionQueue) {
+            permissionQueue.add(pr);
+            activate = pendingPermission == null;
+            if (activate) {
+                pendingPermission = pr;
+            }
+        }
+        if (activate) showPermissionPrompt(pr);
+    }
+
+    /** 渲染一条权限询问消息（只在它成为当前待答请求时调用一次）。 */
+    private void showPermissionPrompt(AgentEvent.PermissionRequestEvent pr) {
         synchronized (messages) {
             // 移除空的流式占位，让权限问题紧跟工具调用显示
             if (!messages.isEmpty() && messages.getLast().streaming()
@@ -1830,6 +1873,170 @@ public class TerminalUI implements SkillForkHost {
             messages.add(UIMessage.permissionRequest(pr.toolName(), pr.description()));
         }
         scrollToBottom();
+        needsRedraw = true;
+    }
+
+    /**
+     * 收到结构化问卷（AskUserQuestion）：移除空的流式占位后在对话区登记提示，
+     * 然后激活全屏问卷状态——后续按键由 inputLoop 路由到 confirm/编辑方法，
+     * 主线程 render() 检测 pendingAsk 改绘问卷界面。
+     */
+    private void handleAskUserRequest(AgentEvent.AskUserRequestEvent aq) {
+        synchronized (messages) {
+            if (!messages.isEmpty() && messages.getLast().streaming()
+                    && streamAccum.isEmpty() && thinkingAccum.isEmpty()) {
+                messages.remove(messages.size() - 1);
+            }
+            int n = aq.questions().size();
+            messages.add(UIMessage.system(
+                    CYAN + "❓ " + RESET + "DeveCode is asking you "
+                            + n + (n == 1 ? " question" : " questions")
+                            + GRAY + " — Esc to dismiss" + RESET));
+        }
+        pendingAsk = new AskUserRequestState(aq);
+        scrollToBottom();
+        needsRedraw = true;
+    }
+
+    /** 确认当前问题答案：选项题需先选中；全部答完后完成 future 并释放问卷态。 */
+    private void confirmAskCurrent() {
+        AskUserRequestState st = pendingAsk;
+        if (st == null) return;
+        Map<String, String> result = null;
+        String transcript = null;
+        synchronized (st) {
+            var qs = st.event.questions();
+            if (st.current < 0 || st.current >= qs.size()) return;
+            var q = qs.get(st.current);
+            String answer;
+            String typed = st.textAnswer.strip();
+            if (!typed.isEmpty()) {
+                // 自定义文本优先：选项题也可以直接输入自己的答案
+                answer = typed;
+            } else if (!q.options().isEmpty()
+                    && st.selectedOption >= 0 && st.selectedOption < q.options().size()) {
+                answer = q.options().get(st.selectedOption).label();
+            } else {
+                return; // 既没选中选项也没输入内容，Enter 不产生效果
+            }
+            st.answers.set(st.current, answer);
+            if (st.current + 1 < qs.size()) {
+                // 还有下一题：进入下一题
+                st.current++;
+                st.selectedOption = -1;
+                st.textAnswer = "";
+                st.customInput = qs.get(st.current).options().isEmpty();
+            } else {
+                // 全部答完：释放问卷态，把答案映射交回阻塞等待的 StreamingExecutor
+                result = new LinkedHashMap<>();
+                var sb = new StringBuilder();
+                for (int i = 0; i < qs.size(); i++) {
+                    result.put(String.valueOf(i + 1), st.answers.get(i));
+                    if (i > 0) sb.append('\n');
+                    sb.append("  ").append(i + 1).append(". ").append(qs.get(i).question())
+                      .append('\n').append("     ").append(GREEN).append("→ ").append(RESET)
+                      .append(WHITE).append(st.answers.get(i)).append(RESET);
+                }
+                transcript = sb.toString();
+                pendingAsk = null;
+                st.event.future().complete(result);
+            }
+        }
+        if (transcript != null) {
+            appendMessage(UIMessage.system(GRAY + "❓ answers recorded" + RESET + "\n" + transcript));
+            scrollToBottom();
+        }
+        needsRedraw = true;
+    }
+
+    /** 用户取消整份问卷：以空 Map 完成 future（执行端按“拒绝回答”处理）。 */
+    private void cancelAsk() {
+        AskUserRequestState st = pendingAsk;
+        if (st == null) return;
+        synchronized (st) {
+            pendingAsk = null;
+            st.event.future().complete(Map.of());
+        }
+        appendMessage(UIMessage.system(YELLOW + "✋ Question dialog cancelled" + RESET));
+        scrollToBottom();
+        needsRedraw = true;
+    }
+
+    /**
+     * 问卷对话框内的按键处理：
+     * - Tab：在「选选项」与「自定义输入」两种模式间切换（自定义输入模式下数字也会进入文本框）；
+     * - 选项模式下数字 1-6 选择选项；
+     * - 自定义输入模式 / 纯文本题：任意可打印字符（含数字/CJK/符号）都进入文本框；
+     * - 选项模式下输入任意非数字字符：自动切到自定义输入并输入该字符。
+     */
+    private void handleAskPrintable(int ch) {
+        AskUserRequestState st = pendingAsk;
+        if (st == null) return;
+        synchronized (st) {
+            var qs = st.event.questions();
+            if (st.current < 0 || st.current >= qs.size()) return;
+            var q = qs.get(st.current);
+            boolean hasOptions = !q.options().isEmpty();
+            if (ch == '\t' && hasOptions) {
+                // Tab 切换模式：进入自定义输入时清掉已选选项（准备接收纯文本）
+                st.customInput = !st.customInput;
+                if (st.customInput) st.selectedOption = -1;
+            } else if (!hasOptions || st.customInput) {
+                // 纯文本题，或已切到自定义输入：数字也按文本处理
+                if (ch == '\t') ch = ' ';
+                if (ch >= 32) {
+                    if (st.textAnswer.length() < 1000) {
+                        st.textAnswer += (char) ch;
+                        if (hasOptions) st.selectedOption = -1;
+                    }
+                }
+            } else if (hasOptions && ch >= '1' && ch <= '9') {
+                // 选项模式：数字选择选项，并清空已有文本避免两个答案并存
+                int idx = ch - '1';
+                if (idx < q.options().size()) {
+                    st.selectedOption = idx;
+                    st.textAnswer = "";
+                    // 选中的是"自由输入/其它/自定义"类选项 → 自动切到自定义输入，数字不再当作选项
+                    if (isFreeTextOptionLabel(q.options().get(idx).label())) {
+                        st.selectedOption = -1;
+                        st.customInput = true;
+                    }
+                }
+            } else if (ch >= 32) {
+                // 选项模式下按了非数字字符 → 自动进入自定义输入
+                st.customInput = true;
+                if (st.textAnswer.length() < 1000) {
+                    st.textAnswer += (char) ch;
+                    st.selectedOption = -1;
+                }
+            }
+        }
+        needsRedraw = true;
+    }
+
+    /** 判断选项是否表达了"让我自己输入"的语义（命中即自动进入自定义输入模式）。 */
+    private static boolean isFreeTextOptionLabel(String label) {
+        if (label == null) return false;
+        String l = label.toLowerCase(Locale.ROOT);
+        return l.contains("自由输入") || l.contains("自由填写") || l.contains("自定义")
+                || l.contains("其它") || l.contains("其他") || l.contains("请输入")
+                || l.contains("other") || l.contains("custom") || l.contains("free text")
+                || l.contains("free input");
+    }
+
+    /** 问卷自定义文本的退格（无论当前题是否带选项，退格即进入/保持在自定义输入）。 */
+    private void askBackspace() {
+        AskUserRequestState st = pendingAsk;
+        if (st == null) return;
+        synchronized (st) {
+            if (st.current >= 0 && st.current < st.event.questions().size()
+                    && !st.textAnswer.isEmpty()) {
+                st.textAnswer = st.textAnswer.substring(0, st.textAnswer.length() - 1);
+                if (!st.event.questions().get(st.current).options().isEmpty()) {
+                    st.customInput = true;
+                }
+            }
+        }
         needsRedraw = true;
     }
 
@@ -1867,15 +2074,38 @@ public class TerminalUI implements SkillForkHost {
 
     /** 回答挂起的权限询问（由 inputLoop 的按键直接调用）。 */
     private void answerPermission(PermissionResponse response, String label) {
-        AgentEvent.PermissionRequestEvent pr = pendingPermission;
-        pendingPermission = null;
-        if (pr == null) return;
+        AgentEvent.PermissionRequestEvent pr;
+        AgentEvent.PermissionRequestEvent next;
+        synchronized (permissionQueue) {
+            pr = pendingPermission;
+            if (pr == null) return;
+            permissionQueue.remove(pr);
+            next = permissionQueue.peek();
+            pendingPermission = next;
+        }
         pr.future().complete(response);
         String verdict = response == PermissionResponse.DENY
                 ? RED + "denied" + RESET
                 : GREEN + label + RESET;
         appendMessage(UIMessage.system(GRAY + "  ↳ " + RESET + verdict));
+        // 还有排队的请求：激活下一条并显示（此前它只是排队、未渲染）
+        if (next != null) {
+            showPermissionPrompt(next);
+        }
         needsRedraw = true;
+    }
+
+    /** 一轮结束 / 被中断时清理所有未应答的权限请求：统一按 DENY 完成，解除等待中的工具线程。 */
+    private void clearPendingPermissions() {
+        List<AgentEvent.PermissionRequestEvent> pending;
+        synchronized (permissionQueue) {
+            pending = new ArrayList<>(permissionQueue);
+            permissionQueue.clear();
+            pendingPermission = null;
+        }
+        for (var p : pending) {
+            p.future().complete(PermissionResponse.DENY);
+        }
     }
 
     /** 若当前末尾不是流式占位消息，则添加一个（新一轮 LLM 输出开始时调用）。 */
@@ -2007,10 +2237,16 @@ public class TerminalUI implements SkillForkHost {
                     // 30ms 超时区分"独立 Esc 键"和"转义序列首字节"
                     int c2 = reader.read(30L);
                     if (c2 == NonBlockingReader.READ_EXPIRED) {
-                        if (activePicker != null) {
+                        if (pendingAsk != null) {
+                            // 问卷对话框激活：Esc 取消整份问卷
+                            cancelAsk();
+                        } else if (activePicker != null) {
                             // 选择器激活：Esc 取消选择，返回对话界面
                             activePicker = null;
                             needsRedraw = true;
+                        } else if (pendingPermission != null) {
+                            // 权限等待中：Esc = 拒绝当前请求（解开等待的工具线程，而不是挂起整个 agent）
+                            answerPermission(PermissionResponse.DENY, "denied");
                         } else if (streaming) {
                             // 独立 Esc：流式期间中断当前 agent 循环
                             interruptAgent();
@@ -2038,12 +2274,12 @@ public class TerminalUI implements SkillForkHost {
                             case "A" -> {
                                 if (activePicker != null) movePicker(-1);
                                 else if (!currentCommandCandidates().isEmpty()) moveCommandHint(-1);
-                                else if (!streaming) { scrollOffset++; needsRedraw = true; }
+                                else if (!streaming) arrowUp();
                             }
                             case "B" -> {
                                 if (activePicker != null) movePicker(1);
                                 else if (!currentCommandCandidates().isEmpty()) moveCommandHint(1);
-                                else if (!streaming) { scrollOffset = Math.max(0, scrollOffset - 1); needsRedraw = true; }
+                                else if (!streaming) arrowDown();
                             }
                             case "C" -> handleCursorRight();
                             case "D" -> handleCursorLeft();
@@ -2066,12 +2302,12 @@ public class TerminalUI implements SkillForkHost {
                             case 'A' -> {
                                 if (activePicker != null) movePicker(-1);
                                 else if (!currentCommandCandidates().isEmpty()) moveCommandHint(-1);
-                                else if (!streaming) { scrollOffset++; needsRedraw = true; }
+                                else if (!streaming) arrowUp();
                             }
                             case 'B' -> {
                                 if (activePicker != null) movePicker(1);
                                 else if (!currentCommandCandidates().isEmpty()) moveCommandHint(1);
-                                else if (!streaming) { scrollOffset = Math.max(0, scrollOffset - 1); needsRedraw = true; }
+                                else if (!streaming) arrowDown();
                             }
                             case 'C' -> handleCursorRight();
                             case 'D' -> handleCursorLeft();
@@ -2084,7 +2320,8 @@ public class TerminalUI implements SkillForkHost {
 
                     // Alt+Enter: ESC CR or ESC LF
                     if (c2 == '\r' || c2 == '\n') {
-                        insertNewline();
+                        // 问卷对话框中的文本答案是单行输入，Alt+Enter 不进入底层输入框
+                        if (pendingAsk == null) insertNewline();
                         continue;
                     }
 
@@ -2094,11 +2331,19 @@ public class TerminalUI implements SkillForkHost {
 
                 // --- Control characters ---
                 if (ch == '\r' || ch == '\n') {
-                    handleEnter();
+                    if (pendingAsk != null) {
+                        confirmAskCurrent();
+                    } else {
+                        handleEnter();
+                    }
                     continue;
                 }
                 if (ch == '\b' || ch == 127) {
-                    handleBackspace();
+                    if (pendingAsk != null) {
+                        askBackspace();
+                    } else {
+                        handleBackspace();
+                    }
                     needsRedraw = true;
                     continue;
                 }
@@ -2126,6 +2371,11 @@ public class TerminalUI implements SkillForkHost {
 
                 // --- Printable characters (incl. CJK) ---
                 if (ch >= 32 || ch == '\t') {
+                    if (pendingAsk != null) {
+                        // 问卷对话框激活：数字选答案 / 自由文本输入 / q 取消
+                        handleAskPrintable(ch);
+                        continue;
+                    }
                     if (activePicker != null) {
                         // 选择器激活：q 取消，其余按键不进入输入框
                         if (ch == 'q' || ch == 'Q') {
@@ -2177,13 +2427,89 @@ public class TerminalUI implements SkillForkHost {
             }
             String text = inputBuffer.toString();
             if (!text.isBlank()) {
-                inputHistory.add(text);
+                historyStore.append(text);
+                historyIndex = -1;
+                historyDraft = "";
             }
             eventQueue.add(new UIEvent.Submit(text));
         }
     }
 
+    /** ↑：从当前输入回退到上一条历史（-1 表示从自由编辑态出发，先保存草稿）。 */
+    private void historyUp() {
+        navigateHistory(1);
+    }
+
+    /** ↓：前进到更新的历史；已到最新一条时恢复按下 ↑ 前的草稿。 */
+    private void historyDown() {
+        navigateHistory(-1);
+    }
+
+    /**
+     * ↑：输入框有内容（含正在翻历史）→ 翻输入历史；输入框为空 → 向上滚动对话。
+     */
+    private void arrowUp() {
+        if (historyIndex >= 0 || !inputBuffer.isEmpty()) {
+            historyUp();
+            return;
+        }
+        scrollOffset++;
+        needsRedraw = true;
+    }
+
+    /** ↓：输入框有内容（含正在翻历史）→ 翻输入历史；输入框为空 → 向下滚动对话。 */
+    private void arrowDown() {
+        if (historyIndex >= 0 || !inputBuffer.isEmpty()) {
+            historyDown();
+            return;
+        }
+        scrollOffset = Math.max(0, scrollOffset - 1);
+        needsRedraw = true;
+    }
+
+    /**
+     * 历史浏览核心：
+     * historyIndex 0=最新一条，正值越往旧；-1 = 自由编辑态。
+     * ↑（delta=+1）从 -1 出发先存草稿再跳到最新；↓（delta=-1）越过 0 后回 -1 并恢复草稿。
+     * 到最旧一条后继续 ↑ 停在原地（不循环，避免误覆盖用户内容）。
+     */
+    private void navigateHistory(int delta) {
+        List<String> entries = historyStore.getEntries();
+        if (entries.isEmpty()) return;
+        if (historyIndex == -1 && delta < 0) return; // 自由编辑态按 ↓ 无意义
+
+        if (historyIndex == -1) {
+            historyDraft = inputBuffer.toString();
+        }
+        int next = historyIndex + delta;
+        if (next < 0) {
+            // ↓ 越过最新 → 回到自由编辑态，恢复最初草稿
+            historyIndex = -1;
+            String draft = historyDraft;
+            historyDraft = "";
+            setInputFromHistory(draft);
+        } else if (next >= entries.size()) {
+            // 已是最旧一条，↑ 停在原地
+            return;
+        } else {
+            historyIndex = next;
+            // 列表按时间从旧到新排列，index 从 0(最新) 起算，因此取倒数第 index+1 条
+            setInputFromHistory(entries.get(entries.size() - 1 - historyIndex));
+        }
+        needsRedraw = true;
+    }
+
+    /** 用历史/草稿文本整体替换输入框，光标移到末尾。 */
+    private void setInputFromHistory(String text) {
+        inputBuffer.setLength(0);
+        inputBuffer.append(text);
+        cursorRow = 0;
+        cursorCol = 0;
+        handleEnd();
+    }
+
     private void insertNewline() {
+        if (historyIndex >= 0) historyIndex = -1;
         inputBuffer.insert(linearPos(), '\n');
         cursorRow++;
         cursorCol = 0;
@@ -2224,6 +2550,7 @@ public class TerminalUI implements SkillForkHost {
     }
 
     private void handleDelete() {
+        if (historyIndex >= 0) historyIndex = -1;
         int pos = linearPos();
         if (pos < inputBuffer.length()) {
             inputBuffer.deleteCharAt(pos);
@@ -2268,6 +2595,15 @@ public class TerminalUI implements SkillForkHost {
         if (activePicker != null) {
             buf.append(CLEAR).append(HOME);
             renderPicker(buf, termWidth, termHeight);
+            writer.print(buf.toString());
+            writer.flush();
+            return;
+        }
+
+        // 结构化问卷激活时：覆盖正常界面，只渲染问卷对话框
+        if (pendingAsk != null) {
+            buf.append(CLEAR).append(HOME);
+            renderAskDialog(buf, termWidth, termHeight);
             writer.print(buf.toString());
             writer.flush();
             return;
@@ -2466,7 +2802,7 @@ public class TerminalUI implements SkillForkHost {
             buf.append(BOLD).append("> ").append(RESET);
 
             if (inputBuffer.isEmpty() && !streaming) {
-                buf.append(DIM).append("Send a message, or ctrl + c to quit, ctrl + p to toggle panel").append(RESET);
+                buf.append(DIM).append("Send a message · ↑↓ history/scroll · Ctrl+C quit · Ctrl+P panel").append(RESET);
                 moveTo(buf, topRow + 1, 3);
                 buf.append(CURSOR_SHOW);
             } else if (inputBuffer.isEmpty() && streaming && pendingPermission != null) {
@@ -2968,6 +3304,164 @@ public class TerminalUI implements SkillForkHost {
         if (w != null && w > 0) termWidth = w;
     }
 
+    /**
+     * 渲染全屏问卷对话框（AskUserQuestion）。
+     *
+     * 布局：顶部标题 → 分隔线 → 已答问题摘要 → 当前问题（选项编号列表或自由文本输入行）→
+     * 底部操作提示。全部状态在 synchronized(state) 下一次性快照，避免与按键线程竞争。
+     */
+    private void renderAskDialog(StringBuilder buf, int w, int h) {
+        AskUserRequestState st = pendingAsk;
+        if (st == null) return;
+
+        List<AgentEvent.AskUserRequestEvent.Question> qs;
+        List<String> answers;
+        int current;
+        int selected;
+        String textAnswer;
+        boolean customInput;
+        synchronized (st) {
+            qs = st.event.questions();
+            answers = List.copyOf(st.answers);
+            current = st.current;
+            selected = st.selectedOption;
+            textAnswer = st.textAnswer;
+            customInput = st.customInput;
+        }
+
+        int n = qs.size();
+        int y = 0;
+        int safeW = Math.max(24, w);
+
+        // ── 标题行 ──
+        moveTo(buf, y, 0);
+        buf.append("\033[K");
+        buf.append(BOLD).append(CYAN).append("❓ AskUserQuestion").append(RESET)
+           .append(GRAY).append("   ·   ").append(n).append(n == 1 ? " question" : " questions")
+           .append("   ·   Esc cancel").append(RESET);
+        y++;
+        moveTo(buf, y, 0);
+        buf.append("\033[K");
+        buf.append(GRAY).append(repeat('─', Math.min(safeW - 2, 72))).append(RESET);
+        y++;
+        y++;
+
+        int bottom = h - 3; // 底部保留 2 行提示 + 1 行边距
+
+        // ── 已答问题摘要 ──
+        for (int i = 0; i < Math.min(current, n); i++) {
+            if (y >= bottom) break;
+            String ans = i < answers.size() ? answers.get(i) : "";
+            moveTo(buf, y, 0);
+            buf.append("\033[K");
+            buf.append("  ").append(GRAY).append("[").append(i + 1).append("/").append(n).append("]").append(RESET)
+               .append(GREEN).append(" ✓ ").append(RESET)
+               .append(GRAY).append("answer: ").append(RESET)
+               .append(truncate(ans, Math.max(10, safeW - 22)));
+            y++;
+        }
+        if (y > 4) y++;
+
+        // ── 当前问题 ──
+        if (current >= 0 && current < n && y < bottom) {
+            var q = qs.get(current);
+            moveTo(buf, y, 0);
+            buf.append("\033[K");
+            buf.append("  ").append(YELLOW).append("● ").append(RESET)
+               .append(GRAY).append("Question ").append(current + 1).append("/").append(n).append(RESET);
+            y++;
+
+            String header = q.header() == null ? "" : q.header().strip();
+            if (!header.isEmpty() && y < bottom) {
+                moveTo(buf, y, 0);
+                buf.append("\033[K");
+                buf.append("     ").append(BOLD).append(CYAN).append(truncate(header, safeW - 10)).append(RESET);
+                y++;
+            }
+
+            String question = q.question() == null ? "" : q.question().strip();
+            int rows = 0;
+            for (String line : UIMessage.wrapText(question, Math.max(16, safeW - 8))) {
+                if (y >= bottom || rows >= 3) break;
+                moveTo(buf, y, 0);
+                buf.append("\033[K");
+                buf.append("     ").append(BOLD).append(truncate(line, safeW - 6)).append(RESET);
+                y++;
+                rows++;
+            }
+            y++;
+
+            if (!q.options().isEmpty() && y < bottom) {
+                // 选项列表预留至少 1 行给下方的自定义输入框
+                int shown = Math.min(q.options().size(), Math.min(6, Math.max(1, bottom - y - 2)));
+                for (int oi = 0; oi < shown && y < bottom; oi++) {
+                    var opt = q.options().get(oi);
+                    boolean sel = oi == selected;
+                    moveTo(buf, y, 0);
+                    buf.append("\033[K");
+                    buf.append("     ").append(sel ? BOLD + WHITE + "● " + RESET : GRAY + "○ " + RESET);
+                    buf.append(GRAY).append(oi + 1).append(". ").append(RESET);
+                    buf.append(sel ? BOLD + WHITE : WHITE)
+                       .append(truncate(opt.label(), Math.max(10, safeW - 28))).append(RESET);
+                    y++;
+                    String desc = opt.description() == null ? "" : opt.description().strip();
+                    if (!desc.isEmpty() && y < bottom) {
+                        moveTo(buf, y, 0);
+                        buf.append("\033[K");
+                        buf.append("           ").append(DIM).append(truncate(desc, Math.max(10, safeW - 24))).append(RESET);
+                        y++;
+                    }
+                }
+                if (q.options().size() > shown && y < bottom) {
+                    moveTo(buf, y, 0);
+                    buf.append("\033[K");
+                    buf.append("     ").append(DIM)
+                       .append("… +").append(q.options().size() - shown).append(" more").append(RESET);
+                    y++;
+                }
+            }
+            // 自定义输入行：纯文本题与带选项的题都显示，用户可随时直接输入自己的答案
+            if (y < bottom) {
+                boolean optionQuestion = current >= 0 && current < n
+                        && !qs.get(current).options().isEmpty();
+                boolean typing = !optionQuestion || customInput
+                        || (textAnswer != null && !textAnswer.isEmpty());
+                moveTo(buf, y, 0);
+                buf.append("\033[K");
+                if (!typing) {
+                    // 选项模式、尚未输入：给出明确的"进入自定义输入"提示
+                    buf.append("     ").append(DIM)
+                       .append("[Tab] type your own answer").append(RESET);
+                } else {
+                    buf.append("     ").append(DIM).append("custom answer: ").append(RESET)
+                       .append(GREEN).append("> ").append(RESET)
+                       .append(truncate(textAnswer == null ? "" : textAnswer, Math.max(10, safeW - 24)))
+                       .append(REVERSE).append(' ').append(RESET);
+                }
+                y++;
+            }
+        }
+
+        // ── 底部操作提示 ──
+        int hintRow = Math.max(0, h - 2);
+        moveTo(buf, hintRow, 0);
+        buf.append("\033[K");
+        boolean hasOptions = current >= 0 && current < n
+                && !qs.get(current).options().isEmpty();
+        String hint = hasOptions
+                ? (customInput
+                    ? "Typing custom answer (digits ok) · Enter confirm · Tab to choose · Esc cancel"
+                    : "Press 1-" + qs.get(current).options().size()
+                            + " to choose · Tab to type custom · Enter confirm · Esc cancel")
+                : "Type your answer · Enter to confirm · Esc to cancel";
+        buf.append(DIM).append(truncate(hint, safeW)).append(RESET);
+
+        int footRow = Math.max(0, h - 1);
+        moveTo(buf, footRow, 0);
+        buf.append("\033[K");
+        buf.append(DIM).append("DeveCode · AskUserQuestion").append(RESET);
+    }
+
     // ═══════════════════════════════════════════════════════════════
     //  内部类
     // ═══════════════════════════════════════════════════════════════
@@ -3243,6 +3737,30 @@ public class TerminalUI implements SkillForkHost {
 
     /** 渲染行：text 含 ANSI 颜色码，style 预留（目前未使用） */
     private record RenderLine(String text, String style) {}
+
+    /**
+     * AskUserQuestion 问卷交互状态（单份问卷）。
+     *
+     * 跨线程访问约定：按键线程（inputLoop）通过 confirm/cancel/编辑方法修改状态，
+     * 主线程 render() 在 synchronized(this) 下做快照；answers 的修改同样受锁保护。
+     */
+    private final class AskUserRequestState {
+        final AgentEvent.AskUserRequestEvent event;
+        final List<String> answers; // 与 questions 平行；未答为 ""
+        int current;                // 当前题号（0-based）
+        int selectedOption = -1;    // 当前选项题选中的下标；-1=未选
+        String textAnswer = "";     // 当前自由文本题的输入
+        boolean customInput;        // true = 当前处于"自定义输入"模式（数字也进文本框）
+
+        AskUserRequestState(AgentEvent.AskUserRequestEvent event) {
+            this.event = event;
+            var list = new ArrayList<String>();
+            for (int i = 0; i < event.questions().size(); i++) list.add("");
+            this.answers = list;
+            this.customInput = !event.questions().isEmpty()
+                    && event.questions().getFirst().options().isEmpty();
+        }
+    }
 
     /**
      * 输入线程 → 主线程的事件（密封接口）。
