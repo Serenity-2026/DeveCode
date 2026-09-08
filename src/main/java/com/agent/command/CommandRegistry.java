@@ -356,6 +356,13 @@ public class CommandRegistry {
                 null
         );
 
+
+        // /change (LOCAL_UI) — 按 sessionId / 会话名（首条消息）直接切换会话
+        register(
+                new Command("change", "Switch to a session by ID or name",
+                        new String[]{}, CommandType.LOCAL_UI, false),
+                null
+        );
         // /rewind (LOCAL_UI)
         register(
                 new Command("rewind", "Rewind to a previous checkpoint",

@@ -893,6 +893,7 @@ public class TerminalUI implements SkillForkHost {
             case "compact" -> doCompact();
             case "plan" -> doPlan();
             case "resume" -> doResume(args);
+            case "change" -> doChange(args);
             case "rewind" -> doRewind();
             case "skill" -> doSkill(args);
             default -> appendMessage(UIMessage.system(GRAY
@@ -1152,7 +1153,73 @@ public class TerminalUI implements SkillForkHost {
             resumeSession(sessions.getFirst());
             return;
         }
-        // 多个会话：打开全屏选择器
+        openSessionPicker(sessions);
+    }
+
+    /**
+     * /change <SessionName> — 切换到指定的既有会话。
+     *
+     * 匹配优先级：
+     *   1. sessionId 精确匹配（大小写不敏感）；
+     *   2. 首条消息（会话的"显示名"）精确匹配；
+     *   3. 包含匹配；命中 1 条直接切换，多条弹选择器，0 条提示未找到。
+     */
+    private void doChange(String args) {
+        if (streaming) {
+            appendMessage(UIMessage.system(YELLOW
+                    + "Cannot change session while streaming." + RESET));
+            scrollToBottom();
+            return;
+        }
+        String query = args == null ? "" : args.strip();
+        if (query.isEmpty()) {
+            appendMessage(UIMessage.system(YELLOW
+                    + "Usage: /change <sessionId | session name>" + RESET + GRAY
+                    + " — e.g. /change 20260908-183000-abcd or /change 冒泡排序实现" + RESET));
+            scrollToBottom();
+            return;
+        }
+        List<SessionManager.SessionInfo> sessions = SessionManager.listSessions(workDir);
+        if (sessions.isEmpty()) {
+            appendMessage(UIMessage.system(GRAY
+                    + "No saved sessions found in .devecode/sessions/" + RESET));
+            scrollToBottom();
+            return;
+        }
+        // 优先级 1：sessionId 精确匹配
+        for (var s : sessions) {
+            if (s.id().equalsIgnoreCase(query)) {
+                resumeSession(s);
+                return;
+            }
+        }
+        // 优先级 2：会话名（首条消息）精确匹配
+        for (var s : sessions) {
+            if (!s.firstMessage().isEmpty() && s.firstMessage().equalsIgnoreCase(query)) {
+                resumeSession(s);
+                return;
+            }
+        }
+        // 优先级 3：包含匹配
+        var matches = sessions.stream()
+                .filter(s -> SessionManager.matchesSearch(s, query))
+                .toList();
+        if (matches.isEmpty()) {
+            appendMessage(UIMessage.system(RED
+                    + "No session found matching \"" + query + "\"" + RESET + GRAY
+                    + " — use /resume to list all saved sessions" + RESET));
+            scrollToBottom();
+            return;
+        }
+        if (matches.size() == 1) {
+            resumeSession(matches.getFirst());
+            return;
+        }
+        openSessionPicker(matches);
+    }
+
+    /** 打开全屏会话选择器（/resume 无参/多结果、/change 多结果共用）。 */
+    private void openSessionPicker(List<SessionManager.SessionInfo> sessions) {
         List<PickerItem> items = new ArrayList<>();
         for (var s : sessions) {
             String first = s.firstMessage().isEmpty() ? "(no messages)" : s.firstMessage();
