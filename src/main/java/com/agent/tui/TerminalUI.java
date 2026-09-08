@@ -1,5 +1,7 @@
 package com.agent.tui;
 
+import static com.agent.tui.TuiStyle.*;
+
 import com.agent.agent.Agent;
 import com.agent.agent.AgentEvent;
 import com.agent.command.Command;
@@ -96,30 +98,22 @@ import com.sun.management.OperatingSystemMXBean;
  */
 public class TerminalUI implements SkillForkHost {
 
-    private static final String APP_NAME    = "DeveCode";
-    private static final String APP_VERSION = "v1.0.0";
-
-    // ── 右侧状态面板 ──
-    private static final int PANEL_WIDTH = 36;
-    private static final int PANEL_MIN_COLS = 100;  // 终端宽度 >= 此值才显示面板
-    private static final long PANEL_REFRESH_MS = 1000;  // 面板周期刷新间隔（CPU/Context 实时更新）
-    private static final int MAX_COMMAND_HINTS = 8;  // 命令提示面板最多显示的候选条数
-
     // ── 终端 ──
     private final Terminal terminal;
     private final PrintWriter writer;
+    private final ScreenRenderer renderer;
 
     // ── 应用状态（外部依赖）──
-    private final ProviderConfig provider;       // 当前选中的 provider 配置
+    final ProviderConfig provider;               // 当前选中的 provider 配置
     private final LlmClient client;              // LLM 流式客户端（由 Agent 使用）
-    private final ConversationManager conversation; // 对话历史管理器
-    private final ToolRegistry toolRegistry;     // 工具注册中心
+    final ConversationManager conversation;      // 对话历史管理器
+    final ToolRegistry toolRegistry;             // 工具注册中心
     private FileHistory fileHistory;             // 文件编辑历史（备份/快照/回退，随会话切换重建）
     private final FileStateCache fileStateCache; // 先读后改强制缓存
-    private final PermissionChecker permissionChecker; // 多层权限裁决器
+    final PermissionChecker permissionChecker;   // 多层权限裁决器
     private final HookEngine hookEngine;         // Hook 引擎（生命周期钩子）
     private final Agent agent;                   // 后端 agent（事件驱动）
-    private volatile String sessionId;           // 会话 ID（session 包持久化 / 快照目录 / 面板显示）
+    volatile String sessionId;                   // 会话 ID（session 包持久化 / 快照目录 / 面板显示）
     private final String workDir;                // 工作目录（session/memory/command 存储根）
 
     // ── 上下文管理（session 包）：.devecode/sessions/<id>.jsonl 持久化 ──
@@ -141,33 +135,33 @@ public class TerminalUI implements SkillForkHost {
     private String loadedMemoryReminder = "";
 
     // ── 全屏选择器（/resume 会话列表、/rewind 快照列表）──
-    private volatile PickerState activePicker;   // null = 无选择器，正常对话界面
-    private volatile int pickerIndex;            // 当前选中项（循环导航）
+    volatile PickerState activePicker;           // null = 无选择器，正常对话界面
+    volatile int pickerIndex;                    // 当前选中项（循环导航）
 
     // ── 命令提示（输入 / 时实时过滤候选命令）──
-    private volatile int commandHintIndex = 0;     // 当前选中候选（循环导航）
-    private volatile String hintTokenCache = null; // 上次计算候选时的命令 token（变化时重置索引）
+    volatile int commandHintIndex = 0;           // 当前选中候选（循环导航）
+    volatile String hintTokenCache = null;       // 上次计算候选时的命令 token（变化时重置索引）
 
     // ── 手动压缩进行中标志（/compact 后台执行期间禁止提交）──
     private volatile boolean compacting = false;
 
     // ── MCP（providers.yaml mcp_servers 段）──
     private final McpManager mcpManager;                    // null = 未配置任何 MCP server
-    private final List<McpManager.ServerInfo> mcpServers = new ArrayList<>(); // 已连接的 server
-    private final Map<String, Integer> mcpToolCounts = new LinkedHashMap<>(); // server 名 → 注册工具数
-    private final List<String> mcpErrors = new ArrayList<>();                 // 连接失败的错误
+    final List<McpManager.ServerInfo> mcpServers = new ArrayList<>(); // 已连接的 server
+    final Map<String, Integer> mcpToolCounts = new LinkedHashMap<>(); // server 名 → 注册工具数
+    final List<String> mcpErrors = new ArrayList<>();                 // 连接失败的错误
 
     // ── system prompt（prompt 包组装）──
     private final String systemPrompt;
 
     // ── 消息记录 ──
-    private final List<UIMessage> messages = new ArrayList<>();
-    private volatile int scrollOffset = 0;
+    final List<UIMessage> messages = new ArrayList<>();
+    volatile int scrollOffset = 0;
 
    // ── 输入状态 ──
-   private final StringBuilder inputBuffer = new StringBuilder();
-   private int cursorCol = 0;
-   private int cursorRow = 0;  // 多行光标行号（相对于输入第一行）
+   final StringBuilder inputBuffer = new StringBuilder();
+   int cursorCol = 0;
+   int cursorRow = 0;  // 多行光标行号（相对于输入第一行）
 
     // ── 输入历史（HistoryStore：~/.devecode/prompt_history.jsonl 持久化）──
     private final HistoryStore historyStore;
@@ -175,61 +169,40 @@ public class TerminalUI implements SkillForkHost {
     private String historyDraft = ""; // 按下 ↑ 之前输入框原有内容，↓ 回到底部时恢复
 
     // ── 流式状态 ──
-    private volatile boolean streaming = false;
-    private final StringBuilder streamAccum = new StringBuilder();
-    private final StringBuilder thinkingAccum = new StringBuilder();
-    private volatile boolean firstTokenReceived = false;
-    private long streamStartMs;
+    volatile boolean streaming = false;
+    final StringBuilder streamAccum = new StringBuilder();
+    final StringBuilder thinkingAccum = new StringBuilder();
+    volatile boolean firstTokenReceived = false;
+    long streamStartMs;
     private long firstTokenMs;
 
     // ── 权限询问（Agent → UI）：并发工具可能同时触发多条请求，排队逐条应答 ──
     private final Queue<AgentEvent.PermissionRequestEvent> permissionQueue = new LinkedList<>();
-    private volatile AgentEvent.PermissionRequestEvent pendingPermission; // 当前待应答请求（=队首）
+    volatile AgentEvent.PermissionRequestEvent pendingPermission; // 当前待应答请求（=队首）
 
-    // ── 结构化问卷（AskUserQuestion → UI，全屏对话框）──
-    private volatile AskUserRequestState pendingAsk;
+    // ── 结构化问卷（AskUserQuestion → UI，全屏对话框，状态机已抽到 AskUserDialog）──
+    volatile AskUserDialog pendingAsk;
 
     // ── token 用量（UsageEvent 累计）──
-    private volatile int usageInTokens;
-    private volatile int usageOutTokens;
+    volatile int usageInTokens;
+    volatile int usageOutTokens;
 
     // ── 控制 ──
     private volatile boolean running = true;
     private volatile boolean needsRedraw = true;
     private volatile boolean terminalResized = false;
-    private volatile boolean panelVisible = true;  // 右侧状态面板开关 (Ctrl+P 切换)
+    volatile boolean panelVisible = true;          // 右侧状态面板开关 (Ctrl+P 切换)
 
     // ── 系统监控 ──
-    private final OperatingSystemMXBean osBean =
+    final OperatingSystemMXBean osBean =
             ManagementFactory.getPlatformMXBean(OperatingSystemMXBean.class);
 
     // ── 终端尺寸（每次渲染前刷新）──
-    private int termWidth = 80;
-    private int termHeight = 24;
+    int termWidth = 80;
+    int termHeight = 24;
 
     // ── 事件队列（输入线程 → 主线程）──
     private final BlockingQueue<UIEvent> eventQueue = new LinkedBlockingQueue<>();
-
-    // ── ANSI ──
-    private static final String ESC = "\033";
-    private static final String CLEAR   = ESC + "[2J";
-    private static final String HOME    = ESC + "[H";
-    private static final String CURSOR_HIDE = ESC + "[?25l";
-    private static final String CURSOR_SHOW = ESC + "[?25h";
-    private static final String RESET   = ESC + "[0m";
-    private static final String BOLD    = ESC + "[1m";
-    private static final String DIM     = ESC + "[2m";
-    private static final String ITALIC  = ESC + "[3m";
-    private static final String RED     = ESC + "[31m";
-    private static final String GREEN   = ESC + "[32m";
-    private static final String YELLOW  = ESC + "[33m";
-    private static final String CYAN    = ESC + "[36m";
-    private static final String GRAY    = ESC + "[90m";
-    private static final String WHITE   = ESC + "[97m";
-    private static final String REVERSE = ESC + "[7m";
-
-    // ── 边框专用色：256 色亮天蓝 (75)，与欢迎屏一致 ──
-    private static final String BORDER  = ESC + "[38;5;75m";
 
     // ── 入口 ──
 
@@ -386,6 +359,8 @@ public class TerminalUI implements SkillForkHost {
                                 "uninstall", "Uninstall an installed skill <name>",
                                 "exit", "Deactivate an active skill <name>")),
                 null);
+        // 渲染器：只负责绘制，状态仍从本类读取（同包可见字段）
+        this.renderer = new ScreenRenderer(this);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -437,6 +412,15 @@ public class TerminalUI implements SkillForkHost {
             }
         }
         return null;
+    }
+
+    /** 全屏重绘入口：委托 ScreenRenderer 逐帧绘制，再一次性写入终端。 */
+    private void render() {
+        StringBuilder buf = new StringBuilder(4096);
+        buf.append(CURSOR_HIDE);
+        renderer.render(buf);
+        writer.print(buf.toString());
+        writer.flush();
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -695,7 +679,7 @@ public class TerminalUI implements SkillForkHost {
      * 候选 key 变化时惰性重置选中索引为 0（渲染与键盘线程都会经过这里，
      * 无需在每个输入修改点埋点重置）。
      */
-    private List<Command> currentCommandCandidates() {
+    List<Command> currentCommandCandidates() {
         String text = inputBuffer.toString();
         String cacheKey;
         List<Command> result;
@@ -1893,72 +1877,41 @@ public class TerminalUI implements SkillForkHost {
                             + n + (n == 1 ? " question" : " questions")
                             + GRAY + " — Esc to dismiss" + RESET));
         }
-        pendingAsk = new AskUserRequestState(aq);
+        pendingAsk = new AskUserDialog(aq, new AskUserDialog.Host() {
+            @Override
+            public void appendMessage(UIMessage msg) {
+                TerminalUI.this.appendMessage(msg);
+            }
+            @Override
+            public void scrollToBottom() {
+                TerminalUI.this.scrollToBottom();
+            }
+            @Override
+            public void requestRedraw() {
+                needsRedraw = true;
+            }
+        });
         scrollToBottom();
         needsRedraw = true;
     }
 
     /** 确认当前问题答案：选项题需先选中；全部答完后完成 future 并释放问卷态。 */
+    /** 确认当前问题（委托 AskUserDialog；全部答完后清空外层引用）。 */
     private void confirmAskCurrent() {
-        AskUserRequestState st = pendingAsk;
-        if (st == null) return;
-        Map<String, String> result = null;
-        String transcript = null;
-        synchronized (st) {
-            var qs = st.event.questions();
-            if (st.current < 0 || st.current >= qs.size()) return;
-            var q = qs.get(st.current);
-            String answer;
-            String typed = st.textAnswer.strip();
-            if (!typed.isEmpty()) {
-                // 自定义文本优先：选项题也可以直接输入自己的答案
-                answer = typed;
-            } else if (!q.options().isEmpty()
-                    && st.selectedOption >= 0 && st.selectedOption < q.options().size()) {
-                answer = q.options().get(st.selectedOption).label();
-            } else {
-                return; // 既没选中选项也没输入内容，Enter 不产生效果
-            }
-            st.answers.set(st.current, answer);
-            if (st.current + 1 < qs.size()) {
-                // 还有下一题：进入下一题
-                st.current++;
-                st.selectedOption = -1;
-                st.textAnswer = "";
-                st.customInput = qs.get(st.current).options().isEmpty();
-            } else {
-                // 全部答完：释放问卷态，把答案映射交回阻塞等待的 StreamingExecutor
-                result = new LinkedHashMap<>();
-                var sb = new StringBuilder();
-                for (int i = 0; i < qs.size(); i++) {
-                    result.put(String.valueOf(i + 1), st.answers.get(i));
-                    if (i > 0) sb.append('\n');
-                    sb.append("  ").append(i + 1).append(". ").append(qs.get(i).question())
-                      .append('\n').append("     ").append(GREEN).append("→ ").append(RESET)
-                      .append(WHITE).append(st.answers.get(i)).append(RESET);
-                }
-                transcript = sb.toString();
-                pendingAsk = null;
-                st.event.future().complete(result);
-            }
-        }
-        if (transcript != null) {
-            appendMessage(UIMessage.system(GRAY + "❓ answers recorded" + RESET + "\n" + transcript));
-            scrollToBottom();
-        }
+        AskUserDialog dlg = pendingAsk;
+        if (dlg == null) return;
+        dlg.confirm();
+        if (dlg.isFinished()) pendingAsk = null;
         needsRedraw = true;
     }
 
     /** 用户取消整份问卷：以空 Map 完成 future（执行端按“拒绝回答”处理）。 */
+    /** 用户取消整份问卷（委托 AskUserDialog，以空 Map 完成 future）。 */
     private void cancelAsk() {
-        AskUserRequestState st = pendingAsk;
-        if (st == null) return;
-        synchronized (st) {
-            pendingAsk = null;
-            st.event.future().complete(Map.of());
-        }
-        appendMessage(UIMessage.system(YELLOW + "✋ Question dialog cancelled" + RESET));
-        scrollToBottom();
+        AskUserDialog dlg = pendingAsk;
+        if (dlg == null) return;
+        dlg.cancel();
+        if (dlg.isFinished()) pendingAsk = null;
         needsRedraw = true;
     }
 
@@ -1969,75 +1922,19 @@ public class TerminalUI implements SkillForkHost {
      * - 自定义输入模式 / 纯文本题：任意可打印字符（含数字/CJK/符号）都进入文本框；
      * - 选项模式下输入任意非数字字符：自动切到自定义输入并输入该字符。
      */
+    /** 问卷对话框按键（委托 AskUserDialog）。 */
     private void handleAskPrintable(int ch) {
-        AskUserRequestState st = pendingAsk;
-        if (st == null) return;
-        synchronized (st) {
-            var qs = st.event.questions();
-            if (st.current < 0 || st.current >= qs.size()) return;
-            var q = qs.get(st.current);
-            boolean hasOptions = !q.options().isEmpty();
-            if (ch == '\t' && hasOptions) {
-                // Tab 切换模式：进入自定义输入时清掉已选选项（准备接收纯文本）
-                st.customInput = !st.customInput;
-                if (st.customInput) st.selectedOption = -1;
-            } else if (!hasOptions || st.customInput) {
-                // 纯文本题，或已切到自定义输入：数字也按文本处理
-                if (ch == '\t') ch = ' ';
-                if (ch >= 32) {
-                    if (st.textAnswer.length() < 1000) {
-                        st.textAnswer += (char) ch;
-                        if (hasOptions) st.selectedOption = -1;
-                    }
-                }
-            } else if (hasOptions && ch >= '1' && ch <= '9') {
-                // 选项模式：数字选择选项，并清空已有文本避免两个答案并存
-                int idx = ch - '1';
-                if (idx < q.options().size()) {
-                    st.selectedOption = idx;
-                    st.textAnswer = "";
-                    // 选中的是"自由输入/其它/自定义"类选项 → 自动切到自定义输入，数字不再当作选项
-                    if (isFreeTextOptionLabel(q.options().get(idx).label())) {
-                        st.selectedOption = -1;
-                        st.customInput = true;
-                    }
-                }
-            } else if (ch >= 32) {
-                // 选项模式下按了非数字字符 → 自动进入自定义输入
-                st.customInput = true;
-                if (st.textAnswer.length() < 1000) {
-                    st.textAnswer += (char) ch;
-                    st.selectedOption = -1;
-                }
-            }
-        }
-        needsRedraw = true;
+        AskUserDialog dlg = pendingAsk;
+        if (dlg != null) dlg.onPrintable(ch);
     }
 
     /** 判断选项是否表达了"让我自己输入"的语义（命中即自动进入自定义输入模式）。 */
-    private static boolean isFreeTextOptionLabel(String label) {
-        if (label == null) return false;
-        String l = label.toLowerCase(Locale.ROOT);
-        return l.contains("自由输入") || l.contains("自由填写") || l.contains("自定义")
-                || l.contains("其它") || l.contains("其他") || l.contains("请输入")
-                || l.contains("other") || l.contains("custom") || l.contains("free text")
-                || l.contains("free input");
-    }
 
     /** 问卷自定义文本的退格（无论当前题是否带选项，退格即进入/保持在自定义输入）。 */
+    /** 问卷退格（委托 AskUserDialog）。 */
     private void askBackspace() {
-        AskUserRequestState st = pendingAsk;
-        if (st == null) return;
-        synchronized (st) {
-            if (st.current >= 0 && st.current < st.event.questions().size()
-                    && !st.textAnswer.isEmpty()) {
-                st.textAnswer = st.textAnswer.substring(0, st.textAnswer.length() - 1);
-                if (!st.event.questions().get(st.current).options().isEmpty()) {
-                    st.customInput = true;
-                }
-            }
-        }
-        needsRedraw = true;
+        AskUserDialog dlg = pendingAsk;
+        if (dlg != null) dlg.onBackspace();
     }
 
     /** 整个 agent 循环结束：定稿流式消息，输出汇总 footer。 */
@@ -2286,8 +2183,8 @@ public class TerminalUI implements SkillForkHost {
                             case "H" -> handleHome();
                             case "F" -> handleEnd();
                             case "3~" -> handleDelete();
-                            case "5~" -> { if (!streaming) { scrollOffset += pageScrollAmount(); needsRedraw = true; } }
-                            case "6~" -> { if (!streaming) { scrollOffset = Math.max(0, scrollOffset - pageScrollAmount()); needsRedraw = true; } }
+                            case "5~" -> { if (!streaming) { scrollOffset += renderer.pageScrollAmount(); needsRedraw = true; } }
+                            case "6~" -> { if (!streaming) { scrollOffset = Math.max(0, scrollOffset - renderer.pageScrollAmount()); needsRedraw = true; } }
                             default -> {} // ignore unknown CSI
                         }
                         if (!csi.equals("A") && !csi.equals("B") && !csi.equals("5~") && !csi.equals("6~")) needsRedraw = true;
@@ -2563,740 +2460,6 @@ public class TerminalUI implements SkillForkHost {
     // ═══════════════════════════════════════════════════════════════
 
     /** PageUp/PageDown 每次滚动的行数（对话区可见行数 - 1，至少 1）。 */
-    private int pageScrollAmount() {
-        int n = estimateConvAvailRows() - 1;
-        return Math.max(1, n);
-    }
-
-    /**
-     * 全屏渲染：将整个终端画面一次性写入 StringBuilder 再 flush。
-     *
-     * 布局（从上到下）：
-     *   ┌────────────────────────────────────────────────┬───────────┐
-     *   │ 状态行 (全宽)                                    │           │ row 0
-     *   │ ──────────────────────────────────────────────  │           │ row 1 (分隔线)
-     *   │                                                │  右侧     │
-     *   │  对话区 (左侧)                                  │  状态     │ rows 2~sep2-1
-     *   │  (消息列表 + 滚动条)                            │  面板     │
-     *   │                                                │           │
-     *   │ ──────────────────────────────────────────────  │           │ sep2 (分隔线)
-     *   │  输入区 (左侧, ASCII 边框)                      │           │ sep2+1~statusBar-1
-     *   │ provider名                          model名    │           │ statusBar (反白)
-     *   └────────────────────────────────────────────────┴───────────┘
-     *
-     * 渲染顺序：状态行 → 分隔线1 → 对话区 → 分隔线2 → 状态面板 → 状态栏 → 输入区
-     * 输入区最后渲染，确保光标最终定位在输入框内。
-     */
-    private void render() {
-        StringBuilder buf = new StringBuilder(4096);
-        buf.append(CURSOR_HIDE);
-
-        // 全屏选择器激活时：覆盖正常界面，只渲染选择器
-        if (activePicker != null) {
-            buf.append(CLEAR).append(HOME);
-            renderPicker(buf, termWidth, termHeight);
-            writer.print(buf.toString());
-            writer.flush();
-            return;
-        }
-
-        // 结构化问卷激活时：覆盖正常界面，只渲染问卷对话框
-        if (pendingAsk != null) {
-            buf.append(CLEAR).append(HOME);
-            renderAskDialog(buf, termWidth, termHeight);
-            writer.print(buf.toString());
-            writer.flush();
-            return;
-        }
-
-        buf.append(HOME);
-
-        int rows = termHeight;
-        int cols = termWidth;
-
-        // 右侧状态面板：终端足够宽时显示
-        boolean showPanel = cols >= PANEL_MIN_COLS && panelVisible;
-        int panelW = showPanel ? PANEL_WIDTH : 0;
-        int leftCols = showPanel ? cols - panelW - 1 : cols;  // -1 给竖线分隔
-        int panelX = showPanel ? cols - panelW : 0;            // 面板起始列
-
-        // 布局：状态行(1) | 分隔(1) | {对话区 | 命令提示 | 分隔(1) | 输入区} + 状态面板 | 状态栏(1)
-        int statusRow = 0;
-        int sep1Row = 1;
-        int convStart = 2;
-        int inputHeight = Math.max(countInputLines() + 1, 3); // +1 边框
-        int sep2Row = rows - inputHeight - 2;
-        int inputTop = sep2Row + 1;
-        int statusBarRow = rows - 1;
-
-        // 命令提示面板（输入 / 时）：占据对话区底部，对话区至少保留 3 行
-        List<Command> hintCmds = currentCommandCandidates();
-        int hintHeight = 0;
-        if (!hintCmds.isEmpty()) {
-            int maxByList = Math.min(hintCmds.size(), MAX_COMMAND_HINTS) + 2;  // 顶线 + 条目 + 操作提示行
-            int maxBySpace = Math.max(0, sep2Row - convStart - 3);             // 对话区至少留 3 行
-            hintHeight = Math.min(maxByList, maxBySpace);
-            if (hintHeight < 3) hintHeight = 0;   // 空间太小放不下完整面板就不显示
-        }
-
-        // 确保对话区至少有 3 行
-        int convEnd = sep2Row - 1 - hintHeight;
-        if (convEnd - convStart < 3) {
-            // 空间不足：优先放弃命令提示面板
-            if (hintHeight > 0) {
-                hintHeight = 0;
-                convEnd = sep2Row - 1;
-            }
-            if (convEnd - convStart < 3) {
-                convEnd = convStart + 3;
-                sep2Row = convEnd;
-                inputTop = sep2Row + 1;
-                if (inputTop + inputHeight >= rows) {
-                    inputHeight = rows - inputTop - 1;
-                    if (inputHeight < 1) inputHeight = 1;
-                }
-            }
-        }
-
-        // ── 状态行（全宽）──
-        moveTo(buf, statusRow, 0);
-        String statusLine;
-        if (streaming) {
-            if (!firstTokenReceived) {
-                long elapsed = (System.currentTimeMillis() - streamStartMs) / 1000;
-                statusLine = BOLD + YELLOW + "DeveCode: Imagining\u2026  (" + elapsed + "s)" + RESET;
-            } else {
-                statusLine = BOLD + GREEN + "DeveCode: Streaming\u2026" + RESET;
-            }
-        } else {
-            statusLine = BOLD + "DeveCode: " + GREEN + "Ready" + RESET;
-        }
-        buf.append("\033[K");
-        buf.append(truncate(statusLine, cols));
-
-        // ── 分隔线1（全宽）──
-        moveTo(buf, sep1Row, 0);
-        buf.append(GRAY).append(repeat('-', cols)).append(RESET);
-
-        // ── 对话区（左侧）──
-        int convWidth = leftCols - 1;
-        renderConversation(buf, convStart, convEnd, convWidth, leftCols);
-
-        // ── 命令提示面板（对话区与分隔线2之间，输入 / 时出现）──
-        if (hintHeight > 0) {
-            renderCommandHints(buf, sep2Row - hintHeight, leftCols, hintCmds, hintHeight - 2);
-        }
-
-        // ── 分隔线2（仅左侧）──
-        moveTo(buf, sep2Row, 0);
-        buf.append("\033[K");
-        buf.append(GRAY).append(repeat('-', leftCols)).append(RESET);
-
-        // ── 右侧状态面板 ──
-        if (showPanel) {
-            // 竖线分隔（从 convStart 到 statusBarRow-1）
-            for (int y = convStart; y < statusBarRow; y++) {
-                moveTo(buf, y, leftCols);
-                buf.append(GRAY).append('│').append(RESET);
-            }
-            renderStatusPanel(buf, convStart, statusBarRow - 1, leftCols + 1, panelW);
-        }
-
-        // ── 状态栏（全宽）──
-        renderStatusBar(buf, statusBarRow, cols);
-
-        // ── 输入区（仅左侧）── 最后渲染，确保光标定位在输入框
-        renderInputArea(buf, inputTop, inputHeight, leftCols);
-
-        // 写入终端
-        writer.print(buf.toString());
-        writer.flush();
-    }
-
-    /** 左侧可用宽度（扣除右侧面板和竖线） */
-    private int leftContentWidth() {
-        int cols = termWidth;
-        boolean showPanel = cols >= PANEL_MIN_COLS && panelVisible;
-        return showPanel ? cols - PANEL_WIDTH - 1 - 1 : cols - 1;
-    }
-
-    private List<RenderLine> buildAllRenderLines() {
-        List<RenderLine> allLines = new ArrayList<>();
-        int textWidth = Math.max(1, leftContentWidth());
-        List<UIMessage> snapshot;
-        synchronized (messages) { snapshot = new ArrayList<>(messages); }
-        for (UIMessage msg : snapshot) { allLines.addAll(msg.toRenderLines(textWidth)); }
-        return allLines;
-    }
-    private int estimateConvAvailRows() {
-        int rows = termHeight;
-        int inputHeight = Math.max(countInputLines() + 1, 3);
-        int sep2Row = rows - inputHeight - 2;
-        int convStart = 2, convEnd = sep2Row - 1;
-        if (convEnd - convStart < 3) convEnd = convStart + 3;
-        return convEnd - convStart + 1;
-    }
-    private void renderConversation(StringBuilder buf, int startRow, int endRow, int textWidth, int termCols) {
-        int availRows = endRow - startRow + 1;
-        if (availRows <= 0) return;
-        List<RenderLine> allLines = buildAllRenderLines();
-        int totalLines = allLines.size();
-        int maxScroll = Math.max(0, totalLines - availRows);
-        if (scrollOffset > maxScroll) scrollOffset = maxScroll;
-        int visibleStart = Math.max(0, totalLines - availRows - scrollOffset);
-        if (visibleStart < 0) visibleStart = 0;
-        int y = startRow;
-        for (int i = visibleStart; i < totalLines && y <= endRow; i++) {
-            moveTo(buf, y, 0);
-            buf.append("\033[K");
-            if (i < allLines.size()) {
-                RenderLine rl = allLines.get(i);
-                String text = truncate(rl.text(), textWidth);
-                buf.append(rl.style()).append(text).append(RESET);
-                int vl = visibleLength(text);
-                if (vl < textWidth) buf.append(repeat(' ', textWidth - vl));
-                drawScrollbarCell(buf, y, termCols, i, visibleStart, totalLines, availRows);
-            }
-            y++;
-        }
-        for (; y <= endRow; y++) { moveTo(buf, y, 0); buf.append("\033[K"); }
-    }
-    private void drawScrollbarCell(StringBuilder buf, int row, int termCols, int lineIdx, int visibleStart, int totalLines, int availRows) {
-        if (totalLines <= availRows) return;
-        int maxScroll = totalLines - availRows;
-        int thumbHeight = Math.max(1, availRows * availRows / totalLines);
-        int thumbTop = maxScroll > 0 ? (maxScroll - scrollOffset) * (availRows - thumbHeight) / maxScroll : availRows - thumbHeight;
-        int thumbBottom = thumbTop + thumbHeight - 1;
-        int rowInTrack = lineIdx - visibleStart;
-        moveTo(buf, row, termCols - 1);
-        if (rowInTrack >= thumbTop && rowInTrack <= thumbBottom) {
-            buf.append(REVERSE).append(' ').append(RESET);
-        } else {
-            buf.append(GRAY).append('│').append(RESET);
-        }
-    }
-
-
-    private void renderInputArea(StringBuilder buf, int topRow, int height, int cols) {
-        // 只清空左侧区域，不擦掉右侧竖线和面板
-        for (int y = topRow; y < topRow + height; y++) {
-            moveTo(buf, y, 0);
-            buf.append(repeat(' ', cols));
-        }
-
-        // ASCII border
-        moveTo(buf, topRow, 0);
-        buf.append(GRAY).append("+").append(repeat('-', cols - 2)).append("+").append(RESET);
-        for (int y = topRow + 1; y < topRow + height - 1; y++) {
-            moveTo(buf, y, 0);
-            buf.append(GRAY).append("|").append(RESET);
-            moveTo(buf, y, cols - 1);
-            buf.append(GRAY).append("|").append(RESET);
-        }
-        moveTo(buf, topRow + height - 1, 0);
-        buf.append(GRAY).append("+").append(repeat('-', cols - 2)).append("+").append(RESET);
-
-        // prompt + input content
-        if (height >= 2) {
-            moveTo(buf, topRow + 1, 1);
-            buf.append(BOLD).append("> ").append(RESET);
-
-            if (inputBuffer.isEmpty() && !streaming) {
-                buf.append(DIM).append("Send a message · ↑↓ history/scroll · Ctrl+C quit · Ctrl+P panel").append(RESET);
-                moveTo(buf, topRow + 1, 3);
-                buf.append(CURSOR_SHOW);
-            } else if (inputBuffer.isEmpty() && streaming && pendingPermission != null) {
-                buf.append(YELLOW).append("Permission required: [y] allow  [a] always  [n] deny").append(RESET);
-                moveTo(buf, topRow + 1, 3);
-                buf.append(CURSOR_HIDE);
-            } else if (inputBuffer.isEmpty() && streaming) {
-                buf.append(DIM).append("Working… press Esc to interrupt, ctrl + c to quit").append(RESET);
-                moveTo(buf, topRow + 1, 3);
-                buf.append(CURSOR_HIDE);
-            } else {
-                String[] lines = inputBuffer.toString().split("\n", -1);
-                int maxDisplayLines = height - 2;
-                int startLine = Math.max(0, lines.length - maxDisplayLines);
-                for (int i = startLine; i < lines.length; i++) {
-                    if (i > startLine) {
-                        moveTo(buf, topRow + 1 + (i - startLine), 1);
-                    }
-                    buf.append(lines[i]);
-                }
-
-                if (!streaming) {
-                    int cursorDisplayRow = Math.min(cursorRow, lines.length - 1) - startLine;
-                    if (cursorDisplayRow < 0) cursorDisplayRow = 0;
-                    int cursorColClamped = Math.min(cursorCol, lines.length > cursorRow ? lines[cursorRow].length() : 0);
-                    // Convert logical cursor pos to display column (CJK = 2 cols)
-                    String curLine = lines.length > cursorRow ? lines[cursorRow] : "";
-                    int displayCol = 0;
-                    for (int ci = 0; ci < Math.min(cursorColClamped, curLine.length()); ci++) {
-                        displayCol += displayCharWidth(curLine.charAt(ci));
-                    }
-                    moveTo(buf, topRow + 1 + cursorDisplayRow, 3 + displayCol);
-                    buf.append(CURSOR_SHOW);
-                }
-            }
-        }
-    }
-
-    /**
-     * 渲染命令提示面板（输入 / 时出现在对话区底部）。
-     *
-     * 结构：亮天蓝顶线（带 commands 标题）+ 候选条目列表 + 操作提示行。
-     * ● 实心白点标记选中项（↑↓ 循环导航），○ 空心灰点标记未选中项，
-     * 与全屏选择器的视觉惯例保持一致。
-     *
-     * @param startRow   面板首行（顶线）所在行
-     * @param width      左侧区域宽度
-     * @param cands      候选命令列表（已按名称排序）
-     * @param maxVisible 空间允许显示的最大条目数
-     */
-    private void renderCommandHints(StringBuilder buf, int startRow, int width,
-                                     List<Command> cands, int maxVisible) {
-        int n = cands.size();
-        int visible = Math.min(n, Math.min(maxVisible, MAX_COMMAND_HINTS));
-        if (visible <= 0) return;
-        int idx = Math.min(Math.max(commandHintIndex, 0), n - 1);
-
-        // 滚动窗口跟随选中项（尽量居中）
-        int winStart;
-        if (n <= visible) {
-            winStart = 0;
-        } else {
-            winStart = idx - visible / 2;
-            if (winStart < 0) winStart = 0;
-            if (winStart > n - visible) winStart = n - visible;
-        }
-
-        // ── 顶线：╾─ commands ──────（亮天蓝，区别于灰色分隔线）──
-        moveTo(buf, startRow, 0);
-        buf.append("\033[K");
-        String header = " commands ";
-        int fill = Math.max(0, width - header.length() - 2);
-        buf.append(BORDER).append('╾').append(header).append(repeat('─', fill)).append(RESET);
-
-        // ── 条目列表（命令列对齐，描述跟随其后）──
-        // 命令列可见宽度 = max("/name (aliases)")，用于各条目描述列对齐
-        int cmdColW = 0;
-        for (int i = winStart; i < winStart + visible; i++) {
-            cmdColW = Math.max(cmdColW, commandColumnWidth(cands.get(i)));
-        }
-
-        int y = startRow + 1;
-        for (int i = winStart; i < winStart + visible; i++) {
-            Command c = cands.get(i);
-            boolean sel = (i == idx);
-            moveTo(buf, y, 0);
-            buf.append("\033[K");
-
-            // 标记 + 命令名（选中：白粗体；未选中：白色）；skill 命令附带青色 [skill] 标识
-            String marker = sel ? BOLD + WHITE + "● " + RESET : GRAY + "○ " + RESET;
-            String nameColored = (sel ? BOLD + WHITE : WHITE) + "/" + c.name() + RESET;
-            String aliases = "";
-            if (c.aliases().length > 0) {
-                aliases = GRAY + " (" + String.join(", ", c.aliases()) + ")" + RESET;
-            }
-            String skillTag = c.skill() ? CYAN + " [skill]" + RESET : "";
-            buf.append(marker).append(nameColored).append(aliases).append(skillTag);
-
-            // 描述（灰色，对齐到统一列；空间不足时截断）
-            int used = 2 + commandColumnWidth(c);
-            int descCol = 2 + cmdColW + 2;
-            if (descCol < width - 4) {
-                buf.append(repeat(' ', descCol - used));
-                buf.append(GRAY).append(truncate(c.description(), width - descCol - 1)).append(RESET);
-            }
-            y++;
-        }
-
-        // ── 操作提示行（条目超出窗口时附带位置指示）──
-        moveTo(buf, y, 0);
-        buf.append("\033[K");
-        String hint = GRAY + "  ↑↓ select  ·  Tab complete  ·  Enter run"
-                + (n > visible ? "  ·  " + (idx + 1) + "/" + n : "") + RESET;
-        buf.append(truncate(hint, width));
-    }
-
-    /** 命令条目中命令列（"/name (aliases) [skill]"）的可见宽度。 */
-    private static int commandColumnWidth(Command c) {
-        int w = 1 + c.name().length();
-        if (c.aliases().length > 0) {
-            w += 3 + String.join(", ", c.aliases()).length();  // " (" + join + ")"
-        }
-        if (c.skill()) {
-            w += 7;  // " [skill]"
-        }
-        return w;
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  右侧状态面板
-    // ═══════════════════════════════════════════════════════════════
-
-    /**
-     * 渲染右侧系统状态监控面板。
-     * 区块化垂直堆叠，每块左侧有灰色竖线，用 ▰ 图标和颜色区隔。
-     */
-    private void renderStatusPanel(StringBuilder buf, int startRow, int endRow, int x, int width) {
-        // 先清空面板区域
-        for (int y = startRow; y <= endRow; y++) {
-            moveTo(buf, y, x);
-            buf.append("\033[K");
-        }
-
-        // ── 收集数据 ──
-        int usedTokens = estimateTokens();
-        // provider.resolvedContextWindow() — 从 ProviderConfig 获取上下文窗口大小（如 200000）
-        int contextWindow = provider.resolvedContextWindow();
-        double pct = contextWindow > 0 ? usedTokens * 100.0 / contextWindow : 0;
-        double freePct = 100.0 - pct;
-        // provider.getModel() — 从 ProviderConfig 获取模型名（如 "deepseek-v4-flash"）
-        String modelName = provider.getModel();
-        if (modelName.length() > 18) modelName = modelName.substring(0, 17) + "…";
-
-        int cpuThreads = osBean.getAvailableProcessors();
-        double cpuLoad = osBean.getCpuLoad() * 100;
-        if (cpuLoad < 0) cpuLoad = 0;
-
-        // ── 逐行渲染 ──
-        int y = startRow;
-        int padX = x + 1;    // 竖线位置
-        int maxW = width - 2; // 内容最大宽度
-
-        // 区块一：Context
-        y = panelHeader(buf, y, padX, maxW, "Context");
-        y = panelLine(buf, y, padX, maxW,
-                WHITE + BOLD + formatTokens(usedTokens) + RESET +
-                YELLOW + " (" + String.format("%.1f%%", pct) + ")" + RESET);
-        y++;
-
-        // 区块二：Context Detail
-        y = panelHeader(buf, y, padX, maxW, "Context Detail");
-        y = panelKV(buf, y, padX, maxW, "Context window:", formatTokens(contextWindow) + " (" + String.format("%.1f%%", pct) + ")");
-        y = panelKV(buf, y, padX, maxW, "Model:", modelName);
-        y = panelKV(buf, y, padX, maxW, "Mode:", permissionChecker.getMode().name().toLowerCase());
-        y = panelKV(buf, y, padX, maxW, "Tools:", String.valueOf(
-                toolRegistry.getAllSchemas(provider.getProtocol()).size()));
-        y = panelKV(buf, y, padX, maxW, "API usage:", "↑" + formatTokens(usageInTokens) + " ↓" + formatTokens(usageOutTokens));
-        y = panelKV(buf, y, padX, maxW, "Free Space:", String.format("%.1f%%", freePct));
-        y++;
-
-        // 区块三：Compact（柱状图）
-        y = panelHeader(buf, y, padX, maxW, "Compact");
-        y = panelBar(buf, y, padX, maxW, pct);
-        y++;  // 柱状图和图例之间空一行
-        // 图例
-        String usageColor = pct > 80 ? RED : (pct > 50 ? YELLOW : GREEN);
-        y = panelLine(buf, y, padX, maxW,
-                usageColor + "█" + RESET + GRAY + " usage  " + RESET +
-                GRAY + "░" + RESET + GRAY + " usable" + RESET);
-        y++;
-
-        // 区块四：Sandbox
-        y = panelHeader(buf, y, padX, maxW, "Sandbox");
-        y = panelKV(buf, y, padX, maxW, "Session:", sessionId);
-        y = panelKV(buf, y, padX, maxW, "Status:",
-                permissionChecker.isSandboxEnabled()
-                        ? GREEN + "●" + RESET + WHITE + " active" + RESET
-                        : GRAY + "○" + RESET + WHITE + " off" + RESET);
-        y++;
-
-        // 区块五：MCP（真实连接状态：server 数 / 各 server 工具数 / 失败数）
-        y = panelHeader(buf, y, padX, maxW, "MCP");
-        if (mcpServers.isEmpty() && mcpErrors.isEmpty()) {
-            y = panelKV(buf, y, padX, maxW, "servers:", "none");
-        } else {
-            y = panelKV(buf, y, padX, maxW, "servers:", String.valueOf(mcpServers.size()));
-            int shown = 0;
-            for (var s : mcpServers) {
-                if (shown++ >= 4) {
-                    // 超过 4 个折叠显示
-                    y = panelLine(buf, y, padX, maxW, GRAY + "… +" + (mcpServers.size() - 4) + " more" + RESET);
-                    break;
-                }
-                y = panelKV(buf, y, padX, maxW,
-                        McpManager.sanitizeName(s.name()) + ":",
-                        mcpToolCounts.getOrDefault(s.name(), 0) + " tools");
-            }
-            if (!mcpErrors.isEmpty()) {
-                y = panelKV(buf, y, padX, maxW, "errors:", String.valueOf(mcpErrors.size()));
-            }
-        }
-        y++;
-
-        // 区块六：CPU
-        y = panelHeader(buf, y, padX, maxW, "CPU");
-        y = panelKV(buf, y, padX, maxW, "Threads:", String.valueOf(cpuThreads));
-        y = panelKV(buf, y, padX, maxW, "Usage:", String.format("%.1f%%", cpuLoad));
-
-        // 页脚（固定在面板底部）
-        panelFooter(buf, endRow, padX, maxW, DIM + APP_NAME.toLowerCase() + " " + APP_VERSION + RESET);
-    }
-
-    /** 区块标题：│ ▰ Title（竖线 + 青色粗体） */
-    private int panelHeader(StringBuilder buf, int y, int x, int maxW, String title) {
-        moveTo(buf, y, x);
-        buf.append("\033[K");
-        buf.append(truncate(GRAY + "│ " + RESET + CYAN + BOLD + "▰ " + title + RESET, maxW));
-        return y + 1;
-    }
-
-    /** 水平柱状图：│ ████████░░░░░░ 22.2% */
-    private int panelBar(StringBuilder buf, int y, int x, int maxW, double pct) {
-        moveTo(buf, y, x);
-        buf.append("\033[K");
-
-        int barW = maxW - 10;  // 留给 │ + 空格 + 百分比
-        if (barW < 8) barW = 8;
-        int filled = (int) Math.round(pct * barW / 100.0);
-        if (filled > barW) filled = barW;
-        if (filled == 0 && pct > 0) filled = 1;  // 至少 1 格
-        int empty = barW - filled;
-
-        String usageColor = pct > 80 ? RED : (pct > 50 ? YELLOW : GREEN);
-        StringBuilder bar = new StringBuilder();
-        bar.append(GRAY).append("│ ").append(RESET);
-        bar.append(usageColor);
-        for (int i = 0; i < filled; i++) bar.append('█');
-        bar.append(RESET);
-        bar.append(GRAY);
-        for (int i = 0; i < empty; i++) bar.append('░');
-        bar.append(RESET);
-        bar.append(" ").append(YELLOW).append(String.format("%.1f%%", pct)).append(RESET);
-
-        buf.append(truncate(bar.toString(), maxW));
-        return y + 1;
-    }
-
-    /** 渲染面板中一行纯文本（带竖线前缀） */
-    private int panelLine(StringBuilder buf, int y, int x, int maxW, String content) {
-        moveTo(buf, y, x);
-        buf.append("\033[K");
-        buf.append(truncate(GRAY + "│ " + RESET + content, maxW));
-        return y + 1;
-    }
-
-    /** 渲染面板中一行键值对：│ · label: value */
-    private int panelKV(StringBuilder buf, int y, int x, int maxW, String label, String value) {
-        moveTo(buf, y, x);
-        buf.append("\033[K");
-        String line = GRAY + "│ · " + label + " " + RESET + WHITE + value + RESET;
-        buf.append(truncate(line, maxW));
-        return y + 1;
-    }
-
-    /** 渲染页脚（无竖线前缀，固定底部） */
-    private void panelFooter(StringBuilder buf, int y, int x, int maxW, String content) {
-        moveTo(buf, y, x);
-        buf.append("\033[K");
-        buf.append(truncate(content, maxW));
-    }
-
-    private void renderStatusBar(StringBuilder buf, int row, int cols) {
-        moveTo(buf, row, 0);
-        buf.append("\033[K");
-        buf.append(REVERSE);
-
-        String left = " " + provider.getName() + " ";
-        String right = " " + provider.getModel() + " ";
-        int padding = cols - left.length() - right.length();
-        if (padding < 0) padding = 0;
-
-        buf.append(left);
-        buf.append(repeat(' ', padding));
-        buf.append(right);
-        buf.append(RESET);
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  全屏选择器渲染
-    // ═══════════════════════════════════════════════════════════════
-
-    /**
-     * 渲染全屏选择器（与欢迎屏同一视觉语言：75 号天蓝边框、●/○ 选中标记、
-     * ↑↓ 循环导航、居中盒子布局）。
-     *
-     * 条目超过可视高度时以选中项为中心滚动窗口。
-     */
-    private void renderPicker(StringBuilder buf, int w, int h) {
-        PickerState p = activePicker;
-        if (p == null) return;
-        int n = p.items().size();
-
-        // ── 计算盒子尺寸 ──
-        int maxItemW = 0;
-        for (var item : p.items()) {
-            int len = Math.max(visibleLength(item.id()), Math.max(
-                    item.title().length(), item.subtitle().length()));
-            if (len > maxItemW) maxItemW = len;
-        }
-        int hintLen = 44;  // "↑↓ navigate · Enter select · Esc/q cancel"
-        int innerW = Math.min(Math.max(Math.max(maxItemW + 6, p.title().length() + 4), hintLen), Math.max(40, w - 4));
-        int boxW = innerW + 2;
-        if (boxW > w) { boxW = w; innerW = boxW - 2; }
-
-        int visible = Math.min(n, Math.max(3, h - 10));   // 可视条目窗口
-        int boxH = Math.min(h, 2 /*边框*/ + 2 /*标题+空行*/ + visible * 2 + 1 /*空行*/ + 1 /*提示*/ + 2 /*留白*/);
-
-        int boxX = Math.max(0, (w - boxW) / 2);
-        int boxY = Math.max(0, (h - boxH) / 2);
-        int left = boxX;
-        int right = boxX + boxW - 1;
-
-        // ── 滚动窗口：保持选中项可见（尽量居中） ──
-        int winStart;
-        if (n <= visible) {
-            winStart = 0;
-        } else {
-            winStart = pickerIndex - visible / 2;
-            if (winStart < 0) winStart = 0;
-            if (winStart > n - visible) winStart = n - visible;
-        }
-
-        // ── 边框 ──
-        moveTo(buf, boxY, left);
-        buf.append(BORDER).append('╭').append(repeat('─', innerW)).append('╮').append(RESET);
-
-        int y = boxY + 1;
-        // 标题（青色粗体，左对齐带缩进）
-        moveTo(buf, y, left);
-        buf.append(BORDER).append('│').append(RESET);
-        moveTo(buf, y, right);
-        buf.append(BORDER).append('│').append(RESET);
-        moveTo(buf, y, left + 2);
-        buf.append(BOLD).append(CYAN).append(truncate(p.title(), innerW - 2)).append(RESET);
-        y++;
-
-        // 空行
-        y = pickerBlankRow(buf, y, left, right);
-        y = pickerBlankRow(buf, y, left, right);
-
-        // ── 条目列表：● 实心白点选中 / ○ 空心灰点未选中 ──
-        for (int i = winStart; i < winStart + visible && i < n; i++) {
-            var item = p.items().get(i);
-            boolean sel = (i == pickerIndex);
-
-            // 第一行：标记 + 标题
-            moveTo(buf, y, left);
-            buf.append(BORDER).append('│').append(RESET);
-            moveTo(buf, y, right);
-            buf.append(BORDER).append('│').append(RESET);
-            moveTo(buf, y, left + 1);
-            String prefix = sel ? BOLD + WHITE + "● " + RESET : GRAY + "○ " + RESET;
-            String titleColored = sel
-                    ? BOLD + WHITE + truncate(item.title(), innerW - 4) + RESET
-                    : WHITE + truncate(item.title(), innerW - 4) + RESET;
-            buf.append(prefix).append(titleColored);
-            y++;
-
-            // 第二行：id + 元信息（灰色）
-            moveTo(buf, y, left);
-            buf.append(BORDER).append('│').append(RESET);
-            moveTo(buf, y, right);
-            buf.append(BORDER).append('│').append(RESET);
-            moveTo(buf, y, left + 3);
-            String meta = GRAY + truncate(item.id() + " · " + item.subtitle(), innerW - 4) + RESET;
-            buf.append(meta);
-            y++;
-        }
-
-        // ── 空行 + 操作提示 ──
-        y = pickerBlankRow(buf, y, left, right);
-        moveTo(buf, y, left);
-        buf.append(BORDER).append('│').append(RESET);
-        moveTo(buf, y, right);
-        buf.append(BORDER).append('│').append(RESET);
-        String hint = GRAY + "↑↓ navigate  ·  Enter select  ·  Esc/q cancel" + RESET;
-        int hintX = left + 1 + Math.max(0, (innerW - visibleLength(hint)) / 2);
-        moveTo(buf, y, hintX);
-        buf.append(hint);
-        y++;
-
-        // 滚动指示（条目超出窗口时显示）
-        if (n > visible) {
-            y = pickerBlankRow(buf, y, left, right);
-            moveTo(buf, y, left);
-            buf.append(BORDER).append('│').append(RESET);
-            moveTo(buf, y, right);
-            buf.append(BORDER).append('│').append(RESET);
-            String pos = DIM + (pickerIndex + 1) + " / " + n + RESET;
-            moveTo(buf, y, left + 1 + Math.max(0, (innerW - visibleLength(pos)) / 2));
-            buf.append(pos);
-            y++;
-        }
-
-        // ── 底边框（固定在内容行之后）──
-        moveTo(buf, y, left);
-        buf.append(BORDER).append('╰').append(repeat('─', innerW)).append('╯').append(RESET);
-    }
-
-    /** 选择器盒子内的空行（只画左右边框）。 */
-    private static int pickerBlankRow(StringBuilder buf, int y, int left, int right) {
-        moveTo(buf, y, left);
-        buf.append(BORDER).append('│').append(RESET);
-        moveTo(buf, y, right);
-        buf.append(BORDER).append('│').append(RESET);
-        return y + 1;
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  工具方法
-    // ═══════════════════════════════════════════════════════════════
-
-    private int countInputLines() {
-        if (inputBuffer.isEmpty()) return 1;
-        return inputBuffer.toString().split("\n", -1).length;
-    }
-
-    // ── Token 估算 ──
-
-    /**
-     * 粗略估算当前对话已消耗的 token 数（~4 字符/token）。
-     *
-     * 数据来源：
-     *   - ConversationManager.getMessages()：已完成的对话历史
-     *   - streamAccum：当前流式输出中尚未完成的文本
-     *
-     * 用于右侧状态面板的 Context 占用率显示。
-     */
-    private int estimateTokens() {
-        int totalChars = 0;
-        // conversation.getMessages() 返回的是发给 LLM 的消息列表（Message 类型）
-        for (var msg : conversation.getMessages()) {
-            String content = msg.getContent();
-            if (content != null) totalChars += content.length();
-        }
-        // 加上流式累积中的文本（尚未存入 ConversationManager）
-        if (streaming) totalChars += streamAccum.length();
-        return totalChars / 4;
-    }
-
-    /** 格式化 token 数为紧凑形式：1234 → "1.2K"，1000000 → "1.0M" */
-    private static String formatTokens(int tokens) {
-        if (tokens >= 1_000_000) return String.format("%.1fM", tokens / 1_000_000.0);
-        if (tokens >= 1_000) return String.format("%.1fK", tokens / 1_000.0);
-        return String.valueOf(tokens);
-    }
-
-    private static String repeat(char c, int n) {
-        if (n <= 0) return "";
-        return String.valueOf(c).repeat(n);
-    }
-
-    private static String truncate(String s, int maxLen) {
-        if (s == null) return "";
-        // 移除 ANSI 序列再计算长度
-        String stripped = s.replaceAll("\u001b\\[[0-9;]*[a-zA-Z]", "");
-        if (stripped.length() <= maxLen) return s;
-        return s.substring(0, Math.min(s.length(), maxLen));
-    }
-
-    private static void moveTo(StringBuilder buf, int row, int col) {
-        buf.append(ESC).append('[').append(row + 1).append(';').append(col + 1).append('H');
-    }
-
     private void readTerminalSize() {
         Integer h = terminal.getHeight();
         Integer w = terminal.getWidth();
@@ -3310,480 +2473,15 @@ public class TerminalUI implements SkillForkHost {
      * 布局：顶部标题 → 分隔线 → 已答问题摘要 → 当前问题（选项编号列表或自由文本输入行）→
      * 底部操作提示。全部状态在 synchronized(state) 下一次性快照，避免与按键线程竞争。
      */
-    private void renderAskDialog(StringBuilder buf, int w, int h) {
-        AskUserRequestState st = pendingAsk;
-        if (st == null) return;
-
-        List<AgentEvent.AskUserRequestEvent.Question> qs;
-        List<String> answers;
-        int current;
-        int selected;
-        String textAnswer;
-        boolean customInput;
-        synchronized (st) {
-            qs = st.event.questions();
-            answers = List.copyOf(st.answers);
-            current = st.current;
-            selected = st.selectedOption;
-            textAnswer = st.textAnswer;
-            customInput = st.customInput;
-        }
-
-        int n = qs.size();
-        int y = 0;
-        int safeW = Math.max(24, w);
-
-        // ── 标题行 ──
-        moveTo(buf, y, 0);
-        buf.append("\033[K");
-        buf.append(BOLD).append(CYAN).append("❓ AskUserQuestion").append(RESET)
-           .append(GRAY).append("   ·   ").append(n).append(n == 1 ? " question" : " questions")
-           .append("   ·   Esc cancel").append(RESET);
-        y++;
-        moveTo(buf, y, 0);
-        buf.append("\033[K");
-        buf.append(GRAY).append(repeat('─', Math.min(safeW - 2, 72))).append(RESET);
-        y++;
-        y++;
-
-        int bottom = h - 3; // 底部保留 2 行提示 + 1 行边距
-
-        // ── 已答问题摘要 ──
-        for (int i = 0; i < Math.min(current, n); i++) {
-            if (y >= bottom) break;
-            String ans = i < answers.size() ? answers.get(i) : "";
-            moveTo(buf, y, 0);
-            buf.append("\033[K");
-            buf.append("  ").append(GRAY).append("[").append(i + 1).append("/").append(n).append("]").append(RESET)
-               .append(GREEN).append(" ✓ ").append(RESET)
-               .append(GRAY).append("answer: ").append(RESET)
-               .append(truncate(ans, Math.max(10, safeW - 22)));
-            y++;
-        }
-        if (y > 4) y++;
-
-        // ── 当前问题 ──
-        if (current >= 0 && current < n && y < bottom) {
-            var q = qs.get(current);
-            moveTo(buf, y, 0);
-            buf.append("\033[K");
-            buf.append("  ").append(YELLOW).append("● ").append(RESET)
-               .append(GRAY).append("Question ").append(current + 1).append("/").append(n).append(RESET);
-            y++;
-
-            String header = q.header() == null ? "" : q.header().strip();
-            if (!header.isEmpty() && y < bottom) {
-                moveTo(buf, y, 0);
-                buf.append("\033[K");
-                buf.append("     ").append(BOLD).append(CYAN).append(truncate(header, safeW - 10)).append(RESET);
-                y++;
-            }
-
-            String question = q.question() == null ? "" : q.question().strip();
-            int rows = 0;
-            for (String line : UIMessage.wrapText(question, Math.max(16, safeW - 8))) {
-                if (y >= bottom || rows >= 3) break;
-                moveTo(buf, y, 0);
-                buf.append("\033[K");
-                buf.append("     ").append(BOLD).append(truncate(line, safeW - 6)).append(RESET);
-                y++;
-                rows++;
-            }
-            y++;
-
-            if (!q.options().isEmpty() && y < bottom) {
-                // 选项列表预留至少 1 行给下方的自定义输入框
-                int shown = Math.min(q.options().size(), Math.min(6, Math.max(1, bottom - y - 2)));
-                for (int oi = 0; oi < shown && y < bottom; oi++) {
-                    var opt = q.options().get(oi);
-                    boolean sel = oi == selected;
-                    moveTo(buf, y, 0);
-                    buf.append("\033[K");
-                    buf.append("     ").append(sel ? BOLD + WHITE + "● " + RESET : GRAY + "○ " + RESET);
-                    buf.append(GRAY).append(oi + 1).append(". ").append(RESET);
-                    buf.append(sel ? BOLD + WHITE : WHITE)
-                       .append(truncate(opt.label(), Math.max(10, safeW - 28))).append(RESET);
-                    y++;
-                    String desc = opt.description() == null ? "" : opt.description().strip();
-                    if (!desc.isEmpty() && y < bottom) {
-                        moveTo(buf, y, 0);
-                        buf.append("\033[K");
-                        buf.append("           ").append(DIM).append(truncate(desc, Math.max(10, safeW - 24))).append(RESET);
-                        y++;
-                    }
-                }
-                if (q.options().size() > shown && y < bottom) {
-                    moveTo(buf, y, 0);
-                    buf.append("\033[K");
-                    buf.append("     ").append(DIM)
-                       .append("… +").append(q.options().size() - shown).append(" more").append(RESET);
-                    y++;
-                }
-            }
-            // 自定义输入行：纯文本题与带选项的题都显示，用户可随时直接输入自己的答案
-            if (y < bottom) {
-                boolean optionQuestion = current >= 0 && current < n
-                        && !qs.get(current).options().isEmpty();
-                boolean typing = !optionQuestion || customInput
-                        || (textAnswer != null && !textAnswer.isEmpty());
-                moveTo(buf, y, 0);
-                buf.append("\033[K");
-                if (!typing) {
-                    // 选项模式、尚未输入：给出明确的"进入自定义输入"提示
-                    buf.append("     ").append(DIM)
-                       .append("[Tab] type your own answer").append(RESET);
-                } else {
-                    buf.append("     ").append(DIM).append("custom answer: ").append(RESET)
-                       .append(GREEN).append("> ").append(RESET)
-                       .append(truncate(textAnswer == null ? "" : textAnswer, Math.max(10, safeW - 24)))
-                       .append(REVERSE).append(' ').append(RESET);
-                }
-                y++;
-            }
-        }
-
-        // ── 底部操作提示 ──
-        int hintRow = Math.max(0, h - 2);
-        moveTo(buf, hintRow, 0);
-        buf.append("\033[K");
-        boolean hasOptions = current >= 0 && current < n
-                && !qs.get(current).options().isEmpty();
-        String hint = hasOptions
-                ? (customInput
-                    ? "Typing custom answer (digits ok) · Enter confirm · Tab to choose · Esc cancel"
-                    : "Press 1-" + qs.get(current).options().size()
-                            + " to choose · Tab to type custom · Enter confirm · Esc cancel")
-                : "Type your answer · Enter to confirm · Esc to cancel";
-        buf.append(DIM).append(truncate(hint, safeW)).append(RESET);
-
-        int footRow = Math.max(0, h - 1);
-        moveTo(buf, footRow, 0);
-        buf.append("\033[K");
-        buf.append(DIM).append("DeveCode · AskUserQuestion").append(RESET);
+    /** 渲染问卷对话框（委托 AskUserDialog）。 */
+    void renderAskDialog(StringBuilder buf, int w, int h) {
+        AskUserDialog dlg = pendingAsk;
+        if (dlg != null) dlg.render(buf, w, h);
     }
 
     // ═══════════════════════════════════════════════════════════════
     //  内部类
     // ═══════════════════════════════════════════════════════════════
 
-    /** UI 消息记录 */
-    /**
-     * Return the display width of a character: 1 for ASCII, 2 for CJK/fullwidth.
-     */
-    private static int displayCharWidth(int codePoint) {
-        if (codePoint < 0x80) return 1;
-        if (codePoint >= 0x1100 && codePoint <= 0x115F) return 2;
-        if (codePoint >= 0x2E80 && codePoint <= 0xA4CF) return 2;
-        if (codePoint >= 0xAC00 && codePoint <= 0xD7A3) return 2;
-        if (codePoint >= 0xF900 && codePoint <= 0xFAFF) return 2;
-        if (codePoint >= 0xFE10 && codePoint <= 0xFE19) return 2;
-        if (codePoint >= 0xFE30 && codePoint <= 0xFE6F) return 2;
-        if (codePoint >= 0xFF01 && codePoint <= 0xFF60) return 2;
-        if (codePoint >= 0xFFE0 && codePoint <= 0xFFE6) return 2;
-        if (codePoint >= 0x1F000 && codePoint <= 0x1F9FF) return 2;
-        if (codePoint >= 0x20000) return 2;
-        return 1;
-    }
 
-
-    private static int visibleLength(String s) {
-        if (s == null) return 0;
-        String stripped = s.replaceAll("\u001b\\[[0-9;]*[a-zA-Z]", "");
-        int len = 0;
-        for (int i = 0; i < stripped.length(); i++) len += displayCharWidth(stripped.charAt(i));
-        return len;
-    }
-    /**
-     * UI 消息记录。封装一条消息在终端中显示所需的全部信息。
-     *
-     * @param role      消息角色："user" / "assistant" / "error" / "banner" / "tool"
-     * @param content   已格式化的内容（含 ANSI 颜色码），按 \n 分行
-     * @param timeLabel 时间标签（如 "14:30"），显示在首行前；null 表示不显示
-     * @param streaming 是否为流式进行中的消息（true 时不加空行分隔）
-     * @param error     是否为错误消息
-     */
-    private record UIMessage(String role, String content, String timeLabel, boolean streaming, boolean error) {
-        private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
-
-        static UIMessage banner() {
-            String banner = BOLD + APP_NAME + " " + APP_VERSION + RESET;
-            String cwd = System.getProperty("user.dir");
-            return new UIMessage("banner", banner + "\n" + DIM + cwd + RESET, null, false, false);
-        }
-
-        static UIMessage user(String text) {
-            return new UIMessage("user",
-                    BOLD + GREEN + "You" + RESET + ": " + text,
-                    LocalTime.now().format(TIME_FMT), false, false);
-        }
-
-        static UIMessage assistant(String text, String timeLabel) {
-            return new UIMessage("assistant",
-                    BOLD + CYAN + "DeveCode" + RESET + "\n" + text,
-                    timeLabel, false, false);
-        }
-
-        static UIMessage streaming(String text) {
-            return new UIMessage("assistant",
-                    BOLD + CYAN + "DeveCode" + RESET + "\n" + text,
-                    null, true, false);
-        }
-
-        /** 流式显示思考过程（每行浅灰色，带计时器） */
-        static UIMessage streamingThinking(String thinkText, long elapsed) {
-            return new UIMessage("assistant",
-                    BOLD + CYAN + "DeveCode" + RESET + "\n" +
-                    GRAY + "✻ Thinking… (" + elapsed + "s)" + RESET + "\n" +
-                    grayLines(thinkText),
-                    null, true, false);
-        }
-
-        /** 思考完成，显示结束标记 */
-        static UIMessage streamingThinkingDone(String thinkText) {
-            return new UIMessage("assistant",
-                    BOLD + CYAN + "DeveCode" + RESET + "\n" +
-                    GRAY + "✻ Thinking…\n" + grayLines(thinkText) + "\n" +
-                    GRAY + "✻ Done" + RESET,
-                    null, true, false);
-        }
-
-        /** 流式显示思考过程（含结束标记）+ 正文 */
-        static UIMessage streamingWithThinking(String thinkText, String responseText) {
-            return new UIMessage("assistant",
-                    BOLD + CYAN + "DeveCode" + RESET + "\n" +
-                    GRAY + "✻ Thinking…\n" + grayLines(thinkText) + "\n" +
-                    GRAY + "✻ Done" + RESET + "\n\n" +
-                    responseText,
-                    null, true, false);
-        }
-
-        // ── 工具调用相关的工厂方法 ──
-
-        /** 工具调用流式中（参数正在推送） */
-        static UIMessage streamingToolCall(String toolName, String argsDisplay) {
-            return new UIMessage("tool",
-                    YELLOW + "⚙ " + CYAN + toolName + RESET +
-                    GRAY + "(" + argsDisplay + ")" + RESET,
-                    null, true, false);
-        }
-
-        /** 工具调用完成（显示完整参数） */
-        static UIMessage toolCall(String toolName, String argsDisplay) {
-            return new UIMessage("tool",
-                    YELLOW + "⚙ " + CYAN + toolName + RESET +
-                    GRAY + "(" + argsDisplay + ")" + RESET,
-                    LocalTime.now().format(TIME_FMT), false, false);
-        }
-
-        /** 工具执行中 */
-        static UIMessage toolExecuting(String toolName) {
-            return new UIMessage("tool",
-                    YELLOW + "⚙ " + CYAN + toolName + RESET +
-                    GRAY + "  executing…" + RESET,
-                    null, false, false);
-        }
-
-        /** 工具执行结果（超长输出截断为前 500 字符，附执行耗时） */
-        static UIMessage toolResult(String toolName, String output, boolean isError, double elapsed) {
-            String color = isError ? RED : GRAY;
-            String display = output;
-            if (display != null && display.length() > 500) {
-                display = display.substring(0, 500) + "\n…";
-            }
-            String time = elapsed > 0
-                    ? GRAY + " [" + String.format("%.1fs", elapsed) + "]" + RESET
-                    : "";
-            // 输出可能含换行，逐行包裹颜色防止 \n 分割后丢失颜色
-            String body = display != null ? display : "";
-            String[] lines = body.split("\n", -1);
-            var sb = new StringBuilder();
-            for (int i = 0; i < lines.length; i++) {
-                if (i > 0) sb.append("\n");
-                sb.append(color).append(i == 0 ? "↳ " : "  ").append(lines[i]);
-                if (i == lines.length - 1) sb.append(time);
-                sb.append(RESET);
-            }
-            return new UIMessage("tool", sb.toString(), null, false, false);
-        }
-
-        /** 系统提示消息（压缩/重试/中断/轮次汇总等） */
-        static UIMessage system(String text) {
-            return new UIMessage("system", text, null, false, false);
-        }
-
-        /** 权限询问：显示待执行操作和 y/a/n 选项 */
-        static UIMessage permissionRequest(String toolName, String description) {
-            return new UIMessage("system",
-                    BOLD + YELLOW + "⚠ Permission required" + RESET + "\n" +
-                    BOLD + CYAN + toolName + RESET + GRAY + " — " + description + RESET + "\n" +
-                    BOLD + "[y]" + RESET + " allow   " +
-                    BOLD + "[a]" + RESET + " always allow   " +
-                    BOLD + "[n]" + RESET + " deny",
-                    LocalTime.now().format(TIME_FMT), false, false);
-        }
-
-        /** 将多行文本逐行包裹 GRAY 颜色（防止 \n 分割后丢失颜色） */
-        private static String grayLines(String text) {
-            if (text == null || text.isEmpty()) return "";
-            String[] lines = text.split("\n", -1);
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < lines.length; i++) {
-                if (i > 0) sb.append("\n");
-                sb.append(GRAY).append(lines[i]).append(RESET);
-            }
-            return sb.toString();
-        }
-
-        static UIMessage error(String text) {
-            return new UIMessage("error",
-                    BOLD + RED + "Error" + RESET + "\n" + RED + text + RESET,
-                    LocalTime.now().format(TIME_FMT), false, true);
-        }
-
-        List<RenderLine> toRenderLines(int width) {
-            List<RenderLine> result = new ArrayList<>();
-            String[] parts = content.split("\n", -1);
-            for (String part : parts) {
-                // 分词换行
-                List<String> wrapped = wrapText(part, width);
-                for (String w : wrapped) {
-                    result.add(new RenderLine("  " + w, ""));
-                }
-            }
-            if (!result.isEmpty()) {
-                // 为第一条加上时间标签
-                if (timeLabel != null && !timeLabel.isEmpty()) {
-                    var first = result.getFirst();
-                    result.set(0, new RenderLine(
-                            DIM + "[" + timeLabel + "]" + RESET + " " + first.text(),
-                            first.style()));
-                }
-            }
-            // 消息间加空行
-            if (!result.isEmpty() && !streaming) {
-                result.addFirst(new RenderLine("", ""));
-            }
-            return result;
-        }
-
-        static List<String> wrapText(String text, int width) {
-            List<String> result = new ArrayList<>();
-            if (text == null || text.isEmpty()) { result.add(""); return result; }
-            if (width <= 0) { result.add(text); return result; }
-            int totalDisplayWidth = visibleLength(text);
-            if (totalDisplayWidth <= width) { result.add(text); return result; }
-            StringBuilder currentLine = new StringBuilder();
-            int currentLineWidth = 0;
-            String plainText = text.replaceAll("\u001b\\[[0-9;]*[a-zA-Z]", "");
-            int plainPos = 0, origPos = 0;
-            while (plainPos < plainText.length()) {
-                char c = plainText.charAt(plainPos);
-                int cw = displayCharWidth(c);
-                if (currentLineWidth + cw > width && !currentLine.isEmpty()) {
-                    // 换行时传递 ANSI 颜色状态
-                    String ansiState = extractAnsiState(currentLine.toString());
-                    if (!ansiState.isEmpty()) currentLine.append(RESET);
-                    result.add(currentLine.toString());
-                    currentLine.setLength(0);
-                    if (!ansiState.isEmpty()) currentLine.append(ansiState);
-                    currentLineWidth = 0;
-                }
-                while (origPos < text.length()) {
-                    char oc = text.charAt(origPos);
-                    if (oc == '\u001b') {
-                        int seqEnd = origPos;
-                        while (seqEnd < text.length() && !Character.isLetter(text.charAt(seqEnd))) seqEnd++;
-                        if (seqEnd < text.length()) seqEnd++;
-                        currentLine.append(text, origPos, seqEnd);
-                        origPos = seqEnd;
-                    } else {
-                        currentLine.append(oc);
-                        origPos++;
-                        break;
-                    }
-                }
-                currentLineWidth += cw;
-                plainPos++;
-            }
-            if (!currentLine.isEmpty()) result.add(currentLine.toString());
-            if (result.isEmpty()) result.add("");
-            return result;
-        }
-
-        /** 提取文本末尾活跃的 ANSI 颜色码（遇 RESET 清空，遇设置码追加） */
-        private static String extractAnsiState(String text) {
-            StringBuilder state = new StringBuilder();
-            int i = 0;
-            while (i < text.length()) {
-                if (text.charAt(i) == '\u001b') {
-                    int start = i;
-                    i++;
-                    while (i < text.length() && !Character.isLetter(text.charAt(i))) i++;
-                    if (i < text.length()) i++;
-                    String code = text.substring(start, i);
-                    if (code.equals(RESET)) {
-                        state.setLength(0);
-                    } else {
-                        state.append(code);
-                    }
-                } else {
-                    i++;
-                }
-            }
-            return state.toString();
-        }
-
-    }
-
-    /** 渲染行：text 含 ANSI 颜色码，style 预留（目前未使用） */
-    private record RenderLine(String text, String style) {}
-
-    /**
-     * AskUserQuestion 问卷交互状态（单份问卷）。
-     *
-     * 跨线程访问约定：按键线程（inputLoop）通过 confirm/cancel/编辑方法修改状态，
-     * 主线程 render() 在 synchronized(this) 下做快照；answers 的修改同样受锁保护。
-     */
-    private final class AskUserRequestState {
-        final AgentEvent.AskUserRequestEvent event;
-        final List<String> answers; // 与 questions 平行；未答为 ""
-        int current;                // 当前题号（0-based）
-        int selectedOption = -1;    // 当前选项题选中的下标；-1=未选
-        String textAnswer = "";     // 当前自由文本题的输入
-        boolean customInput;        // true = 当前处于"自定义输入"模式（数字也进文本框）
-
-        AskUserRequestState(AgentEvent.AskUserRequestEvent event) {
-            this.event = event;
-            var list = new ArrayList<String>();
-            for (int i = 0; i < event.questions().size(); i++) list.add("");
-            this.answers = list;
-            this.customInput = !event.questions().isEmpty()
-                    && event.questions().getFirst().options().isEmpty();
-        }
-    }
-
-    /**
-     * 输入线程 → 主线程的事件（密封接口）。
-     *
-     * 事件类型：
-     *   - KeyTyped：可打印字符（ch >= 32 或 Tab），由主线程 handleKeyTyped 处理
-     *   - Submit：用户按 Enter 提交的文本，由主线程 submitMessage 处理
-     *   - TerminalResize：终端尺寸变化（目前由 readTerminalSize 轮询检测，此事件未使用）
-     *   - Exit：退出请求（Ctrl+C 或 EOF）
-     */
-    private sealed interface UIEvent {
-        record KeyTyped(int ch) implements UIEvent {}
-        record Submit(String text) implements UIEvent {}
-        record PickerConfirm() implements UIEvent {}
-        record TerminalResize(int cols, int rows) implements UIEvent {}
-        record Exit() implements UIEvent {}
-    }
-
-    // ── 全屏选择器数据类型 ──────────────────────────────────────────
-
-    /** 选择器条目：id（会话 ID / 序号）、title（主标题）、subtitle（元信息行）、payload（原始数据） */
-    private record PickerItem(String id, String title, String subtitle, Object payload) {}
-
-    /** 选择器状态：kind（"session" / "snapshot"，决定确认后的动作）、标题、条目列表 */
-    private record PickerState(String kind, String title, List<PickerItem> items) {}
 }
