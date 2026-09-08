@@ -2,6 +2,7 @@ package com.agent.agent;
 
 import com.agent.permission.PermissionResponse;
 
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
@@ -32,9 +33,22 @@ public sealed interface AgentEvent {
     //权限请求,超时后默认拒绝
     record PermissionRequestEvent(String toolName, String description,
                                   CompletableFuture<PermissionResponse> future) implements AgentEvent {}
-    //todo:在tui中让 Agent 可以向用户发起结构化问卷（多个问题，每个问题有独立回答），不仅仅是「允许/拒绝」的二元选择。这在需要收集多项用户输入的场景下非常有用。
-//    record AskUserRequestEvent(
-//            List<AskUserDialog.Question> questions,
-//            CompletableFuture<Map<String, String>> future
-//    ) implements AgentEvent {}
+
+    /**
+     * 结构化提问：Agent 经 AskUserQuestion 工具向用户发起问卷（多个问题，每个问题独立作答），
+     * 不仅仅是「允许/拒绝」的二元选择。StreamingExecutor 构造本事件并阻塞等待；
+     * TUI 以全屏对话框逐题收集答案，完成后通过 future 返回「题目序号(1-based) → 答案」映射，
+     * 用户取消时以空 Map 完成。
+     */
+    record AskUserRequestEvent(
+            List<Question> questions,
+            CompletableFuture<Map<String, String>> future
+    ) implements AgentEvent {
+
+        /** 单个问题：header 为短标签；options 为空表示自由文本作答。 */
+        public record Question(String question, String header, List<Option> options) {}
+
+        /** 选项：label 为答案文本（必填），description 为补充说明（可空）。 */
+        public record Option(String label, String description) {}
+    }
 }
