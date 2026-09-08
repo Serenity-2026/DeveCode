@@ -34,7 +34,7 @@ public class AnthropicCodeClient implements LlmClient {
 
     @Override
     public void setMaxOutputTokens(int tokens) {
-        this.maxOutputTokens=maxOutputTokens;
+        this.maxOutputTokens=tokens;
     }
 
     public AnthropicCodeClient(ProviderConfig cfg, String systemPrompt) {
