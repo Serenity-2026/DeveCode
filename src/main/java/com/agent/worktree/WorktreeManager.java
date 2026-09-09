@@ -11,6 +11,31 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * 负责创建/删除/列出/清理由主 Agent 管理的工作树，并维护内存索引。
+ * 主Agent进入worktree:
+ * EnterWorktreeTool.execute()
+ *   ├─ 检查 WorktreeSessionStore.getCurrentSession() != null
+ *   │     → 如果已经在 worktree 里，拒绝重复进入
+ *   ├─ SlugValidator.validate(slug)
+ *   ├─ worktreeManager.create(slug, null)
+ *   │     ├─ SlugValidator 再校验一次（双保险）
+ *   │     ├─ git worktree add -B ...
+ *   │     ├─ PostCreationSetup.perform(...)
+ *   │     └─ 把 WorktreeInfo 记进自己的 Map
+ *   ├─ new WorktreeSession(original_cwd, path, name, branch, ...)
+ *   ├─ WorktreeSessionStore.restoreSession(session)   // 内存单例
+ *   └─ WorktreeSessionStore.save(root, session)       // 磁盘持久化
+ *
+ *
+ *   退出worktree:
+ *   ExitWorktreeTool.execute()
+ *   ├─ WorktreeSessionStore.getCurrentSession()  // 没有就 no-op
+ *   ├─ WorktreeChanges.countChanges(path, originalHeadCommit)
+ *   │     ├─ 有改动且没显式 discard → 拒绝删除
+ *   │     └─ 干净 → 允许 remove
+ *   ├─ WorktreeSessionStore.restoreSession(null)
+ *   ├─ WorktreeSessionStore.save(root, null)      // 清磁盘记录
+ *   └─ worktreeManager.remove(session.worktreeName())
+ *         └─ 从自己的 Map 找到 path → git worktree remove → 从 Map 移除
  */
 public class WorktreeManager {
 
@@ -36,7 +61,7 @@ public class WorktreeManager {
 
     /**
      * Creates a new git worktree for the given branch under
-     * {@code .mewcode/worktrees/<branch>}.
+     * {@code .devecode/worktrees/<branch>}.
      *
      * @param branch    the new branch name
      * @param targetDir optional override for the worktree directory; when

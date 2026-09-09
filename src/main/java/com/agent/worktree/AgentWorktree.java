@@ -17,6 +17,23 @@ import java.util.regex.Pattern;
  * - 主 Agent 的 worktree：要持久、要能恢复现场、要进全局 session；
  * - 子 Agent 的 worktree：跑完就完了，可能保留、可能删除，没有“恢复现场”需求。
  * WorktreeManager 是“有状态的管理器”，AgentWorktree 是“无状态的静态工具”。
+ * 子Agent使用worktree模式时的工作流程:
+ * AgentTool.runSync(...)  isolation == "worktree"
+ *   ├─ slug = "agent-a" + 随机hex
+ *   ├─ AgentWorktree.create(slug,
+ *   │        worktreeManager.getProjectRoot(),     // 从 WorktreeManager 取仓库根
+ *   │        worktreeManager.getSymlinkDirs())     // 从 WorktreeManager 取软链目录
+ *   │     ├─ SlugValidator.validate(slug)
+ *   │     ├─ git worktree add -B ...
+ *   │     ├─ PostCreationSetup.perform(...)
+ *   │     └─ 返回 Result{path, branch, headCommit, gitRoot}
+ *   ├─ subAgent.setWorkDir(wtResult.worktreePath())
+ *   ├─ buildNotice(...) 拼进 prompt
+ *   ├─ 子 Agent 在隔离树里工作
+ *   │
+ *   └─ 结束后 WorktreeChanges.hasChanges(path, headCommit)
+ *         ├─ 有改动 → 保留，返回 path/branch 给父 Agent
+ *         └─ 干净 → AgentWorktree.remove(path, branch, gitRoot)
  */
 public final class AgentWorktree {
 
