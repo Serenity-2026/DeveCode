@@ -23,6 +23,15 @@ public class AppConfig {
 
     public void setProviders(List<ProviderConfig> providers) { this.providers = providers; }
 
+    /** Convenience accessor: requires exactly one configured provider. */
+    public ProviderConfig getSingle() {
+        if (providers == null || providers.size() != 1) {
+            throw new IllegalStateException("Expected exactly one provider, got "
+                    + (providers == null ? 0 : providers.size()));
+        }
+        return providers.get(0);
+    }
+
     public String getPermissionMode() { return permissionMode; }
 
     public void setPermissionMode(String permissionMode) { this.permissionMode = permissionMode; }

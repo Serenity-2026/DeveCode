@@ -20,6 +20,10 @@ public class ProviderConfig {
     private int contextWindow;
     private int maxOutputTokens;
 
+    /** SnakeYAML JavaBean 反序列化需要的无参构造（字段经 setter 灌入）。 */
+    public ProviderConfig() {
+    }
+
     public ProviderConfig(String name, String protocol, String baseUrl, String model, String apiKey, boolean thinking) {
         this.name = name;
         this.protocol = protocol;

@@ -144,7 +144,7 @@ public class TerminalUI implements SkillForkHost {
     // ── 手动压缩进行中标志（/compact 后台执行期间禁止提交）──
     private volatile boolean compacting = false;
 
-    // ── MCP（providers.yaml mcp_servers 段）──
+    // ── MCP（.devecode/config.yaml 的 mcp_servers 段）──
     private final McpManager mcpManager;                    // null = 未配置任何 MCP server
     final List<McpManager.ServerInfo> mcpServers = new ArrayList<>(); // 已连接的 server
     final Map<String, Integer> mcpToolCounts = new LinkedHashMap<>(); // server 名 → 注册工具数
@@ -209,7 +209,7 @@ public class TerminalUI implements SkillForkHost {
      * 启动终端 UI。由 {@link DeveCodeApp} 在 provider 选择完成后调用。
      *
      * @param provider    用户选中的 provider 配置（含 API Key、模型名、协议等）
-     * @param mcpServers  providers.yaml 中 mcp_servers 段解析出的 MCP server 配置（可为空）
+     * @param mcpServers  .devecode/config.yaml 中 mcp_servers 段解析出的 MCP server 配置（可为空）
      */
     public static void launch(ProviderConfig provider, List<McpServerConfig> mcpServers) {
         try {

@@ -2,6 +2,7 @@
 package com.agent.config;
 
 import org.yaml.snakeyaml.LoaderOptions;
+import org.yaml.snakeyaml.TypeDescription;
 import org.yaml.snakeyaml.Yaml;
 import org.yaml.snakeyaml.constructor.Constructor;
 import org.yaml.snakeyaml.introspector.Property;
@@ -17,6 +18,11 @@ import java.util.Set;
 public class ConfigLoader {
 
     private static final Set<String> VALID_PROTOCOLS = Set.of("anthropic", "openai", "openai-compat");
+
+    /** Loads via default search paths: ~/.devecode/config.yaml -> .devecode/config.yaml -> config.local.yaml. */
+    public static AppConfig load() throws ConfigException {
+        return load(null);
+    }
 
     public static AppConfig load(String path) throws ConfigException {
         if (path != null && !path.isEmpty()) {
@@ -66,6 +72,11 @@ public class ConfigLoader {
         var loaderOptions = new LoaderOptions();
         var constructor = new Constructor(AppConfig.class, loaderOptions);
         constructor.setPropertyUtils(new SnakeCasePropertyUtils());
+        // Declare the element types of the providers/mcpServers lists so SnakeYAML builds the beans.
+        var typeDesc = new TypeDescription(AppConfig.class);
+        typeDesc.putListPropertyType("providers", ProviderConfig.class);
+        typeDesc.putListPropertyType("mcpServers", McpServerConfig.class);
+        constructor.addTypeDescription(typeDesc);
         var yaml = new Yaml(constructor);
         AppConfig cfg;
         try {
@@ -129,13 +140,17 @@ public class ConfigLoader {
     }
 
     private static void validate(AppConfig cfg) throws ConfigException {
-        for (int i = 0; i < cfg.getProviders().size(); i++) {
-            var p = cfg.getProviders().get(i);
+        var providers = cfg.getProviders();
+        if (providers == null || providers.isEmpty()) {
+            throw new ConfigException(
+                    "No providers configured. Add at least one entry under 'providers' in config.yaml");
+        }
+        for (int i = 0; i < providers.size(); i++) {
+            var p = providers.get(i);
             var missing = new ArrayList<String>();
 
             if (isBlank(p.getName())) missing.add("name");
             if (isBlank(p.getProtocol())) missing.add("protocol");
-            if (isBlank(p.getBaseUrl())) missing.add("base_url");
             if (isBlank(p.getModel())) missing.add("model");
 
             if (!missing.isEmpty()) {
@@ -150,7 +165,34 @@ public class ConfigLoader {
                                 .formatted(i + 1, p.getProtocol())
                 );
             }
+            if (p.resolvedApiKey().isEmpty()) {
+                throw new ConfigException(
+                        "Provider #%d ('%s'): no API key found. Set api_key in config.yaml or the %s environment variable"
+                                .formatted(i + 1, p.getName(), envVarFor(p.getProtocol())));
+            }
         }
+
+        var mcpServers = cfg.getMcpServers();
+        if (mcpServers != null) {
+            for (int i = 0; i < mcpServers.size(); i++) {
+                var s = mcpServers.get(i);
+                String label = isBlank(s.getName()) ? ("#" + (i + 1)) : ("'" + s.getName() + "'");
+                if (isBlank(s.getName())) {
+                    throw new ConfigException(
+                            "mcp_servers[%d]: missing 'name'. Each MCP server entry must have a name.".formatted(i));
+                }
+                boolean hasCommand = !isBlank(s.getCommand());
+                boolean hasUrl = !isBlank(s.getUrl());
+                if (!hasCommand && !hasUrl) {
+                    throw new ConfigException(
+                            "mcp_servers %s: has neither 'command' nor 'url'".formatted(label));
+                }
+            }
+        }
+    }
+
+    private static String envVarFor(String protocol) {
+        return "anthropic".equals(protocol) ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY";
     }
 
     private static boolean isBlank(String s) {

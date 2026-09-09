@@ -1,5 +1,7 @@
 package com.agent.tui;
 
+import com.agent.config.AppConfig;
+import com.agent.config.ConfigLoader;
 import com.agent.config.ProviderConfig;
 
 import org.jline.terminal.Terminal;
@@ -56,7 +58,14 @@ public class DeveCodeApp {
     };
 
     public static void main(String[] args) {
-        AppConfig config = AppConfig.load();
+        AppConfig config;
+        try {
+            config = ConfigLoader.load();
+        } catch (ConfigLoader.ConfigException e) {
+            System.err.println("Error: " + e.getMessage());
+            System.exit(1);
+            return;
+        }
         List<ProviderConfig> providers = config.getProviders();
 
         ProviderConfig selected;

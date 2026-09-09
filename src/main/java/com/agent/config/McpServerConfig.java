@@ -4,18 +4,19 @@ import java.util.List;
 import java.util.Map;
 
 /**
+ * mcp_servers 是 List，每项必须带 name，可配置多个 MCP 实例：
+ * <pre>
  * mcp_servers:
- *   # stdio：有 command 字段 → 启动子进程，走管道
- *   GitHub:
+ *   - name: GitHub          # stdio：有 command 字段 → 启动子进程，走管道
  *     command: "npx"
  *     args: ["-y", "@modelcontextprotocol/server-github"]
  *     env:
  *       GITHUB_TOKEN: "${GITHUB_TOKEN}"
- *   # Streamable HTTP：有 url 字段 → 发 HTTP 请求
- *   remote-tool:
+ *   - name: remote-tool     # Streamable HTTP：有 url 字段 → 发 HTTP 请求
  *     url: "https://api.example.com/mcp"
  *     headers:
  *       Authorization: "Bearer ${API_TOKEN}"
+ * </pre>
  */
 public class McpServerConfig {
 
