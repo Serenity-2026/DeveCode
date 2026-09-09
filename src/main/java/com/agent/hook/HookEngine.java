@@ -1,5 +1,7 @@
 package com.agent.hook;
 
+import com.agent.config.HookConfig;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
@@ -187,7 +189,8 @@ public class HookEngine {
         }
     }
 
-    public record HookResult(String hookId, String output, boolean success, boolean reject) {}
+    public record HookResult(String hookId, ActionType type, String output,
+                             boolean success, boolean reject) {}
 
     public record PreToolResult(boolean rejected, String message) {}
 
@@ -226,6 +229,39 @@ public class HookEngine {
             hooks.addAll(hookList);
             fired.clear();
         }
+    }
+
+    /**
+     * 把 config.yaml 的 hooks 段（HookConfig JavaBean）转成引擎可执行的 Hook 列表。
+     * 事件名 / 动作类型解析失败时保留 null，由 {@link #validate(List)} 汇总报错。
+     */
+    public static List<Hook> fromConfigs(List<HookConfig> configs) {
+        if (configs == null) return List.of();
+        var out = new ArrayList<Hook>(configs.size());
+        for (HookConfig c : configs) {
+            if (c == null) continue;
+            Duration timeout = c.getTimeout() > 0
+                    ? Duration.ofSeconds(c.getTimeout()) : Duration.ZERO;
+            var action = new Action(
+                    ActionType.fromString(c.getType()),
+                    c.getCommand(),
+                    c.getMessage(),
+                    c.getUrl(),
+                    c.getMethod(),
+                    c.getHeaders(),
+                    c.getBody(),
+                    timeout);
+            out.add(new Hook(
+                    c.getId(),
+                    EventName.fromString(c.getEvent()),
+                    c.getCondition(),
+                    action,
+                    c.isReject(),
+                    c.isOnce(),
+                    c.isAsync(),
+                    c.getOnError()));
+        }
+        return out;
     }
 
     // ======== Config validation ========
@@ -333,7 +369,7 @@ public class HookEngine {
                     HookResult res = executeAction(h, ctx);
                     notifications.add(res);
                 });
-                results.add(new HookResult(h.id(), "(async)", true, false));
+                results.add(new HookResult(h.id(), h.action().type(), "(async)", true, false));
                 continue;
             }
             //同步hook
@@ -565,7 +601,8 @@ public class HookEngine {
     private HookResult executeAction(Hook h, HookContext ctx) {
         return switch (h.action().type()) {
             case COMMAND -> executeCommand(h, ctx);
-            case PROMPT -> new HookResult(h.id(), h.action().message(), true, h.reject());
+            case PROMPT -> new HookResult(h.id(), h.action().type(),
+                    h.action().message(), true, h.reject());
             case HTTP -> executeHTTP(h, ctx);
             case AGENT -> executeAgent(h, ctx);
         };
@@ -603,7 +640,7 @@ public class HookEngine {
                 // 超时：强制终止进程
                 proc.destroyForcibly();
                 String msg = String.format("command timed out after %s", timeout);
-                return new HookResult(h.id(), msg, false, h.reject());
+                return new HookResult(h.id(), h.action().type(), msg, false, h.reject());
             }
 
             String stdout = new String(stdoutStream.readAllBytes()).strip();
@@ -614,12 +651,12 @@ public class HookEngine {
             if (!stderr.isEmpty()) {
                 output = output.isEmpty() ? stderr : output + "\n" + stderr;
             }
-            return new HookResult(h.id(), output, code == 0, h.reject());
+            return new HookResult(h.id(), h.action().type(), output, code == 0, h.reject());
         } catch (IOException | InterruptedException e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
-            return new HookResult(h.id(),
+            return new HookResult(h.id(), h.action().type(),
                     "Failed to execute hook: " + e.getMessage(), false, h.reject());
         }
     }
@@ -683,11 +720,11 @@ public class HookEngine {
             if (respBody != null && respBody.length() > 65536) {
                 respBody = respBody.substring(0, 65536);
             }
-            return new HookResult(h.id(),
+            return new HookResult(h.id(), h.action().type(),
                     String.format("HTTP %d: %s", resp.statusCode(), respBody != null ? respBody.strip() : ""),
                     ok, h.reject());
         } catch (Exception e) {
-            return new HookResult(h.id(), e.getMessage(), false, h.reject());
+            return new HookResult(h.id(), h.action().type(), e.getMessage(), false, h.reject());
         }
     }
 
@@ -697,7 +734,7 @@ public class HookEngine {
      */
     private HookResult executeAgent(Hook h, HookContext ctx) {
         if (agentRunner == null) {
-            return new HookResult(h.id(),
+            return new HookResult(h.id(), h.action().type(),
                     "agent-type hook configured but no AgentRunner registered",
                     false, h.reject());
         }
@@ -711,9 +748,9 @@ public class HookEngine {
 
         try {
             String output = agentRunner.apply(prompt, ctx);
-            return new HookResult(h.id(), output, true, h.reject());
+            return new HookResult(h.id(), h.action().type(), output, true, h.reject());
         } catch (Exception e) {
-            return new HookResult(h.id(), e.getMessage(), false, h.reject());
+            return new HookResult(h.id(), h.action().type(), e.getMessage(), false, h.reject());
         }
     }
 

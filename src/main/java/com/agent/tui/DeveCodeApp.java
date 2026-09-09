@@ -3,6 +3,7 @@ package com.agent.tui;
 import com.agent.config.AppConfig;
 import com.agent.config.ConfigLoader;
 import com.agent.config.ProviderConfig;
+import com.agent.hook.HookEngine;
 
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
@@ -66,6 +67,18 @@ public class DeveCodeApp {
             System.exit(1);
             return;
         }
+
+        // Hook 配置：转成 Hook 并提前校验，配置错误在进入终端 UI 前直接退出
+        var hooks = HookEngine.fromConfigs(config.getHooks());
+        var hookErrors = HookEngine.validate(hooks);
+        if (!hookErrors.isEmpty()) {
+            for (var err : hookErrors) {
+                System.err.println("Hook config error: " + err);
+            }
+            System.exit(1);
+            return;
+        }
+
         List<ProviderConfig> providers = config.getProviders();
 
         ProviderConfig selected;
@@ -79,7 +92,7 @@ public class DeveCodeApp {
         }
 
         // 交接点：把选定的 provider 和 MCP server 配置交给主聊天 UI，进入交互式对话循环
-        TerminalUI.launch(selected, config.getMcpServers());
+        TerminalUI.launch(selected, config.getMcpServers(), hooks);
     }
 
     /**

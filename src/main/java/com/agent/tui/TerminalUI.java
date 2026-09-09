@@ -210,10 +210,12 @@ public class TerminalUI implements SkillForkHost {
      *
      * @param provider    用户选中的 provider 配置（含 API Key、模型名、协议等）
      * @param mcpServers  .devecode/config.yaml 中 mcp_servers 段解析出的 MCP server 配置（可为空）
+     * @param hooks       config.yaml 中 hooks 段转换并校验后的 Hook 列表（可为空）
      */
-    public static void launch(ProviderConfig provider, List<McpServerConfig> mcpServers) {
+    public static void launch(ProviderConfig provider, List<McpServerConfig> mcpServers,
+                              List<HookEngine.Hook> hooks) {
         try {
-            new TerminalUI(provider, mcpServers).run();
+            new TerminalUI(provider, mcpServers, hooks).run();
         } catch (IOException e) {
             System.err.println("Failed to initialize terminal: " + e.getMessage());
             e.printStackTrace();
@@ -236,8 +238,10 @@ public class TerminalUI implements SkillForkHost {
      *
      * @param provider         provider 配置
      * @param mcpServerConfigs MCP server 配置列表（可为 null）
+     * @param hooks            config.yaml 中 hooks 段转换后的 Hook 列表（可为 null）
      */
-    private TerminalUI(ProviderConfig provider, List<McpServerConfig> mcpServerConfigs) throws IOException {
+    private TerminalUI(ProviderConfig provider, List<McpServerConfig> mcpServerConfigs,
+                       List<HookEngine.Hook> hooks) throws IOException {
         this.provider = provider;
         this.workDir = System.getProperty("user.dir");
         // 步骤 2：JLine Terminal — JNA 提供原生终端控制，SIG_IGN 防止 Ctrl+C 直接杀进程
@@ -303,8 +307,11 @@ public class TerminalUI implements SkillForkHost {
         // 步骤 8：权限裁决器 — 多层规则（Plan模式 → 安全命令 → 危险命令 → 路径沙箱 → YAML 规则 → 模式矩阵）
         this.permissionChecker = new PermissionChecker(
                 PermissionMode.DEFAULT, Path.of(workDir));
-        // Hook 引擎 — 生命周期钩子（默认无 hook，可通过 loadHooks 注入）
+        // Hook 引擎 — 生命周期钩子：加载 config.yaml hooks 段，Agent 各事件点会自动触发
         this.hookEngine = new HookEngine();
+        if (hooks != null && !hooks.isEmpty()) {
+            this.hookEngine.loadHooks(hooks);
+        }
         // 组装 Agent — 后端事件驱动的 agent 循环，UI 只消费 AgentEvent
         this.agent = new Agent(client, toolRegistry, provider);
         agent.setChecker(permissionChecker);
@@ -445,6 +452,10 @@ public class TerminalUI implements SkillForkHost {
             }
         }
 
+        // Hook：会话开始（hook 通知会作为系统消息追加到对话区）
+        fireUiHook(HookEngine.EventName.SESSION_START, null);
+        drainHookNotifications();
+
         // 输入线程：阻塞读取按键 → 事件队列
         Thread inputThread = Thread.startVirtualThread(this::inputLoop);
 
@@ -458,6 +469,9 @@ public class TerminalUI implements SkillForkHost {
                 while ((event = eventQueue.poll()) != null) {
                     handleEvent(event);
                 }
+
+                // Hook 通知展示：只在空闲（非流式）时追加，避免打断流式消息更新
+                if (!streaming) drainHookNotifications();
 
                 // 渲染（事件驱动 + 至少每秒一次的周期性刷新）
                 // 周期刷新保证右侧状态面板（CPU 占用、Context 用量、API usage）实时更新，
@@ -504,6 +518,10 @@ public class TerminalUI implements SkillForkHost {
         if (mcpManager != null) {
             try { mcpManager.shutdown(); } catch (Exception ignored) {}
         }
+        // Hook：会话结束 / Agent 关闭（进程即将退出，通知直接丢弃）
+        fireUiHook(HookEngine.EventName.SESSION_END, null);
+        fireUiHook(HookEngine.EventName.SHUTDOWN, null);
+        if (hookEngine != null) hookEngine.drainNotifications();
         writer.print(CURSOR_SHOW);
         writer.println();
         writer.flush();
@@ -2083,6 +2101,39 @@ public class TerminalUI implements SkillForkHost {
             }
         }
         scrollToBottom();
+    }
+
+    /** 触发一个 UI 生命周期 hook 事件（SESSION_START / SESSION_END / SHUTDOWN）。 */
+    private void fireUiHook(HookEngine.EventName event, String message) {
+        if (hookEngine == null) return;
+        try {
+            hookEngine.runHooks(new HookEngine.HookContext(
+                    event, null, null, null, message, null));
+        } catch (Exception ignored) {
+            // hook 失败不应影响 UI 主流程
+        }
+    }
+
+    /** 取出并展示 hook 通知（非流式时调用；PROMPT 输出也会在这里显示一次）。 */
+    private void drainHookNotifications() {
+        if (hookEngine == null) return;
+        var results = hookEngine.drainNotifications();
+        if (results.isEmpty()) return;
+        synchronized (messages) {
+            for (var r : results) {
+                String badge = r.success() ? GREEN + "✓" + RESET : RED + "✗" + RESET;
+                String type = r.type() == null ? "?" : r.type().value();
+                String id = r.hookId() == null || r.hookId().isEmpty() ? "(anonymous)" : r.hookId();
+                String header = GRAY + "⚡" + RESET + " " + badge
+                        + GRAY + " hook[" + id + "] " + type + RESET;
+                String output = r.output() == null ? "" : r.output().strip();
+                if (output.length() > 800) output = output.substring(0, 800) + "\n…";
+                messages.add(output.isEmpty()
+                        ? UIMessage.system(header)
+                        : UIMessage.system(header + "\n" + UIMessage.grayLines(output)));
+            }
+        }
+        needsRedraw = true;
     }
 
     /** 线程安全地追加消息（消费线程/输入线程/主线程均可能调用）。 */

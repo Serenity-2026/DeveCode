@@ -202,6 +202,9 @@ public class Agent implements SkillHost {
         // 每次 agentLoop 重读 catalog，skill 安装/热更新后下一条消息即生效。
         conv.injectLongTermMemory(instructions, memoryContent, buildSkillSection());
         try{
+        // Hook：单轮对话开始（每个用户请求对应一次 run()）
+        fireAgentHooks(HookEngine.EventName.TURN_START,
+                null, null, lastUserText(conv), null, conv);
         for (int iteration = 1; ; iteration++) {
             // 1. 检查迭代上限
             if (iteration > maxIterations) {
@@ -278,6 +281,9 @@ public class Agent implements SkillHost {
                 }
             } catch (Exception ignored) {}
             var tools = iterToolSchemas;
+            // Hook：每次发送 LLM 请求前（工具循环中多次迭代会多次触发）
+            fireAgentHooks(HookEngine.EventName.PRE_SEND,
+                    null, null, lastUserText(conv), null, conv);
             var streamQueue = client.stream(conv, tools);
             var text = new StringBuilder();
             var thinkingBlocks = new ArrayList<ThinkingBlock>();
@@ -336,6 +342,9 @@ public class Agent implements SkillHost {
                 if (event instanceof StreamEvent.StreamEnd || event instanceof StreamEvent.Error) break;
             }
 
+            // Hook：收到一次 LLM 响应后（含出错）
+            fireAgentHooks(HookEngine.EventName.POST_RECEIVE,
+                    null, null, text.toString(), lastStreamError, null);
             // 7. 错误恢复,在错误现场立即裁剪、压缩，如果让下一轮来判断不会触发压缩、裁剪动作
             if (streamError) {
                 if (lastStreamError != null && (lastStreamError.contains("context") || lastStreamError.contains("too long")
@@ -446,6 +455,9 @@ public class Agent implements SkillHost {
             }
         }
     } finally {
+            // Hook：单轮对话结束（正常结束 / 中断 / 异常都会走到这里）
+            fireAgentHooks(HookEngine.EventName.TURN_END,
+                    null, null, "", null, null);
             // 12. turn_end 通知，使用loopCompleted
             if (!loopCompleted) {
                 putSafe(queue, new AgentEvent.LoopComplete(0));
@@ -459,6 +471,45 @@ public class Agent implements SkillHost {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    /**
+     * Agent 生命周期 hook 的统一触发点：执行匹配 event 的 hook；PROMPT 型同步结果
+     * 在 conv 非空时作为 system-reminder 注入对话（只对 TURN_START / PRE_SEND 生效，
+     * 这两个点注入后会在随后的 LLM 请求里真正进入上下文）。
+     */
+    private void fireAgentHooks(HookEngine.EventName event,
+                                Map<String, Object> toolArgs,
+                                String filePath,
+                                String message,
+                                String error,
+                                ConversationManager conv) {
+        if (hookEngine == null) return;
+        try {
+            var ctx = new HookEngine.HookContext(event, null, toolArgs, filePath, message, error);
+            var results = hookEngine.runHooks(ctx);
+            if (conv == null) return;
+            for (var r : results) {
+                if (r.type() != HookEngine.ActionType.PROMPT) continue;
+                if (!r.success() || r.output() == null || r.output().isBlank()) continue;
+                conv.addSystemReminder(r.output().strip());
+            }
+        } catch (Exception ignored) {
+            // hook 失败不能影响 Agent 主循环
+        }
+    }
+
+    /** 取最近一条真实用户消息文本（跳过 system-reminder 与工具结果占位消息）。 */
+    private static String lastUserText(ConversationManager conv) {
+        var msgs = conv.getMessages();
+        for (int i = msgs.size() - 1; i >= 0; i--) {
+            var m = msgs.get(i);
+            String content = m.getContent();
+            if (!"user".equals(m.getRole()) || content == null || content.isBlank()) continue;
+            if (content.startsWith("<system-reminder>")) continue;
+            return content;
+        }
+        return "";
     }
 
     /**
