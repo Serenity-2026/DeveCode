@@ -18,25 +18,25 @@ import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
 /**
- * Hook 引擎 —— 管理生命周期钩子的注册、条件匹配和动作执行。
+ * Hook 引擎 —— 管理生命周期钩子的注册、条件匹配和动作执行。Hook=触发时间点+触发条件+动作
  * 功能集：
  *   - 9 种事件、4 种动作类型（command / prompt / http / agent）
  *   - != / =~ / =* 操作符，&& / || 复合条件
  *   - once（单次触发）、async（异步执行）、onError 错误策略
- *   - 配置校验、命令超时、环境变量注入、模板变量替换
+ *   - 动作:配置校验、命令超时、环境变量注入、模板变量替换
  *   在 Agent 运行过程中的关键节点（9 种事件）插入用户自定义逻辑，
  *   决定何时触发（条件匹配）、怎么执行（4 种动作）、执行后做什么（拦截/通知/异步）。
  *   它扮演的是"可插拔扩展点"的角色——主流程不感知具体业务，全部交给 Hook 去做。
  */
 public class HookEngine {
 
-    /** 命令执行的默认超时（10 分钟），与 Go 版一致 */
+    /** 命令执行的默认超时（10分钟） */
     private static final Duration DEFAULT_COMMAND_TIMEOUT = Duration.ofMinutes(10);
 
     /** HTTP 请求的默认超时（10 秒） */
     private static final Duration DEFAULT_HTTP_TIMEOUT = Duration.ofSeconds(10);
 
-    // ======== Event names ========
+    // ======== Event names ======== 什么时候
     //定义 Agent 生命周期中的 9 个触发点:
     public enum EventName {
         // 会话开始/结束
@@ -70,7 +70,7 @@ public class HookEngine {
         }
     }
 
-    // ======== Action types ========
+    // ======== Action types ======== 做什么
 
     public enum ActionType {
         //执行 shell 命令
@@ -98,7 +98,7 @@ public class HookEngine {
         }
     }
 
-    // ======== Data records ========
+    // ======== Data records ======== 行为需要的参数汇总
 
     /**
      * 动作定义
@@ -196,12 +196,13 @@ public class HookEngine {
     private final List<Hook> hooks = new ArrayList<>();
     /** 结果累积池,存所有执行过的hook的HookResult,包括异步hook在线程里跑完后写回的结果 */
     private final List<HookResult> notifications = Collections.synchronizedList(new ArrayList<>());
-    /** 已触发的hook ID集合,用于 once 去重 */
+    /** 已触发的hook ID集合,用于once去重，已触发的hook不再触发 */
     private final Set<String> fired = Collections.synchronizedSet(new HashSet<>());
 
     /**
      * Agent 类型 hook 的执行器（可选）。
      * 接收 prompt 和上下文，返回输出字符串。未注册时 agent hook 会返回明确错误。
+     * @todo:完成SubAgent模块后补充
      */
     private BiFunction<String, HookContext, String> agentRunner;
 
@@ -232,7 +233,7 @@ public class HookEngine {
     /**
      * 校验 hook 配置列表，提前暴露配置错误。
      * 所有错误聚合返回，不会因第一个错误就中断检查。
-     *
+     * 启动时把YAML配置解析成Hook列表→HookEngine.validate(hooks)先校验→再loadHooks(hooks)装载。
      * @return 校验错误列表，为空表示配置合法
      */
     public static List<String> validate(List<Hook> hooks) {
@@ -353,6 +354,7 @@ public class HookEngine {
         HookContext ctx = new HookContext(
                 EventName.PRE_TOOL_USE, toolName, args, null, null, null);
         for (Hook h : snapshotHooks()) {
+            //对所有满足条件的Hook触发
             if (h.event() != EventName.PRE_TOOL_USE) continue;
             if (!shouldFire(h, ctx)) continue;
 

@@ -1,7 +1,7 @@
 package com.agent.llm;
 
 import com.agent.infra.ModelResolver;
-import com.agent.infra.ProviderConfig;
+import com.agent.config.ProviderConfig;
 import com.agent.infra.LlmException;
 import com.agent.history.ConversationManager;
 import com.anthropic.client.AnthropicClient;

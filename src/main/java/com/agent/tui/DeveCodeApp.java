@@ -1,6 +1,6 @@
 package com.agent.tui;
 
-import com.agent.infra.ProviderConfig;
+import com.agent.config.ProviderConfig;
 
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;

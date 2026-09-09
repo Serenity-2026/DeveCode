@@ -1,7 +1,7 @@
 package com.agent;
 
 import com.agent.history.ConversationManager;
-import com.agent.infra.ProviderConfig;
+import com.agent.config.ProviderConfig;
 import com.agent.llm.LlmClient;
 import com.agent.llm.StreamEvent;
 

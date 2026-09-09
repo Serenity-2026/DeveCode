@@ -2,7 +2,7 @@ package com.agent.llm;
 
 
 import com.agent.history.ConversationManager;
-import com.agent.infra.ProviderConfig;
+import com.agent.config.ProviderConfig;
 
 import java.util.List;
 import java.util.Map;

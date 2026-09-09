@@ -1,7 +1,7 @@
 package com.agent.tui;
 
 import com.agent.config.McpServerConfig;
-import com.agent.infra.ProviderConfig;
+import com.agent.config.ProviderConfig;
 import org.yaml.snakeyaml.Yaml;
 
 import java.io.IOException;

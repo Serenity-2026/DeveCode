@@ -6,7 +6,7 @@ import com.agent.history.ConversationManager;
 import com.agent.skill.SkillCatalog;
 import com.agent.skill.SkillHost;
 import com.agent.hook.HookEngine;
-import com.agent.infra.ProviderConfig;
+import com.agent.config.ProviderConfig;
 import com.agent.llm.*;
 import com.agent.permission.PermissionChecker;
 import com.agent.permission.PermissionMode;

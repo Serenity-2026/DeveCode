@@ -13,7 +13,7 @@ import com.agent.config.McpServerConfig;
 import com.agent.history.ConversationManager;
 import com.agent.history.HistoryStore;
 import com.agent.hook.HookEngine;
-import com.agent.infra.ProviderConfig;
+import com.agent.config.ProviderConfig;
 import com.agent.llm.LlmClient;
 import com.agent.llm.Message;
 import com.agent.llm.StreamEvent;
@@ -45,7 +45,6 @@ import java.io.UncheckedIOException;
 import java.lang.management.ManagementFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.LocalTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -64,7 +63,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Predicate;
+
 import com.sun.management.OperatingSystemMXBean;
 
 /**
