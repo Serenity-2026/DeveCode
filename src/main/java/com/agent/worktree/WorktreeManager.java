@@ -14,7 +14,7 @@ import java.util.concurrent.TimeUnit;
  * 主Agent进入worktree:
  * EnterWorktreeTool.execute()
  *   ├─ 检查 WorktreeSessionStore.getCurrentSession() != null
- *   │     → 如果已经在 worktree 里，拒绝重复进入
+ *   │     → 如果已经在 worktree 里，拒绝重复进入,需要先退出worktree
  *   ├─ SlugValidator.validate(slug)
  *   ├─ worktreeManager.create(slug, null)
  *   │     ├─ SlugValidator 再校验一次（双保险）
@@ -28,14 +28,22 @@ import java.util.concurrent.TimeUnit;
  *
  *   退出worktree:
  *   ExitWorktreeTool.execute()
- *   ├─ WorktreeSessionStore.getCurrentSession()  // 没有就 no-op
- *   ├─ WorktreeChanges.countChanges(path, originalHeadCommit)
- *   │     ├─ 有改动且没显式 discard → 拒绝删除
- *   │     └─ 干净 → 允许 remove
- *   ├─ WorktreeSessionStore.restoreSession(null)
+ *   ├─ WorktreeSessionStore.getCurrentSession()  // 没有就 no-op,先确保自己在worktree会话里
+ *   ├─ action:keep：离开 worktree，但目录、分支、改动全部保留；
+ *             remove：离开并删除这棵 worktree 的工作目录；
+ *             discard_changes：当 remove 时检测到改动，必须显式确认“我知道会丢改动”，否则拒绝删除。
+ *   ├─ 用户选择remove时:WorktreeChanges.countChanges(path, originalHeadCommit),判断是否有未提交文件及commit数量,if true,要求用户再次确认
+ *                                                                             └─ 干净 → 允许 remove
+ *
+ *   ├─ WorktreeSessionStore.restoreSession(null)//清理内存单例,让主Agent知道自己已经不在worktree中
  *   ├─ WorktreeSessionStore.save(root, null)      // 清磁盘记录
- *   └─ worktreeManager.remove(session.worktreeName())
- *         └─ 从自己的 Map 找到 path → git worktree remove → 从 Map 移除
+ *   ├─ 按 action 执行实际动作,action = "remove":git worktree remove <path> --force——删除工作目录；
+ *                                             从 WorktreeManager 的内存台账里移除该条目。
+ *                           action = "keep":不对文件系统做任何事。worktree 目录、分支、改动全部保留；只是 SessionStore 里不再把它当作“当前工作区”。
+ *   ├─ worktreeManager.remove(session.worktreeName())//先清session，再清worktree，好处是即使删除失败，系统也不会认为自己还卡在一棵已经不存在的树里
+ *   └─ 返回结果:remove 成功："Exited and removed worktree at ... Session is now back in <originalCwd>"
+ *              keep："Exited worktree. Your work is preserved at ..."
+ *
  */
 public class WorktreeManager {
 
