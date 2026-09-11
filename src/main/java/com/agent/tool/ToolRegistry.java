@@ -14,6 +14,9 @@ public class ToolRegistry {
     public void register(Tool tool) {
         tools.put(tool.name(), tool);
     }
+    public List<Tool> listTools() {
+        return List.copyOf(tools.values());
+    }
     /**根据工具名查找工具实例，供 Agent Loop 执行工具调用时使用*/
     public Tool getTool(String name) {
         return tools.get(name);
@@ -156,4 +159,5 @@ public class ToolRegistry {
         }
         return filtered;
     }
+
 }

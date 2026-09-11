@@ -79,7 +79,7 @@ public record SubAgentSpec(
             null
     );
 
-    // 禁止写入的PLAN Agent
+    // 禁止写入的EXPLORE Agent
     public static final SubAgentSpec EXPLORE = new SubAgentSpec(
             "explore",
             "Fast read-only search agent for locating code",
