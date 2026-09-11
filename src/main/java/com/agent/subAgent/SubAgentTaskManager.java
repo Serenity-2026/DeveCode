@@ -146,10 +146,6 @@ public class SubAgentTaskManager {
                 .map(t -> new Task(t.id, t.name, t.status, t.output, t.error))
                 .toList();
     }
-    //子Agent静默超过这个时间就判定为卡死(5分钟:长构建/长测试期间工具不产生任何事件)
-    private static final long IDLE_TIMEOUT_SECONDS = 300;
-    //被放弃任务的收尾等待上限,见 drainRemaining
-    private static final long DRAIN_GRACE_SECONDS = 10;
 
     /**
      * 按照SubAgentSpec生产SubAgent
@@ -250,7 +246,7 @@ public class SubAgentTaskManager {
             while (!Thread.currentThread().isInterrupted()) {
                 AgentEvent event;
                 try {
-                    event = queue.poll(IDLE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    event = queue.poll(SubAgentStream.IDLE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     setFailed(taskId, "Interrupted");
@@ -309,38 +305,11 @@ public class SubAgentTaskManager {
         finally {
             //兜底:取消/超时/错误路径下生产者可能还活着,停掉它并把残留事件读干净
             if (!producerDone) {
-                subAgent.stop();
-                drainRemaining(queue);
+                SubAgentStream.stopAndDrain(subAgent, queue);
             }
         }
     }
 
-    /**
-     * 陪生产者走完最后一程:消费者一旦return就再没人读队列,而队列容量只有64,
-     * 生产者(内层AgentLoop)若还活着,填满后就会永久park在putSafe上——一个虚拟线程就这么吊着
-     * 整份对话(fork场景还吊着cloneForFork出来的注册表克隆),而且期间还在花token。
-     * 所以这里牺牲一点等待时间继续读,直到它发出LoopComplete(说明内层线程已经退出)或超过等待上限。
-     * 不能只调queue.clear():清空只是腾出空间,生产者马上又会填满,挡不住它继续跑。
-     */
-    private static void drainRemaining(BlockingQueue<AgentEvent> queue) {
-        //取消路径下消费线程自己正带着中断标志,不先清掉的话poll会立刻抛InterruptedException,排空就做不成
-        boolean interrupted = Thread.interrupted();
-        try {
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(DRAIN_GRACE_SECONDS);
-            while (System.nanoTime() < deadline) {
-                AgentEvent tail;
-                try {
-                    tail = queue.poll(200, TimeUnit.MILLISECONDS);
-                } catch (InterruptedException e) {
-                    break;
-                }
-                //LoopComplete是生产者的最后一条事件,收到它就说明内层线程已经退出
-                if (tail instanceof AgentEvent.LoopComplete) return;
-            }
-        } finally {
-            if (interrupted) Thread.currentThread().interrupt();
-        }
-    }
     private static String truncate(String s, int n) {
         return s.length() > n ? s.substring(0, n) + "..." : s;
     }
