@@ -179,15 +179,20 @@ public class Agent implements SkillHost {
 
     public BlockingQueue<AgentEvent> run(ConversationManager conv) {
         var queue = new LinkedBlockingQueue<AgentEvent>(64);
-        Thread.startVirtualThread(() -> {
-            agentThread = Thread.currentThread();
+        /**
+         * 按照以前的写法:在startVirtual中才给agentThread=currentThread,有可能出现startVirtual代码还没执行run已经执行完返回,解锁,
+         * 外部调用canceled方法->subAgent.stop()->agentThread为空,no op->消费线程停止但agentLoop还在执行
+         * 修改关键:start()之前就发布，stop()永远有目标.现在如果
+         */
+        agentThread = Thread.ofVirtual().unstarted(() -> {
             try {
                 agentLoop(conv, queue);
-            } catch (Exception e) {
-                putSafe(queue, new AgentEvent.ErrorEvent(
-                        "Agent error: " + e.getMessage()));
+            }
+            catch (Exception e) {
+                putSafe(queue, new AgentEvent.ErrorEvent("Agent error: " + e.getMessage()));
             }
         });
+        agentThread.start();
         return queue;
     }
     private void agentLoop(ConversationManager conv, BlockingQueue<AgentEvent> queue) {
