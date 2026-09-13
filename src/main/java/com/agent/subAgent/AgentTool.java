@@ -305,7 +305,7 @@ public class AgentTool implements Tool {
         boolean runInBackground = Boolean.TRUE.equals(args.get("run_in_background"));
 
         if (runInBackground) {
-            return runAsync(spec, description, prompt, modelOverride);
+            return runAsync(spec, description, prompt, modelOverride, isolation);
         }
         return runSync(spec, description, prompt, modelOverride, isolation);
         }
@@ -316,15 +316,41 @@ public class AgentTool implements Tool {
 
     // ---- Internal ----
 
-    private ToolResult runAsync(SubAgentSpec spec, String description, String prompt, String modelOverride) {
+    private ToolResult runAsync(SubAgentSpec spec, String description, String prompt,
+                                String modelOverride, String isolation) {
         if (taskManager == null) {
             return ToolResult.error("Background execution not available (no task manager configured)");
         }
         LlmClient subClient = selectClient(spec.model(), modelOverride);
-        String taskId = taskManager.spawnSubAgent(subClient, parentRegistry,  providerConfig, spec, prompt);
-        return ToolResult.success(
-                "Agent \"%s\" launched in background (task %s). You will be notified when it completes."
-                        .formatted(description, taskId));
+
+        //后台子Agent会和父Agent(以及别的子Agent)并行改同一份工作区,所以它比同步路径更需要隔离:
+        //这里为它单开一棵worktree。收尾不在这里做——任务在别的线程里结束,由台账在终态时回调onFinish
+        AgentWorktree.Result wtResult = null;
+        SubAgentTaskManager.WorktreeInfo worktree = null;
+        if ("worktree".equals(isolation) && worktreeManager != null) {
+            try {
+                wtResult = createAgentWorktree();
+                prompt = worktreeNotice(wtResult) + "\n\n" + prompt;
+                final AgentWorktree.Result wt = wtResult;
+                worktree = new SubAgentTaskManager.WorktreeInfo(
+                        wt.worktreePath(), () -> cleanupWorktree(wt));
+            } catch (Exception e) {
+                return ToolResult.error("Error creating agent worktree: " + e.getMessage());
+            }
+        }
+
+        try {
+            String taskId = taskManager.spawnSubAgent(
+                    subClient, parentRegistry, providerConfig, spec, prompt, worktree);
+            return ToolResult.success(
+                    "Agent \"%s\" launched in background (task %s)%s. You will be notified when it completes."
+                            .formatted(description, taskId,
+                                    worktree == null ? "" : " in an isolated worktree"));
+        } catch (RuntimeException e) {
+            //台账都没登记上,就没有人会来给这棵树收尾了,只能在这里就地收拾
+            return ToolResult.error("Error launching background agent: " + e.getMessage()
+                    + (wtResult == null ? "" : cleanupWorktree(wtResult)));
+        }
     }
 
     /**
@@ -401,17 +427,11 @@ public class AgentTool implements Tool {
         // Worktree isolation via AgentWorktree API
         AgentWorktree.Result wtResult = null;
         if ("worktree".equals(isolation) && worktreeManager != null) {
-            byte[] rndBytes = new byte[4];
-            new SecureRandom().nextBytes(rndBytes);
-            String slug = "agent-a" + HexFormat.of().formatHex(rndBytes).substring(0, 7);
             try {
-                wtResult = AgentWorktree.create(
-                        slug, worktreeManager.getProjectRoot(), worktreeManager.getSymlinkDirs());
+                wtResult = createAgentWorktree();
                 subAgent.setWorkDir(wtResult.worktreePath());
-                // Inject worktree notice into prompt
-                String notice = AgentWorktree.buildNotice(
-                        System.getProperty("user.dir"), wtResult.worktreePath());
-                prompt = notice + "\n\n" + prompt;
+                //告诉子Agent它在一个隔离树里工作,继承来的路径要翻译过来
+                prompt = worktreeNotice(wtResult) + "\n\n" + prompt;
             } catch (Exception e) {
                 return ToolResult.error("Error creating agent worktree: " + e.getMessage());
             }
@@ -538,6 +558,24 @@ public class AgentTool implements Tool {
         }
         AgentWorktree.remove(wtResult.worktreePath(), wtResult.worktreeBranch(), wtResult.gitRoot());
         return "";
+    }
+
+    /**
+     * 建一棵子Agent专用的隔离树:随机slug避免并发撞名(同步与后台两条路共用这一段)。
+     */
+    private AgentWorktree.Result createAgentWorktree() throws Exception {
+        byte[] rndBytes = new byte[4];
+        new SecureRandom().nextBytes(rndBytes);
+        String slug = "agent-a" + HexFormat.of().formatHex(rndBytes).substring(0, 7);
+        return AgentWorktree.create(slug, worktreeManager.getProjectRoot(), worktreeManager.getSymlinkDirs());
+    }
+
+    /**
+     * 拼"你在隔离树里、继承来的路径要翻译成新根"的说明,放在prompt最前面。
+     * 第一个参数是仓库根(项目根),不是进程工作目录——要翻译的是父的路径前缀。
+     */
+    private String worktreeNotice(AgentWorktree.Result wt) {
+        return AgentWorktree.buildNotice(worktreeManager.getProjectRoot(), wt.worktreePath());
     }
 
     /**

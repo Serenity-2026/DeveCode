@@ -127,7 +127,10 @@ public final class AgentWorktree {
                 + "file structure, separate working copy. Paths in the inherited context refer to the "
                 + "parent's working directory; translate them to your worktree root. Re-read files before "
                 + "editing if the parent may have modified them since they appear in the context. Your "
-                + "changes stay in this worktree and will not affect the parent's files.";
+                + "changes stay in this worktree and will not affect the parent's files. "
+                + "IMPORTANT: file tools resolve relative paths against the process working directory, "
+                + "so pass ABSOLUTE paths rooted at the worktree, and start shell commands with "
+                + "`cd <worktree> && ...`.";
     }
 
     // SHA-1（40 位）或 SHA-256（64 位）十六进制校验

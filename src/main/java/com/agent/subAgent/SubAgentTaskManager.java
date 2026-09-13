@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 
 /**
@@ -43,6 +44,14 @@ public class SubAgentTaskManager {
     public record Task(String id, String name, TaskStatus status, String output, String error) {}
     // 给父Agent的通知,父Agent不需要轮询,只需要drainNotifications()就能知道谁完成了
     public record TaskNotification(String taskId, String name, TaskStatus status, String output) {}
+
+    /**
+     * 后台子Agent的隔离工作区(目前只有worktree一种),由调用方创建,台账负责在终态收尾:
+     * 1. workDir交给子Agent自己——它的session目录、plan文件路径都基于workDir算;
+     * 2. onFinish在任务进入终态、生产者确实停下之后调用一次,返回值追加到那条通知里
+     *    (比如"worktree保留在X,因为里面还有改动"),否则父Agent永远不知道隔离目录的下场。
+     */
+    public record WorktreeInfo(String workDir, Supplier<String> onFinish) {}
     //id-taskEntry
     private final Map<String, TaskEntry> tasks = new LinkedHashMap<>();
 
@@ -158,13 +167,20 @@ public class SubAgentTaskManager {
             ProviderConfig cfg,
             SubAgentSpec spec,
             //prompt是任务描述
-            String prompt
+            String prompt,
+            //worktree:后台+隔离时的隔离树信息,不需要隔离就传null
+            WorktreeInfo worktree
     ) {
         //普通子Agent自己独立的前置工作:按spec裁剪工具 + 起一个没有父历史的空对话
         ToolRegistry subRegistry = ToolFilter.filterForAgent(registry, spec);
         var subAgent = new Agent(client, subRegistry, cfg);
         int maxTurns = spec.maxTurns() > 0 ? spec.maxTurns() : 200;
         subAgent.setMaxIterations(maxTurns);
+
+        //隔离树路径要交给子Agent自己:它的session目录、plan路径都基于workDir算
+        if (worktree != null && worktree.workDir() != null) {
+            subAgent.setWorkDir(worktree.workDir());
+        }
 
         var conv = new ConversationManager();
         if (spec.systemPromptOverride() != null && !spec.systemPromptOverride().isEmpty()) {
@@ -175,7 +191,7 @@ public class SubAgentTaskManager {
 
         String taskId = createTask(spec.name() + ": " + truncate(prompt, 50));
         //前置工作做完,剩下的交给公共后半段
-        return spawnBackground(taskId, subAgent, conv);
+        return spawnBackground(taskId, subAgent, conv, worktree);
     }
 
     /**
@@ -201,19 +217,19 @@ public class SubAgentTaskManager {
 
         String taskId = createTask("fork: " + truncate(taskLabel, 50));
         //前置工作做完,剩下的交给公共后半段
-        return spawnBackground(taskId, subAgent, forkConv);
+        return spawnBackground(taskId, subAgent, forkConv, null);
     }
 
     /**
      * spawnSubAgent / spawnForkAgent 的公共后半段:两条线各自把"用哪个Agent、配哪个对话"准备好之后,都从这里进来。
      * 它做三件事:登记台账 → 起后台消费线程 → 返回taskId让父Agent继续干活。
      */
-    private String spawnBackground(String taskId, Agent subAgent, ConversationManager conv) {
+    private String spawnBackground(String taskId, Agent subAgent, ConversationManager conv, WorktreeInfo worktree) {
         //在父线程里登记,而不是等worker线程跑起来再补登记:cancelTask只处理RUNNING的任务,
         //而setRunning在start()之前就把状态置成RUNNING并记下消费线程,
         //所以父Agent拿到taskId那一刻,t.agent与t.thread必须都已经在台账里,否则cancelTask的两个stop会同时打空
         attachAgent(taskId, subAgent);
-        Thread thread = Thread.ofVirtual().unstarted(() -> consume(taskId, subAgent, conv));
+        Thread thread = Thread.ofVirtual().unstarted(() -> consume(taskId, subAgent, conv, worktree));
         setRunning(taskId, thread);//之后cancelTask可用
         thread.start();
         return taskId;
@@ -223,7 +239,7 @@ public class SubAgentTaskManager {
      * 后台消费线程主体:先守好"取消发生在run()之前"这道门,再消费子Agent的事件流,结束时把终态写回台账。
      * 两条线(普通子Agent / fork)只有前面的准备不同,事件处理完全一样,所以只有这一份。
      */
-    private void consume(String taskId, Agent subAgent, ConversationManager conv) {
+    private void consume(String taskId, Agent subAgent, ConversationManager conv, WorktreeInfo worktree) {
         var output = new StringBuilder();
         //产生了两个线程,1个外部的消费线程及1个内部的AgentLoop线程
         //如果父Agent在run()之前就调用cancelTask，worker线程的interrupt标志会被设置，subAgent会被调用stop不过还没有run，agentThread=null，no op
@@ -235,6 +251,8 @@ public class SubAgentTaskManager {
             if (Thread.currentThread().isInterrupted()) {
                 subAgent.stop();
                 setFailed(taskId, "Interrupted");
+                //守门时就发现已被取消:Agent从没启动,但这棵树已经建好了,得有人收尾
+                finishWorktree(taskId, worktree);
                 return;
             }else{
                 queue =subAgent.run(conv);
@@ -306,6 +324,42 @@ public class SubAgentTaskManager {
             //兜底:取消/超时/错误路径下生产者可能还活着,停掉它并把残留事件读干净
             if (!producerDone) {
                 SubAgentStream.stopAndDrain(subAgent, queue);
+            }
+            //隔离资源收尾必须放在最后:生产者停稳了,读到的git状态才是最终状态
+            finishWorktree(taskId, worktree);
+        }
+    }
+
+
+    /**
+     * 隔离资源收尾:把onFinish的说明追加到该任务的通知上。
+     * 两条路都要走到——正常结束/失败走consume的finally,而"守门时就发现已被取消"那条路
+     * 是在try之前return的,不打这通电话那棵树就没人管了。
+     */
+    private void finishWorktree(String taskId, WorktreeInfo worktree) {
+        if (worktree == null) return;
+        String note;
+        try {
+            note = worktree.onFinish().get();
+        } catch (Exception e) {
+            //收尾自己失败不能连累消费线程,但也不能装看不见
+            note = "\n\n(worktree cleanup failed: " + e.getMessage() + ")";
+        }
+        appendToNotification(taskId, note);
+    }
+
+    /**
+     * 把补充信息追加到该任务已发出的那条通知上。
+     * 为什么是追加而不是重发:终态(含被cancelTask抢先写的取消)在进finally之前就写好了,
+     * 父Agent可能已经读过;重发会让一个任务凭空多出第二条结果,而隔离目录的下场又必须让它看见。
+     */
+    private synchronized void appendToNotification(String taskId, String note) {
+        if (note == null || note.isEmpty()) return;
+        for (int i = notifications.size() - 1; i >= 0; i--) {
+            var n = notifications.get(i);
+            if (n.taskId().equals(taskId)) {
+                notifications.set(i, new TaskNotification(n.taskId(), n.name(), n.status(), n.output() + note));
+                return;
             }
         }
     }
