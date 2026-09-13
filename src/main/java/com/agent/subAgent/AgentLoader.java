@@ -71,8 +71,7 @@ public final class AgentLoader {
                 try {
                     SubAgentSpec spec = parseAgentFile(path);
                     agents.put(spec.name(), spec);
-                } catch (Exception e) {
-                    // Skip invalid files silently, matching Go behaviour
+                } catch (Exception ignored) {
                 }
             }
         } catch (IOException e) {

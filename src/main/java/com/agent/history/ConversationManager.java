@@ -20,6 +20,28 @@ public class ConversationManager {
     private static final ObjectMapper MAPPER=new ObjectMapper();
 
 
+    public ConversationManager(){
+
+    }
+    /**
+     * 深拷贝:history 列表、Message 本体、以及它携带的三个 block 列表容器全部重建。
+     *
+     * 为什么必须深到这一层:fork 出来的子 Agent 会和父 Agent 并发跑各自的 agentLoop,
+     * 而 ToolResultBudget 写回是就地改消息(msg.setToolResults(...))。
+     * 只复制 history 列表的话,父子两边的写回会落在同一个 Message 对象上——
+     * 轻则互相覆盖(比如溢写预览里嵌了各自不同的路径,两边来回翻),重则两个线程无同步地改同一字段。
+     * block 本体(ThinkingBlock/ToolUseBlock/ToolResultBlock)是 record,按只读约定使用,复制容器即可。
+     */
+    public ConversationManager(ConversationManager c){
+        for(Message m : c.history){
+            Message copy = new Message(m.getRole(), m.getContent());
+            copy.setThinkingBlocks(m.getThinkingBlocks() == null ? null : List.copyOf(m.getThinkingBlocks()));
+            copy.setToolUses(m.getToolUses() == null ? null : List.copyOf(m.getToolUses()));
+            copy.setToolResults(m.getToolResults() == null ? null : List.copyOf(m.getToolResults()));
+            this.history.add(copy);
+        }
+    }
+
     public void addUserMessage(String content) {
         Message msg = new Message("user", content);
         history.add(msg);

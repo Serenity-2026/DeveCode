@@ -1,0 +1,607 @@
+
+package com.agent.subAgent;
+
+
+import com.agent.agent.Agent;
+import com.agent.agent.AgentEvent;
+import com.agent.config.ProviderConfig;
+import com.agent.history.ConversationManager;
+import com.agent.llm.LlmClient;
+import com.agent.llm.Message;
+import com.agent.llm.ToolResultBlock;
+import com.agent.llm.ToolUseBlock;
+import com.agent.teams.SpawnDispatcher;
+import com.agent.teams.TeamManager;
+import com.agent.teams.TeamTools;
+import com.agent.teams.TeammateRunner;
+import com.agent.tool.Tool;
+import com.agent.tool.ToolCategory;
+import com.agent.tool.ToolRegistry;
+import com.agent.tool.result.ContentReplacementState;
+import com.agent.tool.result.ToolResult;
+import com.agent.worktree.AgentWorktree;
+import com.agent.worktree.WorktreeChanges;
+import com.agent.worktree.WorktreeManager;
+
+import java.io.IOException;
+import java.security.SecureRandom;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.Function;
+
+/**
+ * 父Agent眼里根本没有"子Agent"这个概念，它只看到工具池里多了一个叫Agent的工具。
+ * 模型的工具调用落到 AgentTool.execute()，由它决定"这次要造哪种子 Agent、怎么造、在哪跑、跑完怎么还给父 Agent"。所以这个类是subAgent包唯一的对外门面
+ */
+public class AgentTool implements Tool {
+    //复用父llmClient
+    private final LlmClient client;
+    //subAgent和forkAgent的tool registry都从父agent toolRegistry中派生
+    private final ToolRegistry parentRegistry;
+    private final String protocol;
+    private final ProviderConfig providerConfig;
+
+    /** Optional: 将模型别名映射为实例. */
+    private Function<String, LlmClient> modelResolver;
+
+    /** Optional: loaded agent definitions (builtins + user + project). */
+    private Map<String, SubAgentSpec> agentSpecs;
+
+    /** Optional: receives progress events while the sub-agent runs. */
+    private Consumer<SubAgentProgress> progressListener;
+
+    /** Optional: task manager for background agent execution. */
+    private SubAgentTaskManager taskManager;
+
+    /** Optional: parent conversation for fork support. */
+    private ConversationManager parentConversation;
+
+    /** Optional: worktree manager for isolation mode. */
+    private WorktreeManager worktreeManager;
+
+    /** Optional: team manager for team_name registration. */
+    private TeamManager teamManager;
+
+    /** 标识当前 AgentTool 的生成上下文；fork 子 Agent 中会被设为 FORK_QUERY_SOURCE */
+    private String querySource = "";
+
+    private static final String FORK_BOILERPLATE_TAG = "<fork_boilerplate>";
+
+    private static final String FORK_BOILERPLATE = FORK_BOILERPLATE_TAG + """
+
+            You are a forked worker process. You are NOT the main agent.
+            Rules (non-negotiable):
+            1. Do NOT fork again.
+            2. Do NOT converse, ask questions, or request confirmation.
+            3. Use tools directly: read files, search code, make changes.
+            4. Stay strictly within your assigned task scope.
+            5. Final report must be under 500 characters, starting with "Scope:".
+            </fork_boilerplate>""";
+
+    /** fork 子 Agent 的 querySource 标记值，用于运行时拦截嵌套 fork */
+    private static final String FORK_QUERY_SOURCE = "agent:builtin:fork";
+
+    public AgentTool(LlmClient client, ToolRegistry parentRegistry, String protocol,
+                     ProviderConfig providerConfig) {
+        this.client = client;
+        this.parentRegistry = parentRegistry;
+        this.protocol = protocol;
+        this.providerConfig = providerConfig;
+    }
+
+    public void setModelResolver(Function<String, LlmClient> modelResolver) {
+        this.modelResolver = modelResolver;
+    }
+
+    public void setAgentSpecs(Map<String, SubAgentSpec> agentSpecs) {
+        this.agentSpecs = agentSpecs;
+    }
+
+    public void setProgressListener(Consumer<SubAgentProgress> progressListener) {
+        this.progressListener = progressListener;
+    }
+
+    public void setTaskManager(SubAgentTaskManager taskManager) {
+        this.taskManager = taskManager;
+    }
+
+    public SubAgentTaskManager getTaskManager() {
+        return taskManager;
+    }
+
+    public void setParentConversation(ConversationManager parentConversation) {
+        this.parentConversation = parentConversation;
+    }
+
+
+    private ContentReplacementState parentReplacementState;
+
+    public void setParentReplacementState(ContentReplacementState state) {
+        this.parentReplacementState = state;
+    }
+
+    public void setWorktreeManager(WorktreeManager worktreeManager) {
+        this.worktreeManager = worktreeManager;
+    }
+
+    public void setTeamManager(TeamManager teamManager) {
+        this.teamManager = teamManager;
+    }
+
+    public String getQuerySource() { return querySource; }
+    public void setQuerySource(String querySource) { this.querySource = querySource; }
+
+    /**
+     * 浅复制当前 AgentTool 并设置新的 querySource。
+     * fork 用它来标记子 Agent 的 AgentTool，使嵌套 fork 在调用时被拦截。
+     */
+    public AgentTool cloneWithQuerySource(String qs) {
+        AgentTool clone = new AgentTool(this.client, this.parentRegistry, this.protocol, this.providerConfig);
+        clone.modelResolver = this.modelResolver;
+        clone.agentSpecs = this.agentSpecs;
+        clone.progressListener = this.progressListener;
+        clone.taskManager = this.taskManager;
+        clone.parentConversation = this.parentConversation;
+        clone.worktreeManager = this.worktreeManager;
+        clone.teamManager = this.teamManager;
+        clone.parentReplacementState = this.parentReplacementState;
+        clone.querySource = qs;
+        return clone;
+    }
+
+    // ---- Tool interface ----
+
+    @Override
+    public String name() {
+        return "Agent";
+    }
+
+    @Override
+    public String description() {
+        var sb = new StringBuilder();
+        sb.append("Launch a sub-agent to handle a complex task. Each agent runs independently ");
+        sb.append("with its own context.\n\n");
+        sb.append("Use this when a task benefits from focused, isolated work -- e.g., ");
+        sb.append("researching a question, implementing a component, or reviewing code. ");
+        sb.append("The sub-agent cannot see the current conversation.\n\n");
+        sb.append("Available agent types:");
+
+        if (agentSpecs != null && !agentSpecs.isEmpty()) {
+            for (String name : AgentLoader.listNames(agentSpecs)) {
+                SubAgentSpec spec = agentSpecs.get(name);
+                sb.append("\n- ").append(name).append(": ").append(spec.description());
+            }
+        } else {
+            sb.append("\n- general-purpose: Full tool access for multi-step tasks (default)");
+            sb.append("\n- plan: Read-only tools for designing implementation plans");
+            sb.append("\n- explore: Read-only search agent for locating code");
+        }
+
+        sb.append("\n\nWrite a detailed prompt explaining what the agent should do and why ");
+        sb.append("-- it has no prior context.");
+        return sb.toString();
+    }
+
+    @Override
+    public ToolCategory category() {
+        return ToolCategory.COMMAND;
+    }
+
+    @Override
+    public Map<String, Object> schema() {
+        List<String> agentTypes;
+        if (agentSpecs != null && !agentSpecs.isEmpty()) {
+            agentTypes = AgentLoader.listNames(agentSpecs);
+        } else {
+            agentTypes = List.of("general-purpose", "plan", "explore");
+        }
+
+        Map<String, Object> properties = new LinkedHashMap<>();
+        properties.put("description", Map.of(
+                "type", "string",
+                "description", "A short (3-5 word) description of the task"
+        ));
+        properties.put("prompt", Map.of(
+                "type", "string",
+                "description", "The task for the agent to perform. Be detailed -- the agent has no context from this conversation."
+        ));
+        properties.put("subagent_type", Map.of(
+                "type", "string",
+                "enum", agentTypes,
+                "description", "The type of agent to use. Defaults to general-purpose."
+        ));
+        properties.put("model", Map.of(
+                "type", "string",
+                "enum", List.of("sonnet", "opus", "haiku"),
+                "description", "Override the model for this agent. Defaults to the parent's model."
+        ));
+        properties.put("run_in_background", Map.of(
+                "type", "boolean",
+                "description", "Set to true to run the agent in the background."
+        ));
+        properties.put("isolation", Map.of(
+                "type", "string",
+                "enum", List.of("worktree"),
+                "description", "Isolation mode. 'worktree' creates a temporary git worktree."
+        ));
+        properties.put("team_name", Map.of(
+                "type", "string",
+                "description", "REQUIRED when creating team members. Spawns the agent as a long-running "
+                        + "teammate under this team (created via TeamCreate). Unlike regular sub-agents, team "
+                        + "members run in their own terminal, persist after the lead returns, and communicate "
+                        + "with each other via SendMessage. Without team_name the agent runs as a one-shot "
+                        + "sub-agent that blocks and returns inline."
+        ));
+
+        Map<String, Object> inputSchema = new LinkedHashMap<>();
+        inputSchema.put("type", "object");
+        inputSchema.put("properties", properties);
+        inputSchema.put("required", List.of("description", "prompt"));
+
+        Map<String, Object> schema = new LinkedHashMap<>();
+        schema.put("name", name());
+        schema.put("description", description());
+        schema.put("input_schema", inputSchema);
+        return schema;
+    }
+
+    @Override
+    public boolean shouldDefer() {
+        return true;
+    }
+
+    /**
+     * @param args:name       是否必填           描述
+     *            description:是,3-5 词任务摘要，主要用于给父 Agent 自己看的结果文案
+     *            prompt:是,任务正文，子 Agent 对话里唯一的那条 user 消息
+     *            subagent_type:否,选哪种预定义模板；不填 = 走 fork
+     *            model:否,覆盖模型，值域靠 modelResolver 解释
+     *            isolation:否,目前只有 "worktree" 有意义
+     *            run_in_background:否,默认 false
+     *            team_name:否,有值就走 teammate 路径
+     * @return
+     */
+    @Override
+    public ToolResult execute(Map<String, Object> args) {
+        String description = getStringArg(args, "description");
+        String prompt = getStringArg(args, "prompt");
+        if (description == null || description.isEmpty() || prompt == null || prompt.isEmpty()) {
+            return ToolResult.error("Error: description and prompt are required");
+        }
+
+        String subagentType = getStringArg(args, "subagent_type");
+        String modelOverride = getStringArg(args, "model");
+        String isolation = getStringArg(args, "isolation");
+        String teamName = getStringArg(args, "team_name");
+        try {
+        // Team-member path: check BEFORE fork/subagent so team_name is never skipped,subagent_type缺省时用general-purpose兜底
+        if (teamName != null && !teamName.isEmpty() && teamManager != null) {
+            SubAgentSpec spec = (subagentType != null && !subagentType.isEmpty())
+                    ? resolveSpec(subagentType) : resolveSpec("general-purpose");
+            if (spec == null) spec = resolveSpec("general-purpose");
+            return runAsTeammate(spec, teamName, description, prompt, modelOverride, isolation);
+        }
+
+            // Fork path: no subagent_type specified.
+            if (subagentType == null || subagentType.isEmpty()) {
+                return runFork(description, prompt, modelOverride);
+            }
+
+        // Resolve the spec,如果使用了预定义外的Agent,返回可用子Agent列表
+        SubAgentSpec spec = resolveSpec(subagentType);
+        if (spec == null) {
+            String available = (agentSpecs != null)
+                    ? String.join(", ", AgentLoader.listNames(agentSpecs))
+                    : "general-purpose, plan, explore";
+            return ToolResult.error(
+                    "Error: unknown agent type '%s'. Available: %s".formatted(subagentType, available));
+        }
+
+        boolean runInBackground = Boolean.TRUE.equals(args.get("run_in_background"));
+
+        if (runInBackground) {
+            return runAsync(spec, description, prompt, modelOverride);
+        }
+        return runSync(spec, description, prompt, modelOverride, isolation);
+        }
+        catch (Exception ie){
+            return ToolResult.error("agent tool execute error:"+ie.getMessage());
+        }
+    }
+
+    // ---- Internal ----
+
+    private ToolResult runAsync(SubAgentSpec spec, String description, String prompt, String modelOverride) {
+        if (taskManager == null) {
+            return ToolResult.error("Background execution not available (no task manager configured)");
+        }
+        LlmClient subClient = selectClient(spec.model(), modelOverride);
+        String taskId = taskManager.spawnSubAgent(subClient, parentRegistry,  providerConfig, spec, prompt);
+        return ToolResult.success(
+                "Agent \"%s\" launched in background (task %s). You will be notified when it completes."
+                        .formatted(description, taskId));
+    }
+
+    /**
+     * fork 的全部价值是"继承父历史 + 父工具池，在同一份工作区里和父并行干活",所以没有考虑worktree
+     */
+    private ToolResult runFork(String description, String prompt, String modelOverride) throws IOException {
+        if (parentConversation == null) {
+            return ToolResult.error("Error: fork requires parent conversation context");
+        }
+        if (taskManager == null) {
+            return ToolResult.error("Error: fork requires task manager for background execution");
+        }
+
+        // 主检测：querySource 标记（压缩安全，对话历史被摘要后仍可检测）
+        if (FORK_QUERY_SOURCE.equals(querySource)) {
+            return ToolResult.error("Error: cannot fork from a forked agent. Use subagent_type to spawn a definition-based agent instead.");
+        }
+
+        // Build forked conversation: copy parent messages + append fork boilerplate + task
+        ConversationManager forkedConv = buildForkedConversation(parentConversation, prompt);
+
+        LlmClient subClient = selectClient(null, modelOverride);
+        // fork 继承父 Agent 的完整工具池，确保子 Agent 拥有相同的工具能力；
+        // AgentTool 实例的 querySource 被标记以拦截嵌套
+        ToolRegistry forkedRegistry = ToolFilter.cloneForFork(parentRegistry);
+        String taskId = taskManager.spawnForkAgent(
+                subClient, forkedRegistry,  providerConfig,
+                prompt,
+                forkedConv,
+                parentReplacementState.copy());
+
+        return ToolResult.success(
+                "Forked agent \"%s\" launched in background (task %s). Results will arrive via task-notification."
+                        .formatted(description, taskId));
+    }
+
+    /**
+     * 给subAgent一份新的cm副本:
+     * assistant带tool_uses但没有tool_results：这是"父刚好停在工具调用中间"的半截状态，API要求每个tool_use必有配对结果，所以先补一条 (tool execution interrupted by fork) 的占位结果；。
+     * 最后追加 FORK_BOILERPLATE + "\n\nYour task:\n" + prompt。
+     * @return
+     */
+    private static ConversationManager buildForkedConversation(ConversationManager parent, String task) throws IOException {
+        ConversationManager forked = new ConversationManager(parent);
+        Message lastMessage = parent.getMessages().getLast();
+        boolean hasAgentTool=false;
+        for (ToolUseBlock toolUs : lastMessage.getToolUses()) {
+            if ("Agent".equals(toolUs.toolName())) {
+                hasAgentTool = true;
+                break;
+            }
+        }
+        if(hasAgentTool){
+            //为最后一条message的所有工具调用构造占位符
+            var placeholders = lastMessage.getToolUses().stream()
+                    .map(tu -> new ToolResultBlock(
+                            tu.toolId(), "(tool execution interrupted by fork)", false))
+                    .toList();
+            forked.addToolResultsMessage(placeholders);
+            forked.addUserMessage(FORK_BOILERPLATE + "\n\nYour task:\n" + task);
+        }
+        else throw new IOException("don't have agent tool use ");
+        return forked;
+    }
+
+    private ToolResult runSync(SubAgentSpec spec, String description, String prompt, String modelOverride, String isolation) {
+        ToolRegistry subRegistry = ToolFilter.filterForAgent(parentRegistry, spec);
+        LlmClient subClient = selectClient(spec.model(), modelOverride);
+
+        Agent subAgent = new Agent(subClient, subRegistry,  providerConfig);
+        int maxTurns = spec.maxTurns() > 0 ? spec.maxTurns() : 200;
+        subAgent.setMaxIterations(maxTurns);
+
+        // Worktree isolation via AgentWorktree API
+        AgentWorktree.Result wtResult = null;
+        if ("worktree".equals(isolation) && worktreeManager != null) {
+            byte[] rndBytes = new byte[4];
+            new SecureRandom().nextBytes(rndBytes);
+            String slug = "agent-a" + HexFormat.of().formatHex(rndBytes).substring(0, 7);
+            try {
+                wtResult = AgentWorktree.create(
+                        slug, worktreeManager.getProjectRoot(), worktreeManager.getSymlinkDirs());
+                subAgent.setWorkDir(wtResult.worktreePath());
+                // Inject worktree notice into prompt
+                String notice = AgentWorktree.buildNotice(
+                        System.getProperty("user.dir"), wtResult.worktreePath());
+                prompt = notice + "\n\n" + prompt;
+            } catch (Exception e) {
+                return ToolResult.error("Error creating agent worktree: " + e.getMessage());
+            }
+        }
+
+        ConversationManager conv = new ConversationManager();
+        if (spec.systemPromptOverride() != null && !spec.systemPromptOverride().isEmpty()) {
+            conv.addSystemReminder(spec.systemPromptOverride());
+        }
+        conv.addUserMessage(prompt);
+
+        long startNanos = System.nanoTime();
+        var output = new StringBuilder();
+        int toolCount = 0;
+
+        BlockingQueue<AgentEvent> queue = subAgent.run(conv);
+
+        //失败原因,null表示成功:终态只在循环外处理一次,避免每个分支各写一套收尾
+        String failure = null;
+        //生产者(内层AgentLoop)是否已经自行收尾:收到LoopComplete就说明它后面不会再往队列里放事件了
+        boolean producerDone = false;
+        try {
+            loop:
+            while (!Thread.currentThread().isInterrupted()) {
+                AgentEvent event;
+                try {
+                    event = queue.poll(SubAgentStream.IDLE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    failure = "Agent interrupted";
+                    break;
+                }
+                if (event == null) {
+                    failure = "Agent timed out waiting for events";
+                    break;
+                }
+
+                switch (event) {
+                    case AgentEvent.StreamText st -> output.append(st.text());
+
+                    case AgentEvent.ToolResultEvent tre -> {
+                        toolCount++;
+                        emitProgress(description, spec.name(), tre.toolName(), tre.output(),
+                                tre.isError(), false, toolCount, elapsedSeconds(startNanos));
+                    }
+
+                    case AgentEvent.ErrorEvent err -> {
+                        //SubAgent直接把它当做错误处理,因为subagent没有那么长的上下文以及速率达到上限也不应该继续用subagent
+                        failure = "Agent failed: " + err.message();
+                        break loop;
+                    }
+
+                    case AgentEvent.RetryEvent r -> {
+                        //RetryEvent是子Agent正在自己做错误恢复(too long context→compact、rate_limit→等待、max_tokens→续写),
+                        //too long context→compact、rate_limit已在ErrorEvent中处理，此处是在处理max_tokens
+                        failure = "Agent aborted on retry: " + r.reason();
+                        break loop;
+                    }
+
+                    case AgentEvent.CompactEvent c -> {
+                        //只在父Agent做压缩
+                        failure = "Agent aborted: its context needed compaction, "
+                                + "compact this conversation (or split the task) and retry.";
+                        break loop;
+                    }
+
+                    case AgentEvent.LoopComplete lc -> {
+                        //正常结束发 LoopComplete(n>0),异常/中断/超限在 finally 里发 LoopComplete(0)
+                        producerDone = true;
+                        if (lc.totalTurns() <= 0) {
+                            failure = "Agent ended without completing";
+                        }
+                        break loop;
+                    }
+
+                    default -> {
+                        // ThinkingText, ThinkingComplete, ToolUseEvent, TurnComplete, UsageEvent, etc.
+                        // -- consumed but not surfaced to the parent
+                    }
+                }
+            }
+            //循环静默退出:中断落在"处理事件"的过程中,上面任何一个分支都没走
+            if (failure == null) {
+                failure = "Agent interrupted";
+            }
+        }
+        catch (RuntimeException e) {
+            //消费体自己抛异常也要给父Agent一个结论,否则这次工具调用永远不返回
+            failure = "Agent consumer error: " + e.getMessage();
+        }
+        finally {
+            //唯一的停止点:不管从哪条路径离开(成功/失败/中断/异常),都保证生产者被停、残留事件读干净
+            if (!producerDone) {
+                SubAgentStream.stopAndDrain(subAgent, queue);
+            }
+        }
+
+        double totalTime = elapsedSeconds(startNanos);
+        if (failure != null) {
+            emitProgress(description, spec.name(), true, true, toolCount, totalTime);
+            return ToolResult.error(failure + cleanupWorktree(wtResult));
+        }
+
+        emitProgress(description, spec.name(), false, true, toolCount, totalTime);
+        String result = output.toString();
+        if (result.isEmpty()) {
+            result = "(agent produced no output)";
+        }
+        long elapsedMs = Math.round(totalTime * 1000);
+        return ToolResult.success(
+                "Agent \"%s\" completed in %d.%03ds.\n\n%s%s".formatted(
+                        description, elapsedMs / 1000, elapsedMs % 1000, result, cleanupWorktree(wtResult)));
+    }
+
+    /**
+     * Worktree收尾(fail-closed):有未提交改动或新提交 → 留下并告知路径;完全干净 → 删掉。
+     * 成功与失败两条路都要走,否则每次失败都会在磁盘上留下一个没人管的worktree。
+     */
+    private String cleanupWorktree(AgentWorktree.Result wtResult) {
+        if (wtResult == null) return "";
+        if (WorktreeChanges.hasChanges(wtResult.worktreePath(), wtResult.headCommit())) {
+            return "\n\nWorktree kept at %s (branch %s) — has uncommitted changes or new commits."
+                    .formatted(wtResult.worktreePath(), wtResult.worktreeBranch());
+        }
+        AgentWorktree.remove(wtResult.worktreePath(), wtResult.worktreeBranch(), wtResult.gitRoot());
+        return "";
+    }
+
+    /**
+     * 根据SubAgent的name返回具体实例
+     */
+    private SubAgentSpec resolveSpec(String name) {
+        if (agentSpecs != null) {
+            return agentSpecs.get(name);
+        }
+        return switch (name) {
+            case "general-purpose" -> SubAgentSpec.GENERAL_PURPOSE;
+            case "plan" -> SubAgentSpec.PLAN;
+            case "explore" -> SubAgentSpec.EXPLORE;
+            default -> null;
+        };
+    }
+
+    /**
+     * todo:以团队成员的方式执行,先缺省日后扩展
+     * @return
+     */
+    private ToolResult runAsTeammate(SubAgentSpec spec, String teamName,
+                                     String description, String prompt, String modelOverride, String isolation) {
+        return ToolResult.success("");
+    }
+
+    /**
+     * 父llmClient兜底
+     */
+    private LlmClient selectClient(String specModel, String overrideModel) {
+        String model = (overrideModel != null && !overrideModel.isEmpty()) ? overrideModel : specModel;
+        if (model == null || model.isEmpty() || "inherit".equals(model)) {
+            return client;
+        }
+        if (modelResolver != null) {
+            LlmClient resolved = modelResolver.apply(model);
+            if (resolved != null) {
+                return resolved;
+            }
+        }
+        return client;
+    }
+
+    private void emitProgress(String description, String agentType,
+                              boolean isError, boolean done, int toolCount, double totalTime) {
+        emitProgress(description, agentType, null, null, isError, done, toolCount, totalTime);
+    }
+
+    private void emitProgress(String description, String agentType,
+                              String toolName, String toolOutput,
+                              boolean isError, boolean done, int toolCount, double totalTime) {
+        if (progressListener != null) {
+            progressListener.accept(new SubAgentProgress(
+                    agentType, description, toolName, toolOutput,
+                    isError, done, toolCount, totalTime));
+        }
+    }
+
+    private static double elapsedSeconds(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1_000_000_000.0;
+    }
+
+    private static String getStringArg(Map<String, Object> args, String key) {
+        Object v = args.get(key);
+        return v instanceof String s ? s : null;
+    }
+}
