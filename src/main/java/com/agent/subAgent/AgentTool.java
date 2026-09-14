@@ -593,13 +593,70 @@ public class AgentTool implements Tool {
         };
     }
 
-    /**
-     * todo:以团队成员的方式执行,先缺省日后扩展
-     * @return
-     */
+
     private ToolResult runAsTeammate(SubAgentSpec spec, String teamName,
                                      String description, String prompt, String modelOverride, String isolation) {
-        return ToolResult.success("");
+        var team = teamManager.getTeam(teamName);
+        //验证是否有这个团队
+        if (team == null) {
+            return ToolResult.error("Error: team '%s' not found. Create it first with TeamCreate.".formatted(teamName));
+        }
+        //使用desc创建队员名
+        String memberName = description.toLowerCase()
+                .replaceAll("[^a-z0-9]+", "-")     // 非字母数字统一变成连字符（顺带干掉 Windows 非法字符）
+                .replaceAll("^-+|-+$", "");        // 去掉首尾连字符
+        if (memberName.isEmpty()) memberName = "teammate";
+        if (memberName.length() > 30) memberName = memberName.substring(0, 30);
+        int suffix = 2;
+        String base = memberName;
+        while (team.hasMember(memberName)) {
+            memberName = base + "-" + suffix++;
+        }
+
+        ToolRegistry subRegistry = ToolFilter.filterForAgent(parentRegistry, spec);
+        // Add coordination tools for teammates
+        subRegistry.register(new TeamTools.SendMessageTool(teamManager, memberName));
+
+        LlmClient subClient = selectClient(spec.model(), modelOverride);
+
+        // Gather peer names for addendum
+        var otherMembers = team.memberNames();
+
+        //告诉队友"你是谁、队友有谁"
+        String addendum = TeammateRunner.buildTeammateAddendum(
+                teamName, memberName, otherMembers);
+
+        // Optional worktree isolation
+        String workdir = null;
+        if ("worktree".equals(isolation) && worktreeManager != null) {
+            try {
+                byte[] rndBytes = new byte[4];
+                new SecureRandom().nextBytes(rndBytes);
+                String slug = "agent-a" + HexFormat.of().formatHex(rndBytes).substring(0, 7);
+                var wtResult = AgentWorktree.create(
+                        slug, worktreeManager.getProjectRoot(), worktreeManager.getSymlinkDirs());
+                workdir = wtResult.worktreePath();
+                String notice = AgentWorktree.buildNotice(
+                        System.getProperty("user.dir"), wtResult.worktreePath());
+                prompt = notice + "\n\n" + prompt;
+            } catch (Exception e) {
+                return ToolResult.error("Error creating teammate worktree: " + e.getMessage());
+            }
+        }
+
+        // Spawn teammate
+        try {
+            var spawnResult = SpawnDispatcher.spawnTeammate(
+                    new SpawnDispatcher.SpawnConfig(
+                            team, memberName, prompt, addendum,
+                            subClient, subRegistry,  providerConfig, workdir));
+
+            return ToolResult.success(
+                    "Teammate \"%s\" spawned in team \"%s\" (mode: %s). The teammate is now working on the assigned task."
+                            .formatted(memberName, teamName, spawnResult.mode()));
+        } catch (Exception e) {
+            return ToolResult.error("Error spawning teammate: " + e.getMessage());
+        }
     }
 
     /**
