@@ -12,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
@@ -267,6 +268,30 @@ public class FileMailBox {
     }
 
     /**
+     * 续约专用的写回：用 WRITE + TRUNCATE_EXISTING，**不带头 CREATE**。
+     *
+     * 为什么要和 writeOwner 分开：Files.writeString 不传选项时等价于 CREATE+TRUNCATE_EXISTING+WRITE，
+     * 也就是"文件不存在就创建"。而心跳线程不在 jvmLock 里，会和 release 的删除产生这个交错：
+     *   心跳：readOwner 校验 token 通过 →（被调度切走）
+     *   持有线程：beat.cancel(false)（不打断已在执行的心跳）→ release() 删掉锁文件
+     *   心跳：writeOwner 写回 → 把刚删掉的锁文件"复活"
+     * 结果是一个幽灵锁：归属还是个已经结束的 token，但心跳时间是刚写的，30 秒内不会被判成僵尸，
+     * 下一个抢锁者会一直重试到 ACQUIRE_TIMEOUT(10s) 再抛 MailboxBusyException。
+     * 去掉 CREATE 之后，文件已被删除时会抛 NoSuchFileException，直接忽略即可，锁不会被复活。
+     */
+    private void refreshOwner(Path lockFile, LockOwner me) {
+        try {
+            Files.writeString(lockFile,
+                    MAPPER.writeValueAsString(
+                            new LockOwner(me.token(), me.pid(), me.host(), System.currentTimeMillis())),
+                    StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
+        } catch (IOException e) {
+            // 文件已被正常释放（或其它 IO 问题）：续约失败不影响持有，忽略
+            log.fine("heartbeat skipped: " + e);
+        }
+    }
+
+    /**
      * 读出锁的归属信息。解析失败（含"刚创建还没写内容"的空文件）一律返回 null，
      * 调用方必须把 null 当成"无法判断"——保守起见不抢锁。
      */
@@ -323,7 +348,9 @@ public class FileMailBox {
         return HEARTBEAT_POOL.scheduleAtFixedRate(() -> {
             LockOwner current = readOwner(lockFile);
             if (current == null || !current.token().equals(me.token())) return;   // 锁已经不是我的了
-            writeOwner(lockFile, new LockOwner(me.token(), me.pid(), me.host(), System.currentTimeMillis()));
+            //用 refreshOwner 而不是 writeOwner：万一下面这行执行前锁已被 release 删除，
+            //writeOwner 会把它重新创建出来（幽灵锁），refreshOwner 只会抛 NoSuchFileException 并忽略
+            refreshOwner(lockFile, me);
         }, HEARTBEAT_INTERVAL.toMillis(), HEARTBEAT_INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
     }
 
