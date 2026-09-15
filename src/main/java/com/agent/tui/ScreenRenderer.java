@@ -4,6 +4,7 @@ import static com.agent.tui.TuiStyle.*;
 
 import com.agent.command.Command;
 import com.agent.mcp.McpManager;
+import com.agent.teams.TeammateProgress;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -440,7 +441,31 @@ final class ScreenRenderer {
         }
         y++;
 
-        // 区块六：CPU
+        // 区块六：Teammates（只在有队友时出现，避免常态占用面板高度）
+        var mates = ui.teammateProgress();
+        if (!mates.isEmpty() && y + 3 < endRow) {
+            y = panelHeader(buf, y, padX, maxW, "Teammates");
+            int shownMates = 0;
+            for (var tp : mates) {
+                if (shownMates++ >= 3) {
+                    y = panelLine(buf, y, padX, maxW,
+                            GRAY + "… +" + (mates.size() - 3) + " more" + RESET);
+                    break;
+                }
+                String mark = switch (tp.getStatus()) {
+                    case "completed" -> GREEN + "●" + RESET;
+                    case "failed" -> RED + "●" + RESET;
+                    default -> YELLOW + "●" + RESET;
+                };
+                y = panelLine(buf, y, padX, maxW,
+                        mark + " " + WHITE + tp.getName() + RESET + GRAY + " · "
+                                + TeammateProgress.formatTokens(tp.getTokenCount()) + " tok · "
+                                + truncate(tp.getActivitySummary(), 16) + RESET);
+            }
+            y++;
+        }
+
+        // 区块七：CPU
         y = panelHeader(buf, y, padX, maxW, "CPU");
         y = panelKV(buf, y, padX, maxW, "Threads:", String.valueOf(cpuThreads));
         y = panelKV(buf, y, padX, maxW, "Usage:", String.format("%.1f%%", cpuLoad));
