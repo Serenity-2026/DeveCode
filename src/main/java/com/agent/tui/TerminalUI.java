@@ -31,6 +31,13 @@ import com.agent.skill.SkillInstallReport;
 import com.agent.skill.SkillInstaller;
 import com.agent.skill.SkillSource;
 import com.agent.skill.SkillExecutor;
+import com.agent.subAgent.AgentLoader;
+import com.agent.subAgent.AgentTool;
+import com.agent.subAgent.SubAgentSpec;
+import com.agent.subAgent.SubAgentTaskManager;
+import com.agent.teams.TeamManager;
+import com.agent.teams.TeamTools;
+import com.agent.teams.TeammateRunner;
 import com.agent.tool.impl.*;
 import com.agent.tool.ToolRegistry;
 import com.agent.tool.FileHistory;
@@ -112,6 +119,10 @@ public class TerminalUI implements SkillForkHost {
     final PermissionChecker permissionChecker;   // 多层权限裁决器
     private final HookEngine hookEngine;         // Hook 引擎（生命周期钩子）
     private final Agent agent;                   // 后端 agent（事件驱动）
+
+    // ── 子 Agent / 团队（subAgent + teams 包）──
+    private final SubAgentTaskManager subAgentTaskManager; // 后台子 Agent 任务台账
+    private final TeamManager teamManager;                 // 团队容器（各队的成员与邮箱）
     volatile String sessionId;                   // 会话 ID（session 包持久化 / 快照目录 / 面板显示）
     private final String workDir;                // 工作目录（session/memory/command 存储根）
 
@@ -365,6 +376,34 @@ public class TerminalUI implements SkillForkHost {
                                 "uninstall", "Uninstall an installed skill <name>",
                                 "exit", "Deactivate an active skill <name>")),
                 null);
+        // ── 子 Agent 接入（subAgent 包）──
+        // 工具池里多一个 "Agent" 工具：模型借此派生子 Agent / fork / 后台任务 / 团队成员
+        this.subAgentTaskManager = new SubAgentTaskManager();
+        Map<String, SubAgentSpec> agentSpecs = AgentLoader.loadAll(Path.of(workDir));
+        var agentTool = new AgentTool(client, toolRegistry, provider.getProtocol(), provider);
+        agentTool.setAgentSpecs(agentSpecs);
+        agentTool.setTaskManager(subAgentTaskManager);
+        agentTool.setParentConversation(conversation);                      // fork 需要父对话快照
+        agentTool.setParentReplacementState(agent.getReplacementState());   // fork 复用父级裁剪决策
+        toolRegistry.register(agentTool);                                   // Agent 是 deferred 工具，模型经 ToolSearch 加载
+
+        // ── 团队接入（teams 包）──
+        this.teamManager = new TeamManager();
+        toolRegistry.register(new TeamTools.TeamCreateTool(teamManager));
+        toolRegistry.register(new TeamTools.TeamDeleteTool(teamManager));
+        toolRegistry.register(new TeamTools.SendMessageTool(teamManager, TeammateRunner.LEAD_NAME));
+        agentTool.setTeamManager(teamManager);   // 缺它的话，Agent 的 team_name 分支永远进不去
+
+        // 通知线：lead 每轮迭代开始前，把"队友的汇报 / idle"和"后台子 Agent 的完成通知"收进对话
+        agent.setNotificationSource(() -> {
+            var notes = new ArrayList<String>(TeammateRunner.drainLeadMailbox(teamManager));
+            for (var n : subAgentTaskManager.drainNotifications()) {
+                notes.add("<task-notification id=\"%s\" status=\"%s\">\n%s\n</task-notification>"
+                        .formatted(n.taskId(), n.status(), n.output()));
+            }
+            return notes;
+        });
+
         // 渲染器：只负责绘制，状态仍从本类读取（同包可见字段）
         this.renderer = new ScreenRenderer(this);
     }
@@ -518,6 +557,8 @@ public class TerminalUI implements SkillForkHost {
         if (mcpManager != null) {
             try { mcpManager.shutdown(); } catch (Exception ignored) {}
         }
+        // 停止所有团队成员：中断队友线程，避免退出后仍残留后台循环
+        try { teamManager.closeAll(); } catch (Exception ignored) {}
         // Hook：会话结束 / Agent 关闭（进程即将退出，通知直接丢弃）
         fireUiHook(HookEngine.EventName.SESSION_END, null);
         fireUiHook(HookEngine.EventName.SHUTDOWN, null);

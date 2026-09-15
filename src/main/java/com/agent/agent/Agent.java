@@ -24,6 +24,7 @@ import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 
 public class Agent implements SkillHost {
     private final LlmClient client;
@@ -75,6 +76,22 @@ public class Agent implements SkillHost {
     }
 
     private ContentReplacementState replacementState = new ContentReplacementState();
+
+    /**
+     * 可选的外部通知源：agentLoop 每轮迭代开始前调用一次，返回的每条文本都作为
+     * system-reminder 注入对话。teams 包用它把队友的汇报 / idle 通知喂给 lead。
+     * 之所以用回调而不是直接调用，是为了避免 agent 包反向依赖 teams 包（teams 依赖 agent）。
+     */
+    private Supplier<List<String>> notificationSource;
+
+    public void setNotificationSource(Supplier<List<String>> source) {
+        this.notificationSource = source;
+    }
+
+    /** 供 fork / 队友共享父级的工具结果裁剪决策（保证 prompt cache 前缀一致） */
+    public ContentReplacementState getReplacementState() {
+        return replacementState;
+    }
 
     private HookEngine hookEngine;
     //LoopComplete事件是否已发送"的幂等标志——保证正常退出和异常退出两条路径下 LoopComplete 都恰好发一次，让UI不会因为信号缺失而卡死、也不会因为信号重复而错乱。
@@ -230,6 +247,16 @@ public class Agent implements SkillHost {
                     sb.append(dn).append("\n");
                 }
                 conv.addSystemReminder(sb.toString());
+            }
+            // 3.5 注入外部通知（teams 包的队友消息、后台子 Agent 的完成通知…）
+            if (notificationSource != null) {
+                try {
+                    for (String note : notificationSource.get()) {
+                        if (note != null && !note.isBlank()) conv.addSystemReminder(note);
+                    }
+                } catch (Exception ignored) {
+                    // 通知源失败绝不能影响主循环
+                }
             }
             // 4. 获取工具 schema，调用 LLM（激活 skill 白名单并集过滤 schema 侧）
             var iterToolSchemas = registry.getAllSchemas(protocol);
