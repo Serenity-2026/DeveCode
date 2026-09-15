@@ -7,6 +7,7 @@ import com.agent.llm.ToolUseBlock;
 import com.agent.permission.PermissionChecker;
 import com.agent.permission.PermissionResponse;
 import com.agent.tool.impl.AskUserQuestionTool;
+import com.agent.tool.PathContext;
 import com.agent.tool.Tool;
 import com.agent.tool.ToolCategory;
 import com.agent.tool.ToolRegistry;
@@ -372,7 +373,7 @@ public class StreamingExecutor {
         if (!(pathObj instanceof String) || ((String) pathObj).isEmpty()) return;
         String path = (String) pathObj;
         try {
-            String content = Files.readString(Path.of(path));
+            String content = Files.readString(PathContext.resolve(path));
             recoveryState.recordFileRead(path, content);
         } catch (IOException ignored) {
             // Best-effort snapshot; if the file vanished between the tool

@@ -2,6 +2,7 @@ package com.agent.tool.impl;
 
 import com.agent.config.SandboxConfig;
 import com.agent.sandbox.Sandbox;
+import com.agent.tool.PathContext;
 import com.agent.tool.Tool;
 import com.agent.tool.ToolCategory;
 import com.agent.tool.result.ToolResult;
@@ -130,9 +131,10 @@ public class BashTool implements Tool {
             // 合并 stdout 和 stderr 到同一个流，简化输出解析
             pb.redirectErrorStream(true);
 
-            // 设置工作目录
-            if (workDir != null && !workDir.isEmpty()) {
-                pb.directory(new java.io.File(workDir));
+            // 设置工作目录：显式 workDir > 当前路径根（EnterWorktree 会切换它）> 进程 CWD
+            String effectiveDir = (workDir != null && !workDir.isEmpty()) ? workDir : PathContext.getRoot();
+            if (effectiveDir != null && !effectiveDir.isEmpty()) {
+                pb.directory(new java.io.File(effectiveDir));
             }
 
             Process process = pb.start();

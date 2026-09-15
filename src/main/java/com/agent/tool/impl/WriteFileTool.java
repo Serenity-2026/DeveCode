@@ -71,7 +71,7 @@ public class WriteFileTool implements Tool {
         // 写入前先备份
         if (fileHistory != null) fileHistory.trackEdit(filePath);
 
-        Path path = Path.of(filePath);
+        Path path = PathContext.resolve(filePath);
 
         // 强制写前读,判断是否读过、是否被修改,新创建文件会跳过
         if (fileStateCache != null && Files.exists(path)) {

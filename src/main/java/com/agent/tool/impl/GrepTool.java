@@ -1,5 +1,6 @@
 package com.agent.tool.impl;
 
+import com.agent.tool.PathContext;
 import com.agent.tool.Tool;
 import com.agent.tool.ToolCategory;
 import com.agent.tool.ToolRegistry;
@@ -77,7 +78,7 @@ public class GrepTool implements Tool {
             return ToolResult.error("Error: pattern is required");
         }
 
-        Path root = Path.of(basePath);
+        Path root = PathContext.resolve(basePath);
         if (!Files.exists(root) || !Files.isDirectory(root)) {
             return ToolResult.error("Error: path not found: " + basePath);
         }

@@ -1,6 +1,7 @@
 package com.agent.tool.impl;
 
 import com.agent.tool.FileStateCache;
+import com.agent.tool.PathContext;
 import com.agent.tool.Tool;
 import com.agent.tool.ToolCategory;
 import com.agent.tool.result.ToolResult;
@@ -77,7 +78,7 @@ public class ReadFileTool implements Tool {
         int offset = intArg(args, "offset", 0);
         int limit = intArg(args, "limit", 2000);
 
-        Path path = Path.of(filePath);
+        Path path = PathContext.resolve(filePath);
 
         if (!Files.exists(path)) {
             return ToolResult.error("Error: file not found: " + filePath);

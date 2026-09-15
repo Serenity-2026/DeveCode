@@ -74,7 +74,7 @@ public class EditFileTool implements Tool {
 
         if (fileHistory != null) fileHistory.trackEdit(filePath);
 
-        Path path = Path.of(filePath);
+        Path path = PathContext.resolve(filePath);
 
         // Read-before-edit enforcement
         if (fileStateCache != null) {
