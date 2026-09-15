@@ -46,6 +46,12 @@ public class SubAgentTaskManager {
     public record TaskNotification(String taskId, String name, TaskStatus status, String output) {}
 
     /**
+     * 子 Agent 允许自己压缩几次上下文；超过就认为"任务对它太大"或"在原地打转"，
+     * 把任务标失败并交回父 Agent 拆小。见 consume() 里 CompactEvent 分支的说明。
+     */
+    private static final int MAX_SUBAGENT_COMPACTIONS = 2;
+
+    /**
      * 后台子Agent的隔离工作区(目前只有worktree一种),由调用方创建,台账负责在终态收尾:
      * 1. workDir交给子Agent自己——它的session目录、plan文件路径都基于workDir算;
      * 2. onFinish在任务进入终态、生产者确实停下之后调用一次,返回值追加到那条通知里
@@ -260,6 +266,8 @@ public class SubAgentTaskManager {
         }
         //生产者(内层AgentLoop)是否已经自行收尾:收到LoopComplete就说明它后面不会再往队列里放事件了
         boolean producerDone = false;
+        //子Agent自己压缩过几次上下文(压缩是就地重写它自己的对话,父Agent看不到那份上下文)
+        int compactions = 0;
         try {
             while (!Thread.currentThread().isInterrupted()) {
                 AgentEvent event;
@@ -293,10 +301,16 @@ public class SubAgentTaskManager {
                         setFailed(taskId, "Sub-agent aborted on retry: " + r.reason());
                         return;
                     }
-                    //只在父Agent做压缩
                     case AgentEvent.CompactEvent c->{
-                        setFailed(taskId, "Sub-agent aborted: its context needed compaction. Compact this conversation (or split the task) and retry. " );
-                        return;
+                        // 同 AgentTool.runSync：压缩是子 Agent 就地整理自己的对话，它会继续跑，
+                        // 而且那份上下文不在父 Agent 的对话里——直接判死只会丢掉已经干完的活。
+                        compactions++;
+                        if (compactions > MAX_SUBAGENT_COMPACTIONS) {
+                            setFailed(taskId, "Sub-agent compacted its context " + compactions
+                                    + " times — the task is too large (or the agent is looping). "
+                                    + "Split it into smaller sub-tasks and retry.");
+                            return;
+                        }
                     }
                     case AgentEvent.LoopComplete lc -> {
                         //正常结束发 LoopComplete(n>0),异常/中断/超限在 finally 里发 LoopComplete(0)

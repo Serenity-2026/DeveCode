@@ -91,6 +91,12 @@ public class AgentTool implements Tool {
     /** fork 子 Agent 的 querySource 标记值，用于运行时拦截嵌套 fork */
     private static final String FORK_QUERY_SOURCE = "agent:builtin:fork";
 
+    /**
+     * 子 Agent 允许自己压缩几次上下文；超过就认为"任务对它太大"或"在原地打转"，
+     * 交回父 Agent 拆小重试。见 runSync 里 CompactEvent 分支的说明。
+     */
+    private static final int MAX_SUBAGENT_COMPACTIONS = 2;
+
     public AgentTool(LlmClient client, ToolRegistry parentRegistry, String protocol,
                      ProviderConfig providerConfig) {
         this.client = client;
@@ -463,6 +469,8 @@ public class AgentTool implements Tool {
         String failure = null;
         //生产者(内层AgentLoop)是否已经自行收尾:收到LoopComplete就说明它后面不会再往队列里放事件了
         boolean producerDone = false;
+        //子Agent自己压缩过几次上下文(压缩是就地重写它自己的对话,父Agent看不到那份上下文)
+        int compactions = 0;
         try {
             loop:
             while (!Thread.currentThread().isInterrupted()) {
@@ -502,10 +510,18 @@ public class AgentTool implements Tool {
                     }
 
                     case AgentEvent.CompactEvent c -> {
-                        //只在父Agent做压缩
-                        failure = "Agent aborted: its context needed compaction, "
-                                + "compact this conversation (or split the task) and retry.";
-                        break loop;
+                        // 这里原来直接判死,但那是误判:
+                        // ContextCompactor.manage() 是"就地压缩子 Agent 自己的对话"并返回报告,
+                        // 子 Agent 发完这个事件会继续跑;而且它的上下文根本不在父 Agent 的对话里,
+                        // 让父 Agent 去 compact 解决不了任何问题——只会白白丢掉已经干完的活。
+                        // 所以这里只计数:偶尔压一次很正常,反复压缩才说明任务太大或在原地打转。
+                        compactions++;
+                        if (compactions > MAX_SUBAGENT_COMPACTIONS) {
+                            failure = "Agent compacted its context " + compactions
+                                    + " times — the task is too large (or the agent is looping). "
+                                    + "Split it into smaller sub-tasks and retry.";
+                            break loop;
+                        }
                     }
 
                     case AgentEvent.LoopComplete lc -> {
@@ -523,8 +539,11 @@ public class AgentTool implements Tool {
                     }
                 }
             }
-            //循环静默退出:中断落在"处理事件"的过程中,上面任何一个分支都没走
-            if (failure == null) {
+            // 循环静默退出：中断落在"处理事件"的过程中，上面任何一个分支都没走。
+            // 必须排除"正常收尾"：LoopComplete 那条路是 break loop 出来的，producerDone 已经置位，
+            // 此时 failure 本来就该保持 null 表示成功。以前这里不看 producerDone，
+            // 于是每一次正常完成的同步子 Agent 都会被改写成失败（"Agent interrupted"）。
+            if (failure == null && !producerDone) {
                 failure = "Agent interrupted";
             }
         }
