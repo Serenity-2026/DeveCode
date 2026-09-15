@@ -19,7 +19,10 @@ public final class ToolFilter {
     /** 子Agent永久禁止工具. */
     private static final Set<String> ALWAYS_DISALLOWED = Set.of(
             "TaskOutput", "ExitPlanMode", "EnterPlanMode",
-            "Agent", "AskUserQuestion", "TaskStop", "Workflow"
+            "Agent", "AskUserQuestion", "TaskStop", "Workflow",
+            // 子 Agent / 队友禁止切换"进程级路径根"：它们各自有独立的隔离树（AgentWorktree），
+            // 而 EnterWorktree 会改动全局 PathContext，两者会互相干扰
+            "EnterWorktree", "ExitWorktree"
     );
 
     /** 自定义黑名单预留集合 */
@@ -32,7 +35,7 @@ public final class ToolFilter {
     private static final Set<String> ASYNC_ALLOWED = Set.of(
             "ReadFile", "WebSearch", "TodoWrite", "Grep", "WebFetch", "Glob",
             "Bash", "EditFile", "WriteFile", "NotebookEdit", "Skill", "LoadSkill",
-            "SyntheticOutput", "ToolSearch", "EnterWorktree", "ExitWorktree"
+            "SyntheticOutput", "ToolSearch"
     );
 
     /** in-process teammate 允许使用的工具 */
