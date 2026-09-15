@@ -2,6 +2,7 @@
 package com.agent.teams;
 
 
+import com.agent.agent.AgentDeps;
 import com.agent.config.ProviderConfig;
 import com.agent.llm.LlmClient;
 import com.agent.tool.ToolRegistry;
@@ -24,7 +25,10 @@ public final class SpawnDispatcher {
             LlmClient client,
             ToolRegistry registry,
             ProviderConfig providerConfig,
-            String workdir
+            String workdir,
+            // 队友 Agent 的依赖套装（权限裁决 / hook / 文件历史 / 指令 / 记忆 / skill / 迭代上限）。
+            // 传 null 的队友是"裸 Agent"：没有权限检查、没有记忆，通常不是你想要的
+            AgentDeps deps
     ) {}
 
     public record SpawnResult(
@@ -45,6 +49,10 @@ public final class SpawnDispatcher {
                         config.registry(), config.providerConfig());
                 if (config.workdir() != null) {
                     member.agent.setWorkDir(config.workdir());
+                }
+                // 注入依赖套装：缺了 checker，队友的工具调用会完全跳过权限裁决
+                if (config.deps() != null) {
+                    config.deps().applyTo(member.agent);
                 }
                 member.active = true;
                 member.thread = Thread.startVirtualThread(() ->
