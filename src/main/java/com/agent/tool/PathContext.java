@@ -1,6 +1,7 @@
 package com.agent.tool;
 
 import java.nio.file.Path;
+import java.util.function.Supplier;
 
 /**
  * "相对路径解析到哪个根"的唯一来源。
@@ -12,29 +13,40 @@ import java.nio.file.Path;
  *
  * 有了它之后：EnterWorktree 把根切到隔离树，ExitWorktree 切回来，工具侧不用改动语义。
  *
- * 注意这是**进程级单例**语义（与 WorktreeSessionStore 的设计一致）：同一时刻只支持
- * 一个活动的 worktree 会话。子 Agent / 队友的隔离树由 AgentWorktree 单独管理，
- * 它们被禁止调用 EnterWorktree（见 ToolFilter.ALWAYS_DISALLOWED）。
+ * 路径根是**按 Agent 隔离**的：StreamingExecutor 在调用每个工具前，会用该 Agent 的 workDir
+ * 调 {@link #callWith}，所以 lead、各个队友、各个子 Agent 可以同时活在不同的隔离树里，
+ * 并发执行工具也不会互相串台。进入/退出 worktree 由 EnterWorktree / ExitWorktree 改变
+ * 宿主 Agent 的 workDir 来生效。
  */
 public final class PathContext {
 
-    /** null / 空 = 回退到进程启动目录 */
-    private static volatile String root;
+    /**
+     * 当前线程正在为哪个 Agent 执行工具。null = 没有 Agent 上下文（回退进程启动目录）。
+     * 用 ThreadLocal 而不是静态字段，是为了让**每个 Agent 有自己的路径根**：
+     * 多个队友各自活在自己的隔离树里时，并发执行工具也不会互相串台。
+     */
+    private static final ThreadLocal<String> CURRENT = new ThreadLocal<>();
 
     private PathContext() {}
 
     public static String getRoot() {
-        String r = root;
+        String r = CURRENT.get();
         return (r == null || r.isBlank()) ? System.getProperty("user.dir") : r;
     }
 
-    /** 切换解析根；传 null 或空串表示回退到进程启动目录 */
-    public static void setRoot(String newRoot) {
-        root = (newRoot == null || newRoot.isBlank()) ? null : newRoot;
+    public static boolean isWorktreeActive() {
+        return CURRENT.get() != null;
     }
 
-    public static boolean isWorktreeActive() {
-        return root != null;
+    /** 在以 root 为路径根的上下文里执行 body（可嵌套；结束后恢复上一个值）。 */
+    public static <T> T callWith(String root, Supplier<T> body) {
+        String prev = CURRENT.get();
+        if (root != null && !root.isBlank()) CURRENT.set(root);
+        try {
+            return body.get();
+        } finally {
+            if (prev == null) CURRENT.remove(); else CURRENT.set(prev);
+        }
     }
 
     /** 把（可能是相对的）路径解析到当前根下；绝对路径原样归一化返回 */

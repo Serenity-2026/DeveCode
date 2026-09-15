@@ -1,5 +1,6 @@
 package com.agent.permission;
 
+import com.agent.tool.PathContext;
 import com.agent.tool.Tool;
 import com.agent.tool.ToolCategory;
 import org.yaml.snakeyaml.Yaml;
@@ -435,7 +436,7 @@ public class PermissionChecker {
      */
     private boolean isDeniedPath(String pathStr) {
         try {
-            String normalized = Path.of(pathStr).toAbsolutePath().normalize().toString();
+            String normalized = PathContext.resolve(pathStr).toAbsolutePath().normalize().toString();
             for (String deny : denyWrite) {
                 if (normalized.startsWith(deny)) {
                     return true;
@@ -448,7 +449,7 @@ public class PermissionChecker {
 
     private boolean isPathAllowed(String pathStr) {
         try {
-            Path p = Path.of(pathStr).toAbsolutePath().normalize();
+            Path p = PathContext.resolve(pathStr).toAbsolutePath().normalize();
             Path root = projectRoot.toAbsolutePath().normalize();
             Path tmp = Path.of("/tmp").toAbsolutePath().normalize();
             return p.startsWith(root) || p.startsWith(tmp);

@@ -4,6 +4,7 @@ import com.agent.history.ConversationManager;
 import com.agent.llm.Message;
 import com.agent.llm.ToolResultBlock;
 import com.agent.llm.ToolUseBlock;
+import com.agent.tool.PathContext;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -50,7 +51,7 @@ public final class ToolResultBudget {
         Object raw = tu.arguments().get("file_path");
         if (!(raw instanceof String path) || path.isEmpty()) return false;
         try {
-            String abs = Path.of(path).toAbsolutePath().normalize().toString();
+            String abs = PathContext.resolve(path).toAbsolutePath().normalize().toString();
             return abs.startsWith(absSpillDir);
         } catch (Exception e) {
             return false;

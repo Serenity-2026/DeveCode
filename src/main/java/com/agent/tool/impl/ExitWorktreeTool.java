@@ -86,8 +86,7 @@ public class ExitWorktreeTool implements Tool {
         try {
             WorktreeSessionStore.save(session.originalCwd(), null);
         } catch (Exception ignored) {}
-        PathContext.setRoot(session.originalCwd());
-        //一个consumer,改变Agent侧的workDir
+        // 路径根按 Agent 走：由下面的回调把该 Agent 的 workDir 切回原目录
         if (onRootChanged != null) onRootChanged.accept(session.originalCwd());
         //KEEP分支,不动文件系统
         if (!action.equals("remove")) {

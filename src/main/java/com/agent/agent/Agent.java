@@ -479,7 +479,8 @@ public class Agent implements SkillHost {
                 break;
             }
             // 11. 执行工具 + 收集结果（激活 skill 白名单并集：执行侧硬拦截）
-            var executor = new StreamingExecutor(registry, checker, hookEngine, queue, recoveryState, toolFilter);
+            // 把本 Agent 的 workDir 作为路径根传进去：工具里的相对路径都相对它解析
+            var executor = new StreamingExecutor(registry, checker, hookEngine, queue, recoveryState, toolFilter, workDir);
             var results = executor.executeAll(toolUseBlocks);
             // Add results to conversation
             conv.addToolResultsMessage(results);

@@ -100,7 +100,8 @@ public class EnterWorktreeTool implements Tool {
         } catch (Exception ignored) {
             // 落盘失败不影响本次会话，只是重启后无法恢复现场
         }
-        PathContext.setRoot(info.path());
+        // 不在这里改全局根：路径根是按 Agent 走的——通知宿主把该 Agent 的 workDir 切过去，
+        // 之后的工具调用（StreamingExecutor 会带上这个 workDir）自然落到隔离树里
         if (onRootChanged != null) onRootChanged.accept(info.path());
 
         String msg = ("Entered worktree '%s'\n  path:   %s\n  branch: %s\n  base:   %s (%s)\n"

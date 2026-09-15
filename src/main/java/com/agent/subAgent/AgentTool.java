@@ -648,15 +648,11 @@ public class AgentTool implements Tool {
         String workdir = null;
         if ("worktree".equals(isolation) && worktreeManager != null) {
             try {
-                byte[] rndBytes = new byte[4];
-                new SecureRandom().nextBytes(rndBytes);
-                String slug = "agent-a" + HexFormat.of().formatHex(rndBytes).substring(0, 7);
-                var wtResult = AgentWorktree.create(
-                        slug, worktreeManager.getProjectRoot(), worktreeManager.getSymlinkDirs());
+                // 复用现成 helper：随机 slug + 仓库根 + 软链目录；notice 也按"仓库根 → 隔离树"翻译
+                // （原来这里拿 user.dir 当第一参数，从子目录启动时路径会翻译错位）
+                var wtResult = createAgentWorktree();
                 workdir = wtResult.worktreePath();
-                String notice = AgentWorktree.buildNotice(
-                        System.getProperty("user.dir"), wtResult.worktreePath());
-                prompt = notice + "\n\n" + prompt;
+                prompt = worktreeNotice(wtResult) + "\n\n" + prompt;
             } catch (Exception e) {
                 return ToolResult.error("Error creating teammate worktree: " + e.getMessage());
             }
