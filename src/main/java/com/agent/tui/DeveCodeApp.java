@@ -92,7 +92,7 @@ public class DeveCodeApp {
         }
 
         // 交接点：把选定的 provider 和 MCP server 配置交给主聊天 UI，进入交互式对话循环
-        TerminalUI.launch(selected, config.getMcpServers(), hooks);
+        TerminalUI.launch(selected, config.getMcpServers(), hooks, config.isEnableCoordinatorMode());
     }
 
     /**

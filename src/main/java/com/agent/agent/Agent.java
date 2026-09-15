@@ -165,12 +165,25 @@ public class Agent implements SkillHost {
      * 无激活 skill 或并集为空（全部声明空名单）→ null = 不限制（全量工具）。
      * 每轮迭代取一次快照，中途退出下一轮生效。
      */
+    /**
+     * 协调者模式（Coordinator）的工具白名单：非 null 时，除激活 skill 的白名单外还要落在它里面。
+     * 由宿主在配置 enable_coordinator_mode=true 时注入——lead 只做指挥（读代码、派活、发消息），
+     * 不直接改代码（白名单里没有 EditFile / WriteFile）。
+     */
+    private volatile Set<String> coordinatorWhitelist;
+
+    public void setCoordinatorWhitelist(Collection<String> names) {
+        this.coordinatorWhitelist = (names == null || names.isEmpty()) ? null : new HashSet<>(names);
+    }
+
     private Predicate<String> currentToolFilter() {
         Set<String> union = new HashSet<>();
         for (var tools : activeSkillTools.values()) {
             union.addAll(tools);
         }
-        return union.isEmpty() ? null : union::contains;
+        Set<String> coord = coordinatorWhitelist;
+        if (union.isEmpty() && coord == null) return null;
+        return name -> (union.isEmpty() || union.contains(name)) && (coord == null || coord.contains(name));
     }
 
     public void setWorkDir(String workDir) { this.workDir = workDir; }
