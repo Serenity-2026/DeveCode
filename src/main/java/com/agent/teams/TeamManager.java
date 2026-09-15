@@ -94,17 +94,23 @@ public class TeamManager {
         final TeamMode mode;
         final Map<String, Member> members = new LinkedHashMap<>();
         private final FileMailBox mailBox;
+        /** 队伍共享任务板：.devecode/teams/<team>/tasks.json（与 inboxes/ 同级） */
+        private final SharedTaskStore tasks;
 
         public Team(String name, TeamMode mode) {
             this.name = name;
             this.mode = mode;
-            this.mailBox = new FileMailBox(teamsBaseDir().resolve(name).resolve("inboxes"));
+            Path teamDir = teamsBaseDir().resolve(name);
+            this.mailBox = new FileMailBox(teamDir.resolve("inboxes"));
+            this.tasks = new SharedTaskStore(teamDir);
         }
 
         public String getName() { return name; }
         public TeamMode getMode() { return mode; }
 
         public FileMailBox getMailBox() { return mailBox; }
+
+        public SharedTaskStore getTasks() { return tasks; }
 
         public synchronized Member addMember(String name, LlmClient client, ToolRegistry registry,
                                              ProviderConfig cfg) {
