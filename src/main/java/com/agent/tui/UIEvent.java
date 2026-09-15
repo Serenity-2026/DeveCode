@@ -5,6 +5,7 @@ package com.agent.tui;
  *
  * 事件类型：
  *   - KeyTyped：可打印字符（ch >= 32 或 Tab），由主线程 handleKeyTyped 处理
+ *   - Paste：括号粘贴的一整段文本（内部换行保留为换行），由主线程 insertPastedText 处理
  *   - Submit：用户按 Enter 提交的文本，由主线程 submitMessage 处理
  *   - PickerConfirm：全屏选择器按 Enter 确认
  *   - TerminalResize：终端尺寸变化
@@ -12,6 +13,7 @@ package com.agent.tui;
  */
 sealed interface UIEvent {
     record KeyTyped(int ch) implements UIEvent {}
+    record Paste(String text) implements UIEvent {}
     record Submit(String text) implements UIEvent {}
     record PickerConfirm() implements UIEvent {}
     record TerminalResize(int cols, int rows) implements UIEvent {}

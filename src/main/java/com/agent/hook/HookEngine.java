@@ -375,9 +375,23 @@ public class HookEngine {
             //同步hook
             HookResult result = executeAction(h, ctx);
             results.add(result);
-            notifications.add(result);
+            // 成功输出的 prompt 型 hook 在 PRE_SEND 上只会被注入对话（system-reminder），
+            // 它是"给模型的上下文"，不是给用户看的事件。而 PRE_SEND 每次 LLM 请求都要触发一次，
+            // 一轮里能跑十几次——照旧记通知的话，这些一模一样的提醒会在轮次结束时一次性刷满对话区。
+            // 其他事件（session_start 等）不注入对话，通知就是它唯一的可见效果，必须保留。
+            if (!isSilentInjection(ctx.event(), h, result)) {
+                notifications.add(result);
+            }
         }
         return results;
+    }
+
+    /** 这条成功结果是否属于"已经注入对话、不必再通知用户"的 prompt 注入。 */
+    private static boolean isSilentInjection(EventName event, Hook h, HookResult r) {
+        return r.success()
+                && event == EventName.PRE_SEND
+                && h.action() != null
+                && h.action().type() == ActionType.PROMPT;
     }
 
     /**

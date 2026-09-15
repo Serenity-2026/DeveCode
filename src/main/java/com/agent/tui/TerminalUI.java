@@ -185,6 +185,14 @@ public class TerminalUI implements SkillForkHost {
     private int historyIndex = -1;   // 正在浏览的历史位置（0=最新一条），-1=未浏览（自由编辑）
     private String historyDraft = ""; // 按下 ↑ 之前输入框原有内容，↓ 回到底部时恢复
 
+    // ── 粘贴换行识别（括号粘贴的兜底；只在输入线程读写）──
+    private long lastKeyMs;      // 上一个可打印字符的到达时刻
+    private long burstStartMs;   // 当前"连发窗口"的起点
+    private int burstChars;      // 连发窗口内已到达的字符数
+    private static final long BURST_WINDOW_MS = 300;
+    private static final long PASTE_ENTER_GAP_MS = 15;
+    private static final int PASTE_BURST_CHARS = 8;
+
     // ── 流式状态 ──
     volatile boolean streaming = false;
     final StringBuilder streamAccum = new StringBuilder();
@@ -523,6 +531,10 @@ public class TerminalUI implements SkillForkHost {
     private void run() {
         terminal.enterRawMode();
         readTerminalSize();
+        // 打开括号粘贴：粘贴的多行文本会带 200~/201~ 标记，inputLoop 据此整段插入，
+        // 中间换行不会被当成 Enter 提交
+        writer.print(BRACKET_PASTE_ON);
+        writer.flush();
         // 不开启 trackMouse：保留终端原生 QuickEdit / 文本选区 / I-beam 光标。
         // 滚动改用键盘（PageUp/PageDown/↑/↓）。
 
@@ -537,6 +549,9 @@ public class TerminalUI implements SkillForkHost {
             for (var err : mcpErrors) {
                 messages.add(UIMessage.system(RED + "○ " + err + RESET));
             }
+            // 输入管线版本标记：用来确认"现在跑的是不是包含粘贴修复的构建"。
+            // 看不到这一行 = 跑的还是旧 class，需要重新编译/重启。
+            messages.add(UIMessage.system(GRAY + "input pipeline: v2 (bracketed paste)" + RESET));
         }
 
         // Hook：会话开始（hook 通知会作为系统消息追加到对话区）
@@ -611,6 +626,7 @@ public class TerminalUI implements SkillForkHost {
         fireUiHook(HookEngine.EventName.SESSION_END, null);
         fireUiHook(HookEngine.EventName.SHUTDOWN, null);
         if (hookEngine != null) hookEngine.drainNotifications();
+        writer.print(BRACKET_PASTE_OFF);
         writer.print(CURSOR_SHOW);
         writer.println();
         writer.flush();
@@ -627,7 +643,13 @@ public class TerminalUI implements SkillForkHost {
                 if (!streaming) submitMessage(s.text());
             }
             case UIEvent.KeyTyped kt -> {
-                if (!streaming && activePicker == null) handleKeyTyped(kt.ch());
+                // 不再用 !streaming 拦字符：agent 正在跑的时候打进去的字不该凭空消失
+                // （以前会被静默丢弃，看起来完全像"输入框有长度上限"）。
+                // Enter 提交仍然只在空闲时生效，所以这里多收的字符只会留在输入框里。
+                if (activePicker == null && pendingAsk == null) handleKeyTyped(kt.ch());
+            }
+            case UIEvent.Paste p -> {
+                if (activePicker == null && pendingAsk == null) insertPastedText(p.text());
             }
             case UIEvent.PickerConfirm pc -> confirmPicker();
             case UIEvent.TerminalResize r -> {
@@ -2203,18 +2225,43 @@ public class TerminalUI implements SkillForkHost {
         }
     }
 
-    /** 取出并展示 hook 通知（非流式时调用；PROMPT 输出也会在这里显示一次）。 */
+    /**
+     * 取出并展示 hook 通知（非流式时调用）。
+     *
+     * 完全相同的通知会折叠成一条并标上 ×N：像 pre_tool_use 这类 hook 每次工具调用都会跑，
+     * 一个批量轮次就能攒出几十条重复通知，逐条打印等于把对话区刷屏。
+     */
     private void drainHookNotifications() {
         if (hookEngine == null) return;
         var results = hookEngine.drainNotifications();
         if (results.isEmpty()) return;
+
+        var order = new ArrayList<String>();
+        var first = new LinkedHashMap<String, HookEngine.HookResult>();
+        var counts = new LinkedHashMap<String, Integer>();
+        for (var r : results) {
+            String out = r.output() == null ? "" : r.output().strip();
+            String key = (r.hookId() == null ? "" : r.hookId()) + '\u0000'
+                    + (r.type() == null ? "" : r.type().value()) + '\u0000'
+                    + r.success() + '\u0000' + out;
+            if (!first.containsKey(key)) {
+                order.add(key);
+                first.put(key, r);
+                counts.put(key, 0);
+            }
+            counts.put(key, counts.get(key) + 1);
+        }
+
         synchronized (messages) {
-            for (var r : results) {
+            for (String key : order) {
+                var r = first.get(key);
+                int n = counts.get(key);
                 String badge = r.success() ? GREEN + "✓" + RESET : RED + "✗" + RESET;
                 String type = r.type() == null ? "?" : r.type().value();
                 String id = r.hookId() == null || r.hookId().isEmpty() ? "(anonymous)" : r.hookId();
                 String header = GRAY + "⚡" + RESET + " " + badge
-                        + GRAY + " hook[" + id + "] " + type + RESET;
+                        + GRAY + " hook[" + id + "] " + type + RESET
+                        + (n > 1 ? GRAY + " ×" + n + RESET : "");
                 String output = r.output() == null ? "" : r.output().strip();
                 if (output.length() > 800) output = output.substring(0, 800) + "\n…";
                 messages.add(output.isEmpty()
@@ -2398,17 +2445,23 @@ public class TerminalUI implements SkillForkHost {
                         int c3 = reader.read();
                         if (c3 == -1) break;
 
-                        // Read rest of CSI parameter bytes
+                        // Read rest of CSI parameter bytes.
+                        // 扫描上限 32：粘贴内容里万一混进一个 ESC，不能让这个循环一路吃到
+                        // 后面很远的字母为止——那样会静默吞掉中间一整段用户输入。
                         StringBuilder csiParams = new StringBuilder();
                         csiParams.append((char) c3);
                         int cp;
-                        while ((cp = reader.read()) != -1) {
+                        while (csiParams.length() < 32 && (cp = reader.read()) != -1) {
                             csiParams.append((char) cp);
                             // CSI sequences end with a letter (A-Z, a-z) or ~
                             if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z') || cp == '~') break;
                         }
 
                         String csi = csiParams.toString();
+                        // 括号粘贴标记：200~ 开始（把整段读完后作为 Paste 事件投递）/ 201~ 结束
+                        if (csi.equals("200~")) { readBracketedPaste(reader); continue; }
+                        if (csi.equals("201~")) { continue; }
+
                         switch (csi) {
                             case "A" -> {
                                 if (activePicker != null) movePicker(-1);
@@ -2427,7 +2480,7 @@ public class TerminalUI implements SkillForkHost {
                             case "3~" -> handleDelete();
                             case "5~" -> { if (!streaming) { scrollOffset += renderer.pageScrollAmount(); needsRedraw = true; } }
                             case "6~" -> { if (!streaming) { scrollOffset = Math.max(0, scrollOffset - renderer.pageScrollAmount()); needsRedraw = true; } }
-                            default -> {} // ignore unknown CSI
+                            default -> requeuePrintable(csi);
                         }
                         if (!csi.equals("A") && !csi.equals("B") && !csi.equals("5~") && !csi.equals("6~")) needsRedraw = true;
                         continue;
@@ -2464,7 +2517,9 @@ public class TerminalUI implements SkillForkHost {
                         continue;
                     }
 
-                    // Unknown ESC, ignore
+                    // 未知 ESC：后面这个字符如果是可打印的，说明很可能是粘贴内容里混进的 ESC，
+                    // 把它当普通字符补回去，别吞掉用户输入
+                    if (c2 >= 32 && c2 != 127) eventQueue.add(new UIEvent.KeyTyped(c2));
                     continue;
                 }
 
@@ -2472,6 +2527,10 @@ public class TerminalUI implements SkillForkHost {
                 if (ch == '\r' || ch == '\n') {
                     if (pendingAsk != null) {
                         confirmAskCurrent();
+                    } else if (isLikelyPasteNewline()) {
+                        // 粘贴内容里带的换行：插入一个换行，绝不提交。
+                        // 走 Paste 事件由主线程插入，避免和主线程同时改输入缓冲区。
+                        eventQueue.add(new UIEvent.Paste("\n"));
                     } else {
                         handleEnter();
                     }
@@ -2528,6 +2587,7 @@ public class TerminalUI implements SkillForkHost {
                         completeCommandHint();
                         continue;
                     }
+                    notePrintableInput();
                     eventQueue.add(new UIEvent.KeyTyped(ch));
                     needsRedraw = true;
                 }
@@ -2652,6 +2712,124 @@ public class TerminalUI implements SkillForkHost {
         inputBuffer.insert(linearPos(), '\n');
         cursorRow++;
         cursorCol = 0;
+        needsRedraw = true;
+    }
+
+    /**
+     * 插入一整段粘贴文本（主线程调用）。
+     *
+     * 和逐个 KeyTyped 的区别：换行保留为换行，不会触发提交；Tab 也不会被当成命令补全。
+     * 括号粘贴打开后，终端把粘贴内容整体包在 \033[200~ ... \033[201~ 里，
+     * inputLoop 读到标记就整段投递到这里。
+     */
+    void insertPastedText(String text) {
+        if (text == null || text.isEmpty()) return;
+        if (historyIndex >= 0) historyIndex = -1;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '\r') {
+                // CRLF：\r 丢掉，换行交给紧随其后的 \n；
+                // 单独的 \r（不带 \n，某些终端/来源就是这种换行）必须当成换行，不能直接丢
+                if (i + 1 < text.length() && text.charAt(i + 1) == '\n') continue;
+                insertNewline();
+                continue;
+            }
+            if (c == '\n') { insertNewline(); continue; }
+            inputBuffer.insert(linearPos(), c);
+            cursorCol++;
+        }
+        needsRedraw = true;
+    }
+
+    /**
+     * 读一段括号粘贴的内容，直到结束标记 \033[201~。
+     *
+     * 只在输入线程执行：先整段读进 StringBuilder，再用一个 Paste 事件交给主线程插入。
+     * 这样即使粘贴期间 agent 正在流式输出，也不会丢字符。
+     */
+    private void readBracketedPaste(org.jline.utils.NonBlockingReader reader) {
+        var sb = new StringBuilder();
+        while (true) {
+            int c;
+            try {
+                c = reader.read();
+            } catch (Exception e) {
+                break;
+            }
+            if (c == -1) break;
+            if (c == 0x1B) {
+                int c2 = readQuietly(reader, 200L);
+                if (c2 != '[') {
+                    // 不是结束标记：ESC 原样保留，后面那个字符也补回去
+                    sb.append('\u001b');
+                    if (c2 != NonBlockingReader.READ_EXPIRED && c2 != -1) sb.append((char) c2);
+                    continue;
+                }
+                var tail = new StringBuilder();
+                int tc;
+                while (tail.length() < 8
+                        && (tc = readQuietly(reader, 200L)) != -1
+                        && tc != NonBlockingReader.READ_EXPIRED) {
+                    tail.append((char) tc);
+                    if (tc == '~') break;
+                }
+                if ("201~".contentEquals(tail)) break;   // 粘贴结束
+                sb.append('\u001b').append('[').append(tail);
+                continue;
+            }
+            sb.append((char) c);
+        }
+        eventQueue.add(new UIEvent.Paste(sb.toString()));
+        needsRedraw = true;
+    }
+
+    /**
+     * 把读不懂的转义序列里的可打印字符重新排进输入队列。
+     *
+     * 以参数（数字 / ; / :）开头的序列属于"确实是按键、只是我们不认识"（如 Ctrl+方向键），
+     * 直接丢弃；以普通可打印字符开头的，更像是粘贴内容里混进了 ESC [，必须还原成文字。
+     */
+    /** 记录"刚打进来一个可打印字符"，用于识别接下来这个 Enter 是不是粘贴带来的。 */
+    private void notePrintableInput() {
+        long now = System.currentTimeMillis();
+        if (now - burstStartMs > BURST_WINDOW_MS) {
+            burstStartMs = now;
+            burstChars = 0;
+        }
+        burstChars++;
+        lastKeyMs = now;
+    }
+
+    /**
+     * 判断这次 Enter 是"用户按的"还是"粘贴内容里自带的换行"。
+     *
+     * 正解是括号粘贴（终端用 200~/201~ 把内容包起来），但并非所有终端都支持，
+     * 所以这里加一层兜底：粘贴是一口气灌进来的，字符间隔在毫秒级，而人手不可能
+     * 在 15ms 内从普通字符"跳"到 Enter。两个条件同时满足才判定为粘贴换行。
+     */
+    private boolean isLikelyPasteNewline() {
+        long now = System.currentTimeMillis();
+        return burstChars >= PASTE_BURST_CHARS
+                && (now - lastKeyMs) < PASTE_ENTER_GAP_MS;
+    }
+
+    /** reader.read(timeout) 声明了 IOException；读失败就当作"读不到"，不要让它掀掉整个输入循环。 */
+    private static int readQuietly(org.jline.utils.NonBlockingReader reader, long timeoutMs) {
+        try {
+            return reader.read(timeoutMs);
+        } catch (Exception e) {
+            return NonBlockingReader.READ_EXPIRED;
+        }
+    }
+
+    private void requeuePrintable(String csi) {
+        if (csi == null || csi.isEmpty()) return;
+        char first = csi.charAt(0);
+        if (first < 32 || (first >= '0' && first <= '9') || first == ';' || first == ':') return;
+        for (int i = 0; i < csi.length(); i++) {
+            char c = csi.charAt(i);
+            if (c >= 32 && c != 127) eventQueue.add(new UIEvent.KeyTyped(c));
+        }
         needsRedraw = true;
     }
 

@@ -46,7 +46,9 @@ final class ScreenRenderer {
         int statusRow = 0;
         int sep1Row = 1;
         int convStart = 2;
-        int inputHeight = Math.max(countInputLines() + 1, 3); // +1 边框
+        // 输入框高度随内容增长（长行折行后同样计入行数），但最多 MAX_INPUT_ROWS / rows-8，
+        // 再长就由输入框内部滚动：否则一次长粘贴就能把对话区挤没
+        int inputHeight = computeInputHeight(rows);
         int sep2Row = rows - inputHeight - 2;
         int inputTop = sep2Row + 1;
         int statusBarRow = rows - 1;
@@ -145,7 +147,7 @@ final class ScreenRenderer {
 
     private int estimateConvAvailRows() {
         int rows = ui.termHeight;
-        int inputHeight = Math.max(countInputLines() + 1, 3);
+        int inputHeight = computeInputHeight(rows);
         int sep2Row = rows - inputHeight - 2;
         int convStart = 2, convEnd = sep2Row - 1;
         if (convEnd - convStart < 3) convEnd = convStart + 3;
@@ -229,28 +231,45 @@ final class ScreenRenderer {
                 moveTo(buf, topRow + 1, 3);
 
             } else {
-                String[] lines = ui.inputBuffer.toString().split("\n", -1);
-                int maxDisplayLines = height - 2;
-                int startLine = Math.max(0, lines.length - maxDisplayLines);
-                for (int i = startLine; i < lines.length; i++) {
-                    if (i > startLine) {
-                        moveTo(buf, topRow + 1 + (i - startLine), 1);
-                    }
-                    buf.append(lines[i]);
+                // 长行先折成"屏幕行"，再决定窗口和光标位置。
+                // 曾经的做法是把逻辑行原样丢给终端，让终端自己在行尾折行：续行落在输入框
+                // 之外的屏幕行上，下一帧又被 moveTo 覆盖 —— 用户看到的现象就是"打/贴到一定
+                // 长度之后中间一段文字凭空消失"，进而以为输入框有长度上限。
+                // 缓冲区其实一个字符都没丢，丢的是画面。
+                String[] lines = inputLogicalLines();
+                List<InputLine> wrapped = wrapInputLines(lines);
+                int visibleRows = Math.max(1, height - 2);
+                int startIdx = Math.max(0, wrapped.size() - visibleRows);
+                int cursorRowClamped = Math.min(Math.max(ui.cursorRow, 0), lines.length - 1);
+                int cursorColClamped = Math.min(Math.max(ui.cursorCol, 0),
+                        lines[cursorRowClamped].length());
+                int cursorIdx = findInputLine(wrapped, cursorRowClamped, cursorColClamped);
+                if (!ui.streaming && cursorIdx >= 0) {
+                    // 窗口跟随光标：光标跑到可视区上方/下方时把窗口拉回来
+                    if (cursorIdx < startIdx) startIdx = cursorIdx;
+                    if (cursorIdx >= startIdx + visibleRows) startIdx = cursorIdx - visibleRows + 1;
+                }
+                startIdx = Math.max(0, Math.min(startIdx,
+                        Math.max(0, wrapped.size() - visibleRows)));
+
+                for (int i = startIdx; i < wrapped.size() && i - startIdx < visibleRows; i++) {
+                    moveTo(buf, topRow + 1 + (i - startIdx), 3);
+                    buf.append(wrapped.get(i).text());
                 }
 
-                if (!ui.streaming) {
-                    int cursorDisplayRow = Math.min(ui.cursorRow, lines.length - 1) - startLine;
-                    if (cursorDisplayRow < 0) cursorDisplayRow = 0;
-                    int cursorColClamped = Math.min(ui.cursorCol, lines.length > ui.cursorRow ? lines[ui.cursorRow].length() : 0);
-                    // Convert logical cursor pos to display column (CJK = 2 cols)
-                    String curLine = lines.length > ui.cursorRow ? lines[ui.cursorRow] : "";
-                    int displayCol = 0;
-                    for (int ci = 0; ci < Math.min(cursorColClamped, curLine.length()); ci++) {
-                        displayCol += displayCharWidth(curLine.charAt(ci));
-                    }
-                    moveTo(buf, topRow + 1 + cursorDisplayRow, 3 + displayCol);
+                if (!ui.streaming && cursorIdx >= startIdx && cursorIdx < startIdx + visibleRows) {
+                    InputLine cur = wrapped.get(cursorIdx);
+                    // 逻辑列 → 显示列（CJK / 全角按 2 列算）
+                    moveTo(buf, topRow + 1 + (cursorIdx - startIdx),
+                            3 + displayWidthOf(cur.text(), cursorColClamped - cur.startCol()));
                     buf.append(CURSOR_SHOW);
+                }
+
+                // 上方还有内容没显示：在顶边框上标一下，避免再次产生"我打的东西不见了"的错觉
+                if (startIdx > 0) {
+                    String more = " " + startIdx + " more ↑ ";
+                    moveTo(buf, topRow, Math.max(1, cols - 2 - more.length()));
+                    buf.append(GRAY).append(more).append(RESET);
                 }
             }
         }
@@ -684,9 +703,95 @@ final class ScreenRenderer {
     //  工具方法
     // ═══════════════════════════════════════════════════════════════
 
+    /** 左侧区域占用的列数（右侧状态面板开启时扣掉面板本身和分隔竖线）。 */
+    private int leftColsForLayout() {
+        int cols = ui.termWidth;
+        boolean showPanel = cols >= PANEL_MIN_COLS && ui.panelVisible;
+        return showPanel ? cols - PANEL_WIDTH - 1 : cols;
+    }
+
+    /** 输入框内文本可用的显示宽度：左右边框各占 1 列，"> " 提示占 2 列。 */
+    private int inputTextWidth() {
+        return Math.max(1, leftColsForLayout() - 4);
+    }
+
+    /**
+     * 输入框高度（含上下边框）：随内容行数增长，取 MAX_INPUT_ROWS 与 rows-8 的较小值。
+     * rows-8 是屏幕兜底：终端再矮，输入框也不会把屏幕吃光，对话区仍能剩几行。
+     * 超出视高的内容不丢失，由输入框内部滚动（顶边框上会标 "N more"）。
+     */
+    private int computeInputHeight(int rows) {
+        int desired = Math.max(countInputLines() + 1, 3);
+        int cap = Math.max(3, Math.min(MAX_INPUT_ROWS, rows - 8));
+        return Math.min(desired, cap);
+    }
+
+    /** 输入框里一个"屏幕行"：来自逻辑行 row、从第 startCol 个字符开始的那一段。 */
+    record InputLine(int row, int startCol, String text) {}
+
+    private String[] inputLogicalLines() {
+        return ui.inputBuffer.toString().split("\n", -1);
+    }
+
+    /**
+     * 按输入框宽度把逻辑行折成屏幕行。
+     *
+     * 折行不改变缓冲区内容，只决定"怎么画"；每个片段都记录自己在逻辑行里的起始字符下标，
+     * 供光标定位（逻辑列 → 第几个片段 + 片段内第几列）使用。
+     */
+    private List<InputLine> wrapInputLines(String[] lines) {
+        return wrapText(lines, inputTextWidth());
+    }
+
+    /** 折行的纯函数版本：width = 每行可用的显示列数。不依赖 TerminalUI，便于直接单测。 */
+    static List<InputLine> wrapText(String[] lines, int width) {
+        var out = new ArrayList<InputLine>();
+        for (int r = 0; r < lines.length; r++) {
+            String line = lines[r];
+            if (line.isEmpty()) {
+                out.add(new InputLine(r, 0, ""));
+                continue;
+            }
+            int i = 0;
+            while (i < line.length()) {
+                int start = i;
+                int w = 0;
+                while (i < line.length() && w + displayCharWidth(line.charAt(i)) <= width) {
+                    w += displayCharWidth(line.charAt(i));
+                    i++;
+                }
+                // 单个字符就宽过整行（极窄终端）：至少吃掉一个字符，避免死循环
+                if (i == start) i++;
+                out.add(new InputLine(r, start, line.substring(start, i)));
+            }
+        }
+        return out;
+    }
+
+    /** 逻辑位置 (row, col) 落在第几个屏幕行上；找不到就退回该逻辑行的最后一个片段。 */
+    static int findInputLine(List<InputLine> wrapped, int row, int col) {
+        int fallback = -1;
+        for (int i = 0; i < wrapped.size(); i++) {
+            InputLine il = wrapped.get(i);
+            if (il.row() != row) continue;
+            fallback = i;
+            if (col < il.startCol() + il.text().length()) return i;
+        }
+        return fallback;
+    }
+
+    /** text 前 chars 个字符的终端显示宽度（ASCII 1 列，CJK / 全角 2 列）。 */
+    static int displayWidthOf(String text, int chars) {
+        int n = Math.min(Math.max(chars, 0), text.length());
+        int w = 0;
+        for (int i = 0; i < n; i++) w += displayCharWidth(text.charAt(i));
+        return w;
+    }
+
+    /** 输入框内容占几行（按折行后算）——空输入框也算 1 行。 */
     private int countInputLines() {
         if (ui.inputBuffer.isEmpty()) return 1;
-        return ui.inputBuffer.toString().split("\n", -1).length;
+        return wrapInputLines(inputLogicalLines()).size();
     }
 
     // ── Token 估算 ──

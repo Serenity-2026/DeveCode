@@ -21,6 +21,11 @@ final class TuiStyle {
     static final String HOME    = ESC + "[H";
     static final String CURSOR_HIDE = ESC + "[?25l";
     static final String CURSOR_SHOW = ESC + "[?25h";
+    // 括号粘贴（bracketed paste）：打开后，终端会把粘贴内容用 \033[200~ ... \033[201~ 包起来。
+    // 有了这对标记，才能区分"用户按了 Enter"和"粘贴内容里本来就带的换行"——
+    // 否则粘贴一份多行脚本，会在第一个换行处就被当成提交发出去。
+    static final String BRACKET_PASTE_ON  = ESC + "[?2004h";
+    static final String BRACKET_PASTE_OFF = ESC + "[?2004l";
     static final String RESET   = ESC + "[0m";
     static final String BOLD    = ESC + "[1m";
     static final String DIM     = ESC + "[2m";
@@ -41,6 +46,7 @@ final class TuiStyle {
     static final int PANEL_MIN_COLS = 100;  // 终端宽度 >= 此值才显示面板
     static final long PANEL_REFRESH_MS = 1000; // 面板周期刷新间隔
     static final int MAX_COMMAND_HINTS = 8;   // 命令提示面板最多显示的候选条数
+    static final int MAX_INPUT_ROWS = 12;     // 输入框最多可见行数（含边框），再长就由输入框内部滚动
 
     static String repeat(char c, int n) {
         if (n <= 0) return "";
