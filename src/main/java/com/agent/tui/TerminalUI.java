@@ -44,6 +44,7 @@ import com.agent.teams.TeammateProgress;
 import com.agent.teams.TeammateRunner;
 import com.agent.worktree.StaleCleanup;
 import com.agent.worktree.WorktreeManager;
+import com.agent.worktree.WorktreeSessionStore;
 import com.agent.tool.impl.*;
 import com.agent.tool.ToolRegistry;
 import com.agent.tool.FileHistory;
@@ -130,6 +131,8 @@ public class TerminalUI implements SkillForkHost {
     private final SubAgentTaskManager subAgentTaskManager; // 后台子 Agent 任务台账
     private final TeamManager teamManager;                 // 团队容器（各队的成员与邮箱）
     private final WorktreeManager worktreeManager;         // 隔离工作树（子 Agent / 队友 isolation=worktree）
+    /** 启动时从磁盘恢复出来的隔离树会话（null = 不在树里）；首屏提示用 */
+    private String restoredWorktreeNotice;
     volatile String sessionId;                   // 会话 ID（session 包持久化 / 快照目录 / 面板显示）
     private final String workDir;                // 工作目录（session/memory/command 存储根）
 
@@ -423,6 +426,18 @@ public class TerminalUI implements SkillForkHost {
         // 子 Agent / 队友的 isolation=worktree 依赖它：从它取仓库根与软链目录去建隔离树
         this.worktreeManager = new WorktreeManager(workDir, List.of(), 24);
         agentTool.setWorktreeManager(worktreeManager);
+        // 进程重启后把上次的隔离树会话恢复回来：内存单例是空的，ExitWorktree 会变成空操作。
+        // 必须在 StaleCleanup 之前做——那个清理器会拿 getCurrentSession() 排除"当前正在用的树"。
+        try {
+            var resumed = WorktreeSessionStore.restoreFromDisk(workDir);
+            if (resumed != null) {
+                agent.setWorkDir(resumed.worktreePath());   // 相对路径根跟着回到隔离树
+                restoredWorktreeNotice = "resumed worktree: " + resumed.worktreePath()
+                        + " (branch " + resumed.worktreeBranch() + ")";
+            }
+        } catch (Exception ignored) {
+            // 恢复失败不挡启动：最坏情况就是重新 EnterWorktree 一次
+        }
         // 启动时清理一次"过期且干净"的临时 worktree（有改动的一律保留，见 StaleCleanup 的三层过滤）
         try {
             StaleCleanup.cleanup(workDir, java.time.Instant.now().minusSeconds(24 * 3600L));
@@ -552,6 +567,10 @@ public class TerminalUI implements SkillForkHost {
             // 输入管线版本标记：用来确认"现在跑的是不是包含粘贴修复的构建"。
             // 看不到这一行 = 跑的还是旧 class，需要重新编译/重启。
             messages.add(UIMessage.system(GRAY + "input pipeline: v2 (bracketed paste)" + RESET));
+            // 上次退出时还留在隔离树里：这次启动已经把会话和工作目录恢复过来了
+            if (restoredWorktreeNotice != null) {
+                messages.add(UIMessage.system(CYAN + "⑂" + RESET + " " + restoredWorktreeNotice + RESET));
+            }
         }
 
         // Hook：会话开始（hook 通知会作为系统消息追加到对话区）
