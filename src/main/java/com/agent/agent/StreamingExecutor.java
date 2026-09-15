@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 
 /**
  并发工具执行器，将工具调用分为只读（并行）和写入/命令（顺序）批处理。
@@ -43,8 +44,12 @@ public class StreamingExecutor {
     //schema 侧由 Agent 在每轮迭代过滤，这里做执行侧硬拦截——
     //即使模型幻觉调用被过滤的工具名，也不会真正执行。
     private final java.util.function.Predicate<String> toolFilter;
-    /** 这个 Agent 的路径根（一般是它的 workDir）：工具里的相对路径都相对它解析 */
-    private final String pathRoot;
+    /**
+     * 取"这个 Agent 当前路径根"的供应商（一般是它的 workDir）。
+     * 用 Supplier 而不是 String 快照：路径根可能在一次 agent 迭代中途被改（EnterWorktree 会改
+     * agent.workDir），每次工具调用现取，才能让"同一条消息里先进树、再写文件"也落在正确的根下。
+     */
+    private final Supplier<String> pathRoot;
     /**
      *- concurrent=true：该批可并行执行（只读工具集合）
      *- concurrent=false：该批必须串行执行（写/命令工具）
@@ -69,7 +74,7 @@ public class StreamingExecutor {
                              HookEngine hookEngine, BlockingQueue<AgentEvent> eventQueue,
                              RecoveryState recoveryState,
                              Predicate<String> toolFilter,
-                             String pathRoot) {
+                             Supplier<String> pathRoot) {
         this.registry = registry;
         this.checker = checker;
         this.hookEngine = hookEngine;
@@ -162,8 +167,11 @@ public class StreamingExecutor {
 
     private ToolResultBlock executeSingle(ToolUseBlock call) {
         // 每个工具调用都在"本 Agent 的路径根"上下文里执行：队友各自活在自己的隔离树时，
-        // 相对路径不会串台；并行批次用的是新线程，所以根必须在调用内部设置而不是在外面
-        return PathContext.callWith(pathRoot, () -> executeSingleInRoot(call));
+        // 相对路径不会串台；并行批次用的是新线程，所以根必须在调用内部设置而不是在外面。
+        // 根是每次调用现取的（Supplier），所以 EnterWorktree 改了 agent.workDir 之后，
+        // 同一条 assistant 消息里后续的工具调用也能立刻用上新根。
+        String root = (pathRoot == null) ? null : pathRoot.get();
+        return PathContext.callWith(root, () -> executeSingleInRoot(call));
     }
 
     private ToolResultBlock executeSingleInRoot(ToolUseBlock call) {
