@@ -3,6 +3,7 @@ package com.agent.subAgent;
 
 
 import com.agent.agent.Agent;
+import com.agent.agent.AgentDeps;
 import com.agent.agent.AgentEvent;
 import com.agent.config.ProviderConfig;
 import com.agent.history.ConversationManager;
@@ -12,6 +13,7 @@ import com.agent.llm.ToolResultBlock;
 import com.agent.llm.ToolUseBlock;
 import com.agent.teams.SpawnDispatcher;
 import com.agent.teams.TeamManager;
+import com.agent.teams.TaskTools;
 import com.agent.teams.TeamTools;
 import com.agent.teams.TeammateRunner;
 import com.agent.tool.Tool;
@@ -66,6 +68,9 @@ public class AgentTool implements Tool {
 
     /** Optional: team manager for team_name registration. */
     private TeamManager teamManager;
+
+    /** Optional: 队友 Agent 的依赖套装（权限裁决 / hook / 文件历史 / 指令 / 记忆 / skill / 迭代上限） */
+    private AgentDeps teammateDeps;
 
     /** 标识当前 AgentTool 的生成上下文；fork 子 Agent 中会被设为 FORK_QUERY_SOURCE */
     private String querySource = "";
@@ -133,6 +138,10 @@ public class AgentTool implements Tool {
         this.teamManager = teamManager;
     }
 
+    public void setTeammateDeps(AgentDeps teammateDeps) {
+        this.teammateDeps = teammateDeps;
+    }
+
     public String getQuerySource() { return querySource; }
     public void setQuerySource(String querySource) { this.querySource = querySource; }
 
@@ -149,6 +158,7 @@ public class AgentTool implements Tool {
         clone.parentConversation = this.parentConversation;
         clone.worktreeManager = this.worktreeManager;
         clone.teamManager = this.teamManager;
+        clone.teammateDeps = this.teammateDeps;
         clone.parentReplacementState = this.parentReplacementState;
         clone.querySource = qs;
         return clone;
@@ -613,9 +623,17 @@ public class AgentTool implements Tool {
             memberName = base + "-" + suffix++;
         }
 
-        ToolRegistry subRegistry = ToolFilter.filterForAgent(parentRegistry, spec);
+        // isAsync=true + isInProcessTeammate=true：套上"队友可用工具"白名单——
+        // 队友能读写/搜索/Bash/Skill/任务板，但拿不到 TeamCreate / TeamDelete / Agent（避免队伍自我繁殖）
+        ToolRegistry subRegistry = ToolFilter.filterForAgent(parentRegistry, spec, true, false, true);
         // Add coordination tools for teammates
         subRegistry.register(new TeamTools.SendMessageTool(teamManager, memberName));
+        // 任务板工具必须按"队友身份"重挂一遍：ToolFilter 复用父注册表里的同一个 Tool 实例，
+        // 直接继承会让 createdBy 记成 lead、团队解析也按 lead 去找（多队时直接报 no team found）
+        subRegistry.register(new TaskTools.TaskCreateTool(teamManager, memberName));
+        subRegistry.register(new TaskTools.TaskListTool(teamManager, memberName));
+        subRegistry.register(new TaskTools.TaskGetTool(teamManager, memberName));
+        subRegistry.register(new TaskTools.TaskUpdateTool(teamManager, memberName));
 
         LlmClient subClient = selectClient(spec.model(), modelOverride);
 
@@ -649,7 +667,7 @@ public class AgentTool implements Tool {
             var spawnResult = SpawnDispatcher.spawnTeammate(
                     new SpawnDispatcher.SpawnConfig(
                             team, memberName, prompt, addendum,
-                            subClient, subRegistry,  providerConfig, workdir));
+                            subClient, subRegistry,  providerConfig, workdir, teammateDeps));
 
             return ToolResult.success(
                     "Teammate \"%s\" spawned in team \"%s\" (mode: %s). The teammate is now working on the assigned task."
