@@ -3,6 +3,7 @@ package com.agent.tui;
 import static com.agent.tui.TuiStyle.*;
 
 import com.agent.agent.Agent;
+import com.agent.agent.AgentDeps;
 import com.agent.agent.AgentEvent;
 import com.agent.command.Command;
 import com.agent.command.CommandContext;
@@ -33,11 +34,16 @@ import com.agent.skill.SkillSource;
 import com.agent.skill.SkillExecutor;
 import com.agent.subAgent.AgentLoader;
 import com.agent.subAgent.AgentTool;
+import com.agent.subAgent.SubAgentProgress;
 import com.agent.subAgent.SubAgentSpec;
 import com.agent.subAgent.SubAgentTaskManager;
 import com.agent.teams.TeamManager;
 import com.agent.teams.TeamTools;
+import com.agent.teams.TaskTools;
+import com.agent.teams.TeammateProgress;
 import com.agent.teams.TeammateRunner;
+import com.agent.worktree.StaleCleanup;
+import com.agent.worktree.WorktreeManager;
 import com.agent.tool.impl.*;
 import com.agent.tool.ToolRegistry;
 import com.agent.tool.FileHistory;
@@ -120,9 +126,10 @@ public class TerminalUI implements SkillForkHost {
     private final HookEngine hookEngine;         // Hook 引擎（生命周期钩子）
     private final Agent agent;                   // 后端 agent（事件驱动）
 
-    // ── 子 Agent / 团队（subAgent + teams 包）──
+    // ── 子 Agent / 团队（subAgent + teams + worktree 包）──
     private final SubAgentTaskManager subAgentTaskManager; // 后台子 Agent 任务台账
     private final TeamManager teamManager;                 // 团队容器（各队的成员与邮箱）
+    private final WorktreeManager worktreeManager;         // 隔离工作树（子 Agent / 队友 isolation=worktree）
     volatile String sessionId;                   // 会话 ID（session 包持久化 / 快照目录 / 面板显示）
     private final String workDir;                // 工作目录（session/memory/command 存储根）
 
@@ -224,9 +231,9 @@ public class TerminalUI implements SkillForkHost {
      * @param hooks       config.yaml 中 hooks 段转换并校验后的 Hook 列表（可为空）
      */
     public static void launch(ProviderConfig provider, List<McpServerConfig> mcpServers,
-                              List<HookEngine.Hook> hooks) {
+                              List<HookEngine.Hook> hooks, boolean coordinatorMode) {
         try {
-            new TerminalUI(provider, mcpServers, hooks).run();
+            new TerminalUI(provider, mcpServers, hooks, coordinatorMode).run();
         } catch (IOException e) {
             System.err.println("Failed to initialize terminal: " + e.getMessage());
             e.printStackTrace();
@@ -252,7 +259,7 @@ public class TerminalUI implements SkillForkHost {
      * @param hooks            config.yaml 中 hooks 段转换后的 Hook 列表（可为 null）
      */
     private TerminalUI(ProviderConfig provider, List<McpServerConfig> mcpServerConfigs,
-                       List<HookEngine.Hook> hooks) throws IOException {
+                       List<HookEngine.Hook> hooks, boolean coordinatorMode) throws IOException {
         this.provider = provider;
         this.workDir = System.getProperty("user.dir");
         // 步骤 2：JLine Terminal — JNA 提供原生终端控制，SIG_IGN 防止 Ctrl+C 直接杀进程
@@ -403,6 +410,47 @@ public class TerminalUI implements SkillForkHost {
             }
             return notes;
         });
+
+        // ── 工作树（worktree 包）接入 ──
+        // 子 Agent / 队友的 isolation=worktree 依赖它：从它取仓库根与软链目录去建隔离树
+        this.worktreeManager = new WorktreeManager(workDir, List.of(), 24);
+        agentTool.setWorktreeManager(worktreeManager);
+        // 启动时清理一次"过期且干净"的临时 worktree（有改动的一律保留，见 StaleCleanup 的三层过滤）
+        try {
+            StaleCleanup.cleanup(workDir, java.time.Instant.now().minusSeconds(24 * 3600L));
+        } catch (Exception ignored) {}
+
+        // ── 模型别名解析：Agent 工具的 model 参数经它换成 LlmClient（否则只会回退成父 client）──
+        agentTool.setModelResolver(model -> LlmClient.create(forkProviderConfig(model), systemPrompt));
+
+        // ── 队友依赖套装：权限裁决 / hook / 文件历史 / 指令 / 记忆 / skill + 迭代上限 ──
+        // 缺了 checker，队友的工具调用会完全跳过权限裁决；缺了 maxIterations，队友只有默认的 5 轮
+        agentTool.setTeammateDeps(new AgentDeps(
+                permissionChecker, hookEngine, fileHistory,
+                loadedInstructions, loadedMemoryReminder, skillCatalog, 200));
+
+        // ── 子 Agent 进度 → UI ──
+        agentTool.setProgressListener(this::onSubAgentProgress);
+
+        // ── 任务板（teams 包 SharedTaskStore）接入 ──
+        toolRegistry.register(new TaskTools.TaskCreateTool(teamManager, TeammateRunner.LEAD_NAME));
+        toolRegistry.register(new TaskTools.TaskListTool(teamManager, TeammateRunner.LEAD_NAME));
+        toolRegistry.register(new TaskTools.TaskGetTool(teamManager, TeammateRunner.LEAD_NAME));
+        toolRegistry.register(new TaskTools.TaskUpdateTool(teamManager, TeammateRunner.LEAD_NAME));
+
+        // ── 工作树会话（worktree 包）接入：主 Agent 可进入/退出隔离树，相对路径根随之切换 ──
+        toolRegistry.register(new EnterWorktreeTool(worktreeManager, workDir, this::onPathRootChanged));
+        toolRegistry.register(new ExitWorktreeTool(worktreeManager, this::onPathRootChanged));
+
+        // ── 协调者模式：只留"指挥类"工具（读代码 + 派活 + 发消息），不直接改代码 ──
+        // 这份白名单原先由 teams 包的 Coordinator 类提供，那个类已删除，这里就地内联
+        if (coordinatorMode) {
+            agent.setCoordinatorWhitelist(List.of(
+                    "Agent", "SendMessage",
+                    "TaskCreate", "TaskGet", "TaskList", "TaskUpdate",
+                    "TeamCreate", "TeamDelete",
+                    "ReadFile", "Glob", "Grep", "Bash"));
+        }
 
         // 渲染器：只负责绘制，状态仍从本类读取（同包可见字段）
         this.renderer = new ScreenRenderer(this);
@@ -2180,6 +2228,42 @@ public class TerminalUI implements SkillForkHost {
     /** 线程安全地追加消息（消费线程/输入线程/主线程均可能调用）。 */
     private void appendMessage(UIMessage msg) {
         synchronized (messages) { messages.add(msg); }
+    }
+
+    /** worktree 工具切换了路径根（进入/退出隔离树）：同步 agent 的工作目录，并提示用户 ── */
+    private void onPathRootChanged(String newRoot) {
+        try {
+            agent.setWorkDir(newRoot);
+            appendMessage(UIMessage.system(CYAN + "⑂" + RESET + " path root → " + newRoot + RESET));
+            needsRedraw = true;
+        } catch (Exception ignored) {}
+    }
+
+    /** 供右侧状态面板显示队友进度（teams 包 TeammateProgress） */
+    List<TeammateProgress> teammateProgress() {
+        try {
+            return teamManager == null ? List.of() : teamManager.getAllTeammateProgress();
+        } catch (Exception e) {
+            return List.of();
+        }
+    }
+
+    /** subAgent 包 SubAgentProgress 的落点：把子 Agent / 后台任务的进度画成 UI 行（可能来自 agent 线程） */
+    private void onSubAgentProgress(SubAgentProgress p) {
+        try {
+            if (p.done()) {
+                appendMessage(UIMessage.system(GRAY + "⚙ " + p.agentType() + " \"" + p.description()
+                        + "\" finished (" + p.toolCount() + " tool(s), "
+                        + String.format("%.1f", p.totalTime()) + "s)" + RESET));
+            } else if (p.toolError()) {
+                appendMessage(UIMessage.error("⚙ " + p.agentType() + " tool failed: " + p.toolName()));
+            } else if (p.toolName() != null) {
+                appendMessage(UIMessage.system(GRAY + "│ ⚙ " + p.agentType() + " " + p.toolName() + RESET));
+            }
+            needsRedraw = true;
+        } catch (Exception ignored) {
+            // 进度展示失败绝不能影响主流程
+        }
     }
 
     /** 格式化工具参数为 "key: value, key: value" 形式，超长值截断 */
