@@ -106,7 +106,6 @@ public class ExitWorktreeTool implements Tool {
                 return ToolResult.error("Exited worktree but could not remove " + session.worktreePath()
                         + " (" + e.getMessage() + "). Remove it manually with git worktree remove.");
             }
-            EnterWorktreeTool.git(session.originalCwd(), "branch", "-D", session.worktreeBranch());
         }
         return ToolResult.success("Exited and removed worktree at " + session.worktreePath()
                 + ". Session is now back in " + session.originalCwd() + ".");
