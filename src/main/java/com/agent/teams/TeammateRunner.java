@@ -9,6 +9,7 @@ import com.agent.permission.PermissionResponse;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
@@ -130,25 +131,20 @@ public final class TeammateRunner {
      * lead周期性检查邮箱,发现队员是否完成任务
      */
     public static List<String> drainLeadMailbox(TeamManager teamMgr) {
-        if (teamMgr == null) return List.of();
-        var result = new ArrayList<String>();
-        for (String teamName : teamMgr.listTeams()) {
-            var team = teamMgr.getTeam(teamName);
-            if (team == null) continue;
-
-            List<FileMailBox.MailMessage> messages;
-            try {
-                // 取出lead所有消息
-                messages = team.getMailBox().drainUnread(LEAD_NAME);
-            } catch (FileMailBox.MailboxBusyException e) {
-                // 邮箱暂时不可用：跳过这个团队，下一轮再收
-                continue;
-            }
-            if (messages.isEmpty()) continue;
-
+        var raw = drainLeadInbox(teamMgr);
+        if (raw.isEmpty()) return List.of();
+        // 按团队分组渲染成给模型看的 team-notification 块
+        var order = new ArrayList<String>();
+        var byTeam = new LinkedHashMap<String, List<FileMailBox.MailMessage>>();
+        for (var m : raw) {
+            if (!byTeam.containsKey(m.teamName())) order.add(m.teamName());
+            byTeam.computeIfAbsent(m.teamName(), k -> new ArrayList<>()).add(m.message());
+        }
+        var result = new ArrayList<String>(order.size());
+        for (String teamName : order) {
             var sb = new StringBuilder();
             sb.append("<team-notification team=\"").append(teamName).append("\">\n");
-            for (var msg : messages) {
+            for (var msg : byTeam.get(teamName)) {
                 sb.append("from=").append(msg.from()).append(": ").append(msg.text()).append("\n");
             }
             sb.append("</team-notification>");
@@ -157,9 +153,51 @@ public final class TeammateRunner {
         return result;
     }
 
+    /** 一条来自 lead 邮箱的消息，附带它所属的团队名（渲染 team-notification 时要用）。 */
+    public record LeadInboxMessage(String teamName, FileMailBox.MailMessage message) {}
+
+    /**
+     * 把每个团队 lead 邮箱里的未读消息取出来（取出即标记已读），按团队顺序打平。
+     *
+     * <p>与 {@link #drainLeadMailbox} 的区别只是"不渲染"：等待队友汇报的轮询
+     * （{@link com.agent.subAgent.PendingTeammates}）需要按成员名记账，渲染成
+     * team-notification 文本反而会把发件人信息埋进字符串里。
+     */
+    public static List<LeadInboxMessage> drainLeadInbox(TeamManager teamMgr) {
+        if (teamMgr == null) return List.of();
+        var out = new ArrayList<LeadInboxMessage>();
+        for (String teamName : teamMgr.listTeams()) {
+            var team = teamMgr.getTeam(teamName);
+            if (team == null) continue;
+            List<FileMailBox.MailMessage> messages;
+            try {
+                // 取出 lead 所有未读消息
+                messages = team.getMailBox().drainUnread(LEAD_NAME);
+            } catch (FileMailBox.MailboxBusyException e) {
+                // 邮箱暂时不可用：跳过这个团队，下一次再收
+                continue;
+            }
+            for (var m : messages) {
+                out.add(new LeadInboxMessage(teamName, m));
+            }
+        }
+        return out;
+    }
+
 
     public static boolean isShutdownRequest(String message) {
         return message != null && message.strip().startsWith(SHUTDOWN_PREFIX);
+    }
+
+    /**
+     * 这条消息是不是 idle 通知（队友"这一轮干完了、又闲下来了"）。
+     *
+     * <p>为什么需要区分它和普通汇报：汇报（内容）只是"我干了什么"，idle 才是"这一轮到此为止"。
+     * lead 的等待逻辑必须拿 idle 当结束信号——如果拿任意消息当信号，队友最后一条正式汇报
+     * 一到达就会让等待提前结束，那条汇报反而来不及注入对话。
+     */
+    public static boolean isIdleNotification(String message) {
+        return message != null && message.strip().startsWith("[idle]");
     }
 
     public static String createIdleNotification(String memberName, String reason) {

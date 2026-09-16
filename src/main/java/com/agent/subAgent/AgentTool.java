@@ -81,6 +81,12 @@ public class AgentTool implements Tool {
     /** 队友的结构化问卷出口（AskUserQuestion，同样接 TUI）。 */
     private TeammateRunner.QuestionAsker teammateQuestionAsker;
 
+    /**
+     * "派出去但还没回话的队友"台账：runAsTeammate 派发时登记、等待阶段收到汇报后注销。
+     * 宿主把它交给 lead（Agent.waitWhilePending），lead 才会在收尾前先把汇报等回来。
+     */
+    private final PendingTeammates pendingTeammates = new PendingTeammates();
+
     /** 标识当前 AgentTool 的生成上下文；fork 子 Agent 中会被设为 FORK_QUERY_SOURCE */
     private String querySource = "";
 
@@ -163,6 +169,11 @@ public class AgentTool implements Tool {
 
     public void setTeammateQuestionAsker(com.agent.teams.TeammateRunner.QuestionAsker asker) {
         this.teammateQuestionAsker = asker;
+    }
+
+    /** 供宿主（TerminalUI）取用：把它交给 lead 用，lead 才能"等汇报再收尾"。 */
+    public PendingTeammates getPendingTeammates() {
+        return pendingTeammates;
     }
 
     public String getQuerySource() { return querySource; }
@@ -704,8 +715,13 @@ public class AgentTool implements Tool {
                             subClient, subRegistry,  providerConfig, workdir, teammateDeps,
                             teammatePermissionAsker, teammateQuestionAsker));
 
+            // 登记"这个队友还欠我一份汇报"：lead 收尾前会据此决定要不要继续等
+            // （见 Agent.waitWhilePending / PendingTeammates）。
+            pendingTeammates.register(memberName);
             return ToolResult.success(
-                    "Teammate \"%s\" spawned in team \"%s\" (mode: %s). The teammate is now working on the assigned task."
+                    ("Teammate \"%s\" spawned in team \"%s\" (mode: %s). It is working on the assigned task; "
+                            + "its report will arrive automatically, and this turn will not end before then "
+                            + "(unless the wait times out).")
                             .formatted(memberName, teamName, spawnResult.mode()));
         } catch (Exception e) {
             return ToolResult.error("Error spawning teammate: " + e.getMessage());

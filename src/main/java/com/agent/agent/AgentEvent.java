@@ -26,6 +26,12 @@ public sealed interface AgentEvent {
     //已触发压缩事件
     record CompactEvent(String message) implements AgentEvent {}
     record RetryEvent(String reason, long waitMs) implements AgentEvent {}
+    /**
+     * 本轮暂时不能收尾：还有派生出去的队友没回话，lead 正在等它的汇报。
+     *
+     * <p>存在的意义是让 UI 能解释"为什么这一轮还没结束"，而不是对着静止的界面等几分钟。
+     */
+    record WaitingForTeammateEvent(String what) implements AgentEvent {}
     record ThinkingText(String text) implements AgentEvent {}
 
     record ThinkingComplete(String thinking, String signature) implements AgentEvent {}

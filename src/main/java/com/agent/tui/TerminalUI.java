@@ -412,15 +412,28 @@ public class TerminalUI implements SkillForkHost {
         toolRegistry.register(new TeamTools.SendMessageTool(teamManager, TeammateRunner.LEAD_NAME));
         agentTool.setTeamManager(teamManager);   // 缺它的话，Agent 的 team_name 分支永远进不去
 
-        // 通知线：lead 每轮迭代开始前，把"队友的汇报 / idle"和"后台子 Agent 的完成通知"收进对话
+        // 通知线：lead 每轮迭代开始前，把"队友的汇报 / idle"和"后台子 Agent 的完成通知"收进对话。
+        // 顺序很重要：先取等待期间攒下的汇报（PendingTeammates 缓冲区里的），再收当前邮箱——
+        // lead 等回话时把消息收进了缓冲区，这里就是它们进入模型上下文的唯一出口。
         agent.setNotificationSource(() -> {
-            var notes = new ArrayList<String>(TeammateRunner.drainLeadMailbox(teamManager));
+            agentTool.getPendingTeammates().pumpOnce(teamManager);
+            var notes = new ArrayList<String>(agentTool.getPendingTeammates().drainBuffered());
             for (var n : subAgentTaskManager.drainNotifications()) {
                 notes.add("<task-notification id=\"%s\" status=\"%s\">\n%s\n</task-notification>"
                         .formatted(n.taskId(), n.status(), n.output()));
             }
             return notes;
         });
+
+        // lead 收尾前先等队友汇报：AgentTool 派发队友时登记，收到汇报后注销。
+        // 缺了这行的后果就是用户看到的那一幕——队友还在跑，lead 已经把这一轮结束了。
+        agent.setPendingWorkSource(() ->
+                agentTool.getPendingTeammates().isPending()
+                        && agentTool.getPendingTeammates().waitForReports(
+                                teamManager, com.agent.subAgent.PendingTeammates.DEFAULT_WAIT_TIMEOUT_MS));
+        // 兜底：收尾前把"已收下但还没进对话"的队友消息灌进去，避免最后一次迭代把汇报吞掉
+        agent.setPendingMessageFlusher(conv ->
+                agentTool.getPendingTeammates().flushInto(conv));
 
         // ── 工作树（worktree 包）接入 ──
         // 子 Agent / 队友的 isolation=worktree 依赖它：从它取仓库根与软链目录去建隔离树
@@ -2000,6 +2013,13 @@ public class TerminalUI implements SkillForkHost {
                     appendMessage(UIMessage.system(
                             CYAN + "⤾ Context compacted" + RESET + GRAY +
                             (c.message() == null || c.message().isEmpty() ? "" : ": " + c.message()) + RESET));
+                    needsRedraw = true;
+                }
+                case AgentEvent.WaitingForTeammateEvent w -> {
+                    appendMessage(UIMessage.system(
+                            YELLOW + "⏳ Waiting for teammate report" + RESET + GRAY
+                                    + (w.what() == null || w.what().isBlank() ? "" : " — " + w.what())
+                                    + RESET));
                     needsRedraw = true;
                 }
                 case AgentEvent.RetryEvent r -> {

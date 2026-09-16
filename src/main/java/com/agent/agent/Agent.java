@@ -25,6 +25,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
+import java.util.function.ToIntFunction;
 
 public class Agent implements SkillHost {
     private final LlmClient client;
@@ -88,10 +89,48 @@ public class Agent implements SkillHost {
         this.notificationSource = source;
     }
 
+    /**
+     * 可选：把"已经收下但还没注入对话"的外部消息立刻灌进对话（返回注入条数）。
+     *
+     * <p>为什么要有这条兜底：收消息（drain 邮箱）和注入（notificationSource）是两步，
+     * 中间隔着一个迭代边界。如果这一步正好是本轮最后一次迭代——再也没有下一次了——
+     * 那么刚收下来的汇报就永远不会进入模型上下文（邮箱那边已经标记已读，等于彻底丢了）。
+     * 收尾前过一遍这个回调，保证「只要收下了，就一定送进模型上下文」。
+     */
+    public void setPendingMessageFlusher(ToIntFunction<ConversationManager> flusher) {
+        this.pendingMessageFlusher = flusher;
+    }
+
+    /**
+     * 可选：告诉 Agent "还有派生出去、还没回话的活"。非 null 时，Agent 在"没有工具调用、
+     * 准备收尾"之前会先等它变空（见 waitWhilePending）。
+     *
+     * <p>为什么需要：Agent 是同步的（一轮到底），而它派生出去的东西可能是异步的
+     * （队友是长驻员工，工具在毫秒级就返回"已在干活"）。以前 lead 在队友汇报到达之前就把
+     * 这一轮收掉了，用户看到的就是"队友还在跑，然后整轮结束了"。加上之后，lead
+     * 会留在循环里把汇报等回来——注意它只提供"还有人欠汇报"这一条信息，具体的收邮箱逻辑
+     * 在宿主那边（teams 包的 PendingTeammates），agent 包不反向依赖 teams 包。
+     */
+    public void setPendingWorkSource(Supplier<Boolean> source) {
+        this.pendingWorkSource = source;
+    }
+
+    /** 单次等待队友汇报的预算上限（毫秒）；默认 3 分钟。 */
+    public void setPendingWaitTimeoutMs(long ms) {
+        if (ms > 0) this.pendingWaitTimeoutMs = ms;
+    }
+
     /** 供 fork / 队友共享父级的工具结果裁剪决策（保证 prompt cache 前缀一致） */
     public ContentReplacementState getReplacementState() {
         return replacementState;
     }
+
+    /** 还有没有派生出去、还没回话的活（由宿主注入；见 setPendingWorkSource）。 */
+    private Supplier<Boolean> pendingWorkSource;
+    /** 把"已收下但未注入"的外部消息灌进对话的兜底回调。 */
+    private ToIntFunction<ConversationManager> pendingMessageFlusher;
+    /** 单次等待队友汇报的预算。 */
+    private long pendingWaitTimeoutMs = 180_000L;
 
     private HookEngine hookEngine;
     //LoopComplete事件是否已发送"的幂等标志——保证正常退出和异常退出两条路径下 LoopComplete 都恰好发一次，让UI不会因为信号缺失而卡死、也不会因为信号重复而错乱。
@@ -468,7 +507,11 @@ public class Agent implements SkillHost {
                 usageAnchor = new ContextCompactor.UsageAnchor(
                         baseline, conv.size());
             }
-            // 10. 没有工具调用 → 结束
+            // 10. 没有工具调用 → 收尾；但若还有队友没汇报，先留在循环里把汇报等回来
+            if (toolUseBlocks.isEmpty() &&
+                    waitWhilePending(conv, queue, iteration, text.toString())) {
+                continue;
+            }
             if (toolUseBlocks.isEmpty()) {
                 if (fileHistory != null) {
                     String summary = text.length() > 60 ? text.substring(0, 60) + "..." : text.toString();
@@ -544,6 +587,99 @@ public class Agent implements SkillHost {
         } catch (Exception ignored) {
             // hook 失败不能影响 Agent 主循环
         }
+    }
+
+    /**
+     * 收尾前等队友汇报（不是收尾，只是"拖住这一轮"）。
+     *
+     * <p>为什么需要它：Agent(team_name=...) 是异步派发——队友活在自己的线程上，工具在毫秒级
+     * 返回"已在干活"。这时模型既没有工具调用、也没有任何后续输入，按老逻辑就该 LoopComplete
+     * 了；可队友的汇报要等 lead 下一轮迭代开头才会从邮箱被收走，于是汇报永远等不到，
+     * 用户看到的是"队友还没回话，这个回合就结束了"（模型只能对着用户复述"它还在跑"）。
+     *
+     * <p>这里做的就是把"收尾"推迟到汇报到达之后：留在循环里，由宿主提供的
+     * pendingWorkSource 决定是否还有人欠汇报，等待期间把收到的消息攒在宿主缓冲区里；
+     * 汇报到齐（或超时）就 return true，交给主循环进入下一轮——下一轮开头
+     * notificationSource 会把这些消息注入成 system-reminder，模型这才有机会把结果讲清楚。
+     *
+     * <p>为什么用"睡 500ms 轮询"而不是直接发起一次新 LLM 请求：模型此刻无话可说，
+     * 真正的信息（汇报）还没到，先调 LLM 只会空烧一轮 token；轮询邮箱几乎不花钱。
+     *
+     * @return true 表示"等到了/还在等，应当继续下一轮迭代"；false 表示"照常收尾"
+     */
+    private boolean waitWhilePending(ConversationManager conv,
+                                     BlockingQueue<AgentEvent> queue,
+                                     int iteration,
+                                     String assistantText) {
+        if (pendingWorkSource == null) return false;
+        if (!Boolean.TRUE.equals(pendingWorkSource.get())) return false;
+        // 让用户看见"为什么这一轮还没结束"，而不是对着一个不动的界面等 3 分钟
+        String what = assistantText == null || assistantText.isBlank()
+                ? "Waiting for teammate report"
+                : concise(assistantText);
+        putSafe(queue, new AgentEvent.WaitingForTeammateEvent(what));
+
+        long deadlineNanos = pendingDeadlineNanos(pendingWaitTimeoutMs);
+        int rounds = 0;
+        //不断去调pendingWorkSource检测是否完成
+        while (true) {
+            if (Thread.currentThread().isInterrupted()) return false;
+            rounds++;
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            // 等待期间**不要**调用 notificationSource：它的返回值是给模型看的消息，
+            // 而这里的调用点没有地方注入（注入只发生在一轮迭代的开头）。调用它只会把
+            // 邮箱/缓冲区里的队友汇报取出来然后丢掉——drainUnread 取出即标记已读，
+            // 丢掉就是永久丢失，用户会看到"汇报到了但 lead 说没到"。
+            //
+            // 等待期间只做两件事：判断是否还需要等，以及非破坏性地观察 idle。
+            // 真正的读取与注入交给下一轮的迭代开头（那才是唯一有注入点的地方）。
+            if (System.nanoTime() >= deadlineNanos) {
+                break;
+            }
+            if (!Boolean.TRUE.equals(pendingWorkSource.get())) {
+                // 汇报到齐：继续下一轮，由主循环把缓冲消息注入对话交给模型处理
+                return true;
+            }
+        }
+        // 走到这里 = 等超时了（或到期）。收尾之前先把"已经收下但还没送进对话"的消息灌进去：
+        // 否则这一轮是最后一次迭代，缓冲区里的汇报会随回合一起消失（邮箱侧已标记已读）。
+        int flushed = flushPendingMessages(conv);
+        if (flushed > 0) {
+            return true;
+        }
+        putSafe(queue, new AgentEvent.RetryEvent(
+                "Stopped waiting for teammate reports after "
+                        + (pendingWaitTimeoutMs / 1000) + "s (giving up on this turn)", 0));
+        return false;
+    }
+
+    /**
+     * 把"已收下但未注入"的外部消息立刻送进对话；没有这样的消息时返回 0。
+     * 由宿主（TerminalUI）注入具体实现，agent 包因此不需要知道 teams / mailbox 的存在。
+     */
+    private int flushPendingMessages(ConversationManager conv) {
+        if (pendingMessageFlusher == null || conv == null) return 0;
+        try {
+            return pendingMessageFlusher.applyAsInt(conv);
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+
+
+    /** 把一段助手文本压成一行短摘要（用于 UI 提示）。 */
+    private static String concise(String text) {
+        String one = text.strip().replaceAll("\\s*\\n\\s*", " ");
+        return one.length() > 80 ? one.substring(0, 77) + "..." : one;
+    }
+
+    private static long pendingDeadlineNanos(long budgetMs) {
+        return System.nanoTime() + budgetMs * 1_000_000L;
     }
 
     /** 取最近一条真实用户消息文本（跳过 system-reminder 与工具结果占位消息）。 */
