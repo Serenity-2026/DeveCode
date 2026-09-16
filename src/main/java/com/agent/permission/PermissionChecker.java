@@ -5,6 +5,7 @@ import com.agent.tool.Tool;
 import com.agent.tool.ToolCategory;
 import org.yaml.snakeyaml.Yaml;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
@@ -442,20 +443,78 @@ public class PermissionChecker {
                     return true;
                 }
             }
+            // 保护清单是"按 Agent 的路径根"计算的：队友/子 Agent 在自己的隔离树里工作，
+            // 也该受自己那棵树里的 .devecode/config.yaml 等文件保护——关键是"属于哪棵树"，
+            // 而不是"绝对路径字符串是否以主仓库的路径为前缀"。
+            //
+            // 为什么必须单独判一次：隔离树通常就在 <projectRoot>/.devecode/worktrees/<slug>，
+            // 而 denyWrite 里有 <projectRoot>/.devecode/config.yaml 这一条。前缀比较是纯字符串
+            // 匹配，"...\\.devecode\\worktrees\\x\\.devecode\\config.yaml" 并不以
+            // "...\\.devecode\\config.yaml" 开头；但反过来相对路径 "worktrees/x/.devecode/..."
+            // 一旦被当成相对主仓库根的路径，就会被误认成受保护文件。用 Agent 自己的根重算一遍，
+            // 只在真正写到自己树里的受保护文件时拒绝。
+            String rel = relativize(pathStr);
+            if (rel != null) {
+                for (String deny : DEFAULT_DENY_WRITE) {
+                    if (rel.startsWith(deny)) {
+                        return true;
+                    }
+                }
+            }
         } catch (Exception ignored) {
         }
         return false;
     }
 
+    /**
+     * 把路径换算成"相对当前 Agent 路径根"的形式，用于保护清单的归属判断。
+     * 路径不落在当前根下时返回 null（那种路径本来就该由 Layer 3 处理）。
+     */
+    private String relativize(String pathStr) {
+        try {
+            Path root = effectiveRoot();
+            Path p = PathContext.resolve(pathStr).toAbsolutePath().normalize();
+            if (!p.startsWith(root)) return null;
+            return root.relativize(p).toString().replace(File.separatorChar, '/');
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     private boolean isPathAllowed(String pathStr) {
         try {
             Path p = PathContext.resolve(pathStr).toAbsolutePath().normalize();
-            Path root = projectRoot.toAbsolutePath().normalize();
+            Path root = effectiveRoot();
             Path tmp = Path.of("/tmp").toAbsolutePath().normalize();
             return p.startsWith(root) || p.startsWith(tmp);
         } catch (Exception e) {
             return true;
         }
+    }
+
+    /**
+     * 当前生效的路径根：优先 per-Agent 的 {@link PathContext} 根，其次构造时的 projectRoot。
+     *
+     * <p>为什么不能在构造时把根定死：真实路径根是 per-Agent 的——lead 可能已经
+     * EnterWorktree，队友和子 Agent 各自活在 AgentWorktree 建出来的隔离树里，而本
+     * checker 实例是被所有这些 Agent 共享的。用构造时的 projectRoot 判定，会把
+     * "在自己的隔离树里写文件"误判成"路径在沙箱之外"→ Layer 3 返回 ASK：
+     * <ul>
+     *   <li>lead 侧只是一次多余的确认提示；</li>
+     *   <li>队友/子 Agent 侧是致命的：StreamingExecutor 把 ASK 变成
+     *       PermissionRequestEvent 后阻塞等回答，而队友的事件流没有 UI 消费者
+     *       （TeammateRunner 只把事件塞进一个没人读的队列），于是干等到 5 分钟超时
+     *       被默认 DENY——表现为"队友跑了两轮、一个工具都没调、文件也没建"。</li>
+     * </ul>
+     *
+     * <p>工具执行期间 PathContext 已由 StreamingExecutor.callWith 设成该 Agent 的
+     * workDir，所以这里直接读 thread-local；没有 Agent 上下文时回退到 projectRoot。
+     */
+    private Path effectiveRoot() {
+        String ctxRoot = PathContext.getRoot();
+        Path root = (ctxRoot == null || ctxRoot.isBlank()) ? projectRoot : Path.of(ctxRoot);
+        if (root == null) return Path.of(".").toAbsolutePath().normalize();
+        return root.toAbsolutePath().normalize();
     }
 
     /**

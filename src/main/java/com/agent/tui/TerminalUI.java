@@ -451,6 +451,10 @@ public class TerminalUI implements SkillForkHost {
         agentTool.setTeammateDeps(new AgentDeps(
                 permissionChecker, hookEngine, fileHistory,
                 loadedInstructions, loadedMemoryReminder, skillCatalog, 200));
+        // 队友的权限/问卷出口：把它们转成主线程能渲染的请求（与 lead 共用同一套 UI 弹窗）。
+        // 不接的话，队友命中 ASK 的工具（写文件、SendMessage…）会干等到 5 分钟超时被默认 DENY。
+        agentTool.setTeammatePermissionAsker(this::askUserForTeammatePermission);
+        agentTool.setTeammateQuestionAsker(this::askUserForTeammateQuestion);
 
         // ── 子 Agent 进度 → UI ──
         agentTool.setProgressListener(this::onSubAgentProgress);
@@ -593,6 +597,13 @@ public class TerminalUI implements SkillForkHost {
 
                 // Hook 通知展示：只在空闲（非流式）时追加，避免打断流式消息更新
                 if (!streaming) drainHookNotifications();
+
+                // 空闲时也要把"已经排队的权限询问 / 问卷"弹出来：
+                // 队友（teams 包）是长驻的，它的工具调用可能在本轮 loop 结束之后才要权限
+                // （或者队友是等到下一轮唤醒才发起工具调用）。这些请求经 handlePermissionRequest
+                // 入队后，旧实现只在 consumeAgentEvents 里渲染，导致 lead 已空闲时请求躺在队列里
+                // 没人应答——队友只能等满 5 分钟被默认 DENY，看上去就是"队友去写文件了但什么都没发生"。
+                if (!streaming) promotePendingPermission();
 
                 // 渲染（事件驱动 + 至少每秒一次的周期性刷新）
                 // 周期刷新保证右侧状态面板（CPU 占用、Context 用量、API usage）实时更新，
@@ -2060,6 +2071,25 @@ public class TerminalUI implements SkillForkHost {
         if (activate) showPermissionPrompt(pr);
     }
 
+    /**
+     * 轮询兜底：把已经入队但还没显示的权限询问提上来（主线程调用）。
+     *
+     * <p>为什么需要它：队友/子 Agent 的生命周期独立于 lead 的一轮 loop。它们的工具调用
+     * 可能在 lead 已经跑完（`streaming == false`）之后才触发 ASK。旧实现只在
+     * {@code consumeAgentEvents} 里调用 {@link #showPermissionPrompt}，于是这些请求静静躺在
+     * permissionQueue 里，用户看不见、也答不了，队友一直阻塞到 5 分钟超时被默认拒绝。
+     */
+    private void promotePendingPermission() {
+        AgentEvent.PermissionRequestEvent toShow = null;
+        synchronized (permissionQueue) {
+            if (pendingPermission == null && !permissionQueue.isEmpty()) {
+                pendingPermission = permissionQueue.peek();
+                toShow = pendingPermission;
+            }
+        }
+        if (toShow != null) showPermissionPrompt(toShow);
+    }
+
     /** 渲染一条权限询问消息（只在它成为当前待答请求时调用一次）。 */
     private void showPermissionPrompt(AgentEvent.PermissionRequestEvent pr) {
         synchronized (messages) {
@@ -2303,6 +2333,49 @@ public class TerminalUI implements SkillForkHost {
             appendMessage(UIMessage.system(CYAN + "⑂" + RESET + " path root → " + newRoot + RESET));
             needsRedraw = true;
         } catch (Exception ignored) {}
+    }
+
+    /**
+     * 队友的权限询问出口（TeammateRunner.PermissionAsker，跑在队友线程上）。
+     *
+     * <p>语义与 StreamingExecutor 里 lead 的权限询问完全一致：构造一个 future，
+     * 把请求挂到主线程渲染的权限队列上，然后阻塞等用户按 y / a / n。区别只是 lead 的请求
+     * 由 consumeAgentEvents 渲染，而队友的请求是这条路径投进来的——主循环里
+     * promotePendingPermission 会把"空闲时到达"的请求也弹出来。
+     *
+     * <p>这里不设超时：用户对着屏幕做决定，超时上限交给既不现实也不友好；
+     * 队友线程在用户作答前一直等，用户按 Esc / n 即拒绝。
+     */
+    private PermissionResponse askUserForTeammatePermission(String toolName, String description) {
+        var future = new CompletableFuture<PermissionResponse>();
+        handlePermissionRequest(new AgentEvent.PermissionRequestEvent(toolName, description, future));
+        try {
+            return future.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return PermissionResponse.DENY;
+        } catch (Exception e) {
+            return PermissionResponse.DENY;
+        }
+    }
+
+    /**
+     * 队友的 AskUserQuestion 出口：复用 lead 的全屏问卷对话框。
+     * 用户取消（或以其它方式拿不到答案）时返回空 Map，执行端按"拒绝回答"处理。
+     */
+    private Map<String, String> askUserForTeammateQuestion(
+            List<AgentEvent.AskUserRequestEvent.Question> questions) {
+        var future = new CompletableFuture<Map<String, String>>();
+        handleAskUserRequest(new AgentEvent.AskUserRequestEvent(questions, future));
+        try {
+            Map<String, String> answers = future.get();
+            return answers == null ? Map.of() : answers;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Map.of();
+        } catch (Exception e) {
+            return Map.of();
+        }
     }
 
     /** 供右侧状态面板显示队友进度（teams 包 TeammateProgress） */

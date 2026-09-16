@@ -72,6 +72,15 @@ public class AgentTool implements Tool {
     /** Optional: 队友 Agent 的依赖套装（权限裁决 / hook / 文件历史 / 指令 / 记忆 / skill / 迭代上限） */
     private AgentDeps teammateDeps;
 
+    /**
+     * 队友的权限询问出口（接 TUI 弹窗）。缺它时队友的 ASK 只能等 5 分钟超时被默认拒绝——
+     * 表现为"队友去写文件了，然后什么都没发生"。
+     */
+    private TeammateRunner.PermissionAsker teammatePermissionAsker;
+
+    /** 队友的结构化问卷出口（AskUserQuestion，同样接 TUI）。 */
+    private TeammateRunner.QuestionAsker teammateQuestionAsker;
+
     /** 标识当前 AgentTool 的生成上下文；fork 子 Agent 中会被设为 FORK_QUERY_SOURCE */
     private String querySource = "";
 
@@ -148,6 +157,14 @@ public class AgentTool implements Tool {
         this.teammateDeps = teammateDeps;
     }
 
+    public void setTeammatePermissionAsker(com.agent.teams.TeammateRunner.PermissionAsker asker) {
+        this.teammatePermissionAsker = asker;
+    }
+
+    public void setTeammateQuestionAsker(com.agent.teams.TeammateRunner.QuestionAsker asker) {
+        this.teammateQuestionAsker = asker;
+    }
+
     public String getQuerySource() { return querySource; }
     public void setQuerySource(String querySource) { this.querySource = querySource; }
 
@@ -165,6 +182,8 @@ public class AgentTool implements Tool {
         clone.worktreeManager = this.worktreeManager;
         clone.teamManager = this.teamManager;
         clone.teammateDeps = this.teammateDeps;
+        clone.teammatePermissionAsker = this.teammatePermissionAsker;
+        clone.teammateQuestionAsker = this.teammateQuestionAsker;
         clone.parentReplacementState = this.parentReplacementState;
         clone.querySource = qs;
         return clone;
@@ -682,7 +701,8 @@ public class AgentTool implements Tool {
             var spawnResult = SpawnDispatcher.spawnTeammate(
                     new SpawnDispatcher.SpawnConfig(
                             team, memberName, prompt, addendum,
-                            subClient, subRegistry,  providerConfig, workdir, teammateDeps));
+                            subClient, subRegistry,  providerConfig, workdir, teammateDeps,
+                            teammatePermissionAsker, teammateQuestionAsker));
 
             return ToolResult.success(
                     "Teammate \"%s\" spawned in team \"%s\" (mode: %s). The teammate is now working on the assigned task."

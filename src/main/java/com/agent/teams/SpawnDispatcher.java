@@ -28,7 +28,11 @@ public final class SpawnDispatcher {
             String workdir,
             // 队友 Agent 的依赖套装（权限裁决 / hook / 文件历史 / 指令 / 记忆 / skill / 迭代上限）。
             // 传 null 的队友是"裸 Agent"：没有权限检查、没有记忆，通常不是你想要的
-            AgentDeps deps
+            AgentDeps deps,
+            // 队友的权限询问出口（通常接 TUI 弹窗）。null = 无 UI 场景，ASK 会被按拒绝处理
+            TeammateRunner.PermissionAsker permissionAsker,
+            // 队友的结构化问卷出口（AskUserQuestion）。null = 无 UI 场景，按"拒绝回答"处理
+            TeammateRunner.QuestionAsker questionAsker
     ) {}
 
     public record SpawnResult(
@@ -56,7 +60,8 @@ public final class SpawnDispatcher {
                 }
                 member.active = true;
                 member.thread = Thread.startVirtualThread(() ->
-                        TeammateRunner.runInProcessTeammate(team, member, config.task(), config.addendum()));
+                        TeammateRunner.runInProcessTeammate(team, member, config.task(), config.addendum(),
+                                config.permissionAsker(), config.questionAsker()));
                 return new SpawnResult(mode, null);
             }
             //

@@ -5,10 +5,12 @@ package com.agent.teams;
 
 import com.agent.agent.AgentEvent;
 import com.agent.history.ConversationManager;
+import com.agent.permission.PermissionResponse;
 
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -29,16 +31,45 @@ public final class TeammateRunner {
     private TeammateRunner() {}
 
     /**
+     * 队友的"权限裁决出口"。
+     *
+     * <p>为什么必须有它：队友的工具调用同样要过 PermissionChecker 的多层裁决，而写文件 /
+     * 发消息会命中 ASK。lead 的 ASK 会被 StreamingExecutor 包成 PermissionRequestEvent
+     * 交给 TUI 弹窗（用户按 y/a/n），但队友的事件流以前没有消费者——drainAgentEvents 把事件
+     * 塞进一个没人读的本地队列，请求就这么消失了，队友只能干等到 StreamingExecutor 的
+     * 5 分钟超时被默认 DENY。表现就是"队友去写文件了，然后什么都没发生"，用户永远拿不到
+     * 它的汇报。
+     *
+     * <p>所以把出口参数化：in-process 队友接 TUI 的弹窗（问真实用户）；没有 UI 的场景
+     * （后台 / 测试）传 null，按"拒绝"处理并留下可见的理由。
+     */
+    @FunctionalInterface
+    public interface PermissionAsker {
+        /**
+         * @param toolName    工具名
+         * @param description 人类可读的操作描述（如 "Write: /path/to/x"）
+         * @return 用户裁决；null 视作 DENY
+         */
+        PermissionResponse ask(String toolName, String description);
+    }
+
+    /** 结构化问卷（AskUserQuestion 工具）的出口，语义同 {@link PermissionAsker}。 */
+    @FunctionalInterface
+    public interface QuestionAsker {
+        Map<String, String> ask(List<AgentEvent.AskUserRequestEvent.Question> questions);
+    }
+
+    /**
      * 把Agent（天生只能干一轮）包装成一个常驻的员工：干完一轮 → 报告"我空了" → 等新指令 → 用同一份记忆接着干 → 直到收到下班指令。
      */
     public static void runInProcessTeammate(
             TeamManager.Team team,
             TeamManager.Member member,
             String initialPrompt,
-            String addendum
+            String addendum,
+            PermissionAsker permissionAsker,
+            QuestionAsker questionAsker
     ) {
-        BlockingQueue<AgentEvent> eventOut = new LinkedBlockingQueue<>(32);
-
         // Create progress tracker and attach to member
         var progress = new TeammateProgress(member.getName(), team.getName(), "");
         member.progress = progress;
@@ -52,7 +83,7 @@ public final class TeammateRunner {
 
         // Run agent
         var agentQueue = member.agent.run(member.conv);
-        drainAgentEvents(agentQueue, eventOut, progress);
+        drainAgentEvents(agentQueue, progress, permissionAsker, questionAsker);
 
         // Send idle notification
         notifyLead(team, member.getName(), "completed initial task");
@@ -64,7 +95,7 @@ public final class TeammateRunner {
 
             member.conv.addUserMessage(result.prompt);
             agentQueue = member.agent.run(member.conv);
-            drainAgentEvents(agentQueue, eventOut, progress);
+            drainAgentEvents(agentQueue, progress, permissionAsker, questionAsker);
 
             notifyLead(team, member.getName(), "completed follow-up");
         }
@@ -187,11 +218,14 @@ public final class TeammateRunner {
     /**
      * 消费Agent产生的输出
      * @param source 源agent产生的输出
-     * @param sink 中转站
      * @param progress 供回调的进度条
+     * @param permissionAsker 权限询问出口（可为 null：无 UI 场景按拒绝处理）
+     * @param questionAsker 结构化问卷出口（可为 null：无 UI 场景按"拒绝回答"处理）
      */
-    private static void drainAgentEvents(BlockingQueue<AgentEvent> source, BlockingQueue<AgentEvent> sink,
-                                         TeammateProgress progress) {
+    private static void drainAgentEvents(BlockingQueue<AgentEvent> source,
+                                         TeammateProgress progress,
+                                         PermissionAsker permissionAsker,
+                                         QuestionAsker questionAsker) {
         while (true) {
             AgentEvent event;
             try {
@@ -202,7 +236,6 @@ public final class TeammateRunner {
                 return;
             }
             if (event == null) return;
-            sink.offer(event);
 
             // Record progress from agent events
             if (event instanceof AgentEvent.ToolUseEvent tue) {
@@ -212,6 +245,32 @@ public final class TeammateRunner {
             } else if (event instanceof AgentEvent.ErrorEvent) {
                 progress.setStatus("failed");
                 return;
+            } else if (event instanceof AgentEvent.PermissionRequestEvent pr) {
+                // 关键分支：队友的 ASK 必须有人答，否则工具线程会挂到 5 分钟超时。
+                PermissionResponse response = PermissionResponse.DENY;
+                if (permissionAsker != null) {
+                    try {
+                        PermissionResponse asked = permissionAsker.ask(pr.toolName(), pr.description());
+                        if (asked != null) response = asked;
+                    } catch (Exception e) {
+                        log.warning("teammate permission ask failed: " + e.getMessage());
+                    }
+                } else {
+                    log.warning("teammate '" + progress.getName() + "' requested permission for "
+                            + pr.toolName() + " but no asker is wired; denying: " + pr.description());
+                }
+                pr.future().complete(response);
+            } else if (event instanceof AgentEvent.AskUserRequestEvent aq) {
+                Map<String, String> answers = Map.of();
+                if (questionAsker != null) {
+                    try {
+                        Map<String, String> asked = questionAsker.ask(aq.questions());
+                        if (asked != null) answers = asked;
+                    } catch (Exception e) {
+                        log.warning("teammate question ask failed: " + e.getMessage());
+                    }
+                }
+                aq.future().complete(answers);
             } else if (event instanceof AgentEvent.LoopComplete) {
                 return;
             }
