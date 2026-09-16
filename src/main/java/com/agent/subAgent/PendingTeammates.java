@@ -104,7 +104,7 @@ public final class PendingTeammates {
 
     /**
      * 收一次各队的 lead 邮箱，收到的东西进缓冲区（由 notificationSource 调用，
-     * 这样普通邮箱往来不必绕道等待循环就能到达模型）。
+     * 这样普通邮箱往来不必绕道等待循环就能到达模型）。；
      */
     public void pumpOnce(TeamManager teamMgr) {
         drainOnce(teamMgr);

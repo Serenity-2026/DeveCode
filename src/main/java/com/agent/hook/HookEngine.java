@@ -624,7 +624,7 @@ public class HookEngine {
 
     /**
      * 执行 command 类型 action —— 通过 bash -c 运行命令。
-     * 注入 MEWCODE_EVENT、MEWCODE_TOOL、MEWCODE_FILE_PATH 环境变量。
+     * 注入 DEVECODE_EVENT、DEVECODE_TOOL、DEVECODE_FILE_PATH 环境变量，供 hook 脚本读取上下文。
      * 支持超时保护，超时后强制终止子进程。
      */
     private HookResult executeCommand(Hook h, HookContext ctx) {

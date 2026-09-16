@@ -377,9 +377,10 @@ public class MemoryManager {
     }
 
     /**
-     * 加载指令文件：支持用户级（~/.mewcode/MEWCODE.md）、项目级（git root 到 workDir 逐层）、
-     * 兼容旧版 INSTRUCTIONS.md、私有 MEWCODE.local.md，以及 @include 递归展开。
-     * 委托给 {@link InstructionLoader} 实现完整的发现和展开逻辑。
+     * 加载指令文件，实际发现规则见 {@link InstructionLoader}：
+     * 用户级 ~/.devecode/DEVECODE.md、~/.devecode/AGENTS.md；
+     * 项目级从 git root 沿目录树向下到 workDir，每层找 DEVECODE.md / AGENTS.md；
+     * 兼容旧版 .devecode/INSTRUCTIONS.md 与私有覆盖 DEVECODE.local.md；支持 @include 递归展开。
      */
     public static String loadInstructions(String workDir) {
         return InstructionLoader.loadInstructions(workDir);
