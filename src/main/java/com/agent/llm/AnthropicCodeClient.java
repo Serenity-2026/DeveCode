@@ -153,6 +153,9 @@ public class AnthropicCodeClient implements LlmClient {
         String stopReason = "";
         int inputTokens=0;
         int outputTokens=0;
+        //前缀缓存用量：本次请求命中缓存 / 写入缓存的输入 token 数，由服务端 usage 回报。
+        int cacheReadTokens=0;
+        int cacheCreationTokens=0;
         //是否已收到 message_stop 正常收尾（连接中断/异常截断时为 false，用于兜底报错）
         boolean streamEnded = false;
         //流式响应,try-with-resource,确保 reader 和底层的 InputStream 在结束时自动关闭
@@ -266,6 +269,20 @@ public class AnthropicCodeClient implements LlmClient {
                     }
                 }
                 //SSE 流的末尾会推 message_start 和 message_delta 事件，携带 token 消耗信息：
+                case "message_start" -> {
+                    //Anthropic 协议把输入侧用量（含前缀缓存命中）挂在 message.usage 里；
+                    //部分兼容端点（如 DeepSeek）只在 message_delta 回报，因此两处都解析一次
+                    var startMsg = (Map<String, Object>) event.get("message");
+                    var startUsage = startMsg == null ? null : (Map<String, Object>) startMsg.get("usage");
+                    if (startUsage != null) {
+                        int si = ((Number) startUsage.getOrDefault("input_tokens", 0)).intValue();
+                        if (si > 0) inputTokens = si;
+                        int scr = ((Number) startUsage.getOrDefault("cache_read_input_tokens", 0)).intValue();
+                        if (scr > 0) cacheReadTokens = scr;
+                        int scc = ((Number) startUsage.getOrDefault("cache_creation_input_tokens", 0)).intValue();
+                        if (scc > 0) cacheCreationTokens = scc;
+                    }
+                }
                 case "message_delta" ->{
                     var delta = (Map<String, Object>) event.get("delta");
                     if (delta != null && delta.containsKey("stop_reason"))
@@ -277,11 +294,17 @@ public class AnthropicCodeClient implements LlmClient {
                         int do_ = ((Number) usage.getOrDefault("output_tokens", 0)).intValue();
                         if (di > 0) inputTokens = di;
                         if (do_ > 0) outputTokens = do_;
+                        int cr = ((Number) usage.getOrDefault("cache_read_input_tokens", 0)).intValue();
+                        if (cr > 0) cacheReadTokens = cr;
+                        int cc = ((Number) usage.getOrDefault("cache_creation_input_tokens", 0)).intValue();
+                        if (cc > 0) cacheCreationTokens = cc;
                     }
                 }
                 case "message_stop" -> {
                     streamEnded = true;
-                    streamQueue.add(new StreamEvent.StreamEnd(stopReason, inputTokens, outputTokens));
+                    streamQueue.add(new StreamEvent.StreamEnd(
+                            stopReason, inputTokens, outputTokens,
+                            cacheReadTokens, cacheCreationTokens));
                 }
             }
         }

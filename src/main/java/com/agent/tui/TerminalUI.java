@@ -32,11 +32,7 @@ import com.agent.skill.SkillInstallReport;
 import com.agent.skill.SkillInstaller;
 import com.agent.skill.SkillSource;
 import com.agent.skill.SkillExecutor;
-import com.agent.subAgent.AgentLoader;
-import com.agent.subAgent.AgentTool;
-import com.agent.subAgent.SubAgentProgress;
-import com.agent.subAgent.SubAgentSpec;
-import com.agent.subAgent.SubAgentTaskManager;
+import com.agent.subAgent.*;
 import com.agent.teams.TeamManager;
 import com.agent.teams.TeamTools;
 import com.agent.teams.TaskTools;
@@ -430,7 +426,7 @@ public class TerminalUI implements SkillForkHost {
         agent.setPendingWorkSource(() ->
                 agentTool.getPendingTeammates().isPending()
                         && agentTool.getPendingTeammates().waitForReports(
-                                teamManager, com.agent.subAgent.PendingTeammates.DEFAULT_WAIT_TIMEOUT_MS));
+                                teamManager, PendingTeammates.DEFAULT_WAIT_TIMEOUT_MS));
         // 兜底：收尾前把"已收下但还没进对话"的队友消息灌进去，避免最后一次迭代把汇报吞掉
         agent.setPendingMessageFlusher(conv ->
                 agentTool.getPendingTeammates().flushInto(conv));
@@ -1271,7 +1267,7 @@ public class TerminalUI implements SkillForkHost {
      * 其余为保留消息。rebuildConversation 重放时据此还原压缩后的状态。
      */
     private void saveCompactBoundaryFromConversation() {
-        List<com.agent.llm.Message> msgs = conversation.getMessages();
+        List<Message> msgs = conversation.getMessages();
         int i = 0;
         while (i < msgs.size() && msgs.get(i).getContent() != null
                 && msgs.get(i).getContent().startsWith("<system-reminder>")) {

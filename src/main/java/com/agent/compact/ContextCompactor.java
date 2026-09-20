@@ -324,6 +324,7 @@ public final class ContextCompactor {
         int keepStartIndex = computeKeepStartIndex(messages);
         //保留窗口覆盖了全部消息,没有旧消息可摘要||要摘要的消息太少，不值得调 LLM=>返回空字符串,调用方知道"没压缩"
         if (keepStartIndex < MIN_KEEP_MESSAGES) {
+
             return "";
         }
         //摘要消息,subList左闭右开

@@ -163,11 +163,11 @@ public class AgentTool implements Tool {
         this.teammateDeps = teammateDeps;
     }
 
-    public void setTeammatePermissionAsker(com.agent.teams.TeammateRunner.PermissionAsker asker) {
+    public void setTeammatePermissionAsker(TeammateRunner.PermissionAsker asker) {
         this.teammatePermissionAsker = asker;
     }
 
-    public void setTeammateQuestionAsker(com.agent.teams.TeammateRunner.QuestionAsker asker) {
+    public void setTeammateQuestionAsker(TeammateRunner.QuestionAsker asker) {
         this.teammateQuestionAsker = asker;
     }
 

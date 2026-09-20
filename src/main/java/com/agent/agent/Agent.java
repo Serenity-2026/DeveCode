@@ -333,6 +333,10 @@ public class Agent implements SkillHost {
                 conv.addSystemReminder(reminder);
             }
             // Layer 1: 裁剪大tool_use
+            //为什么要用决策冻结及从0开始处理消息:
+            // 1.第N次溢写失败 第N+1次溢写成功，如果不知道之前状态会改变前缀
+            // 2.消息不因为上下文窗口大小改变而改变决策状态
+            // 3.不好定义何为最好一条带有工具调用的消息,万一对消息列表做出了修改怎么办
             Path sessionDir = Paths.get(workDir == null ? "." : workDir, ".devecode/session");
             //返回需要新落盘的文件记录,即溢写成功的文件
             List<ContentReplacementRecord> newRecords = ToolResultBudget.apply(conv, sessionDir, replacementState);
@@ -436,14 +440,6 @@ public class Agent implements SkillHost {
                     if (contextRetries < 3) {
                         contextRetries++;
                         putSafe(queue, new AgentEvent.RetryEvent("Context too long, compacting...", 0));
-                        // 先裁剪再压缩，确保预算内的结果不会被误压缩
-                        Path forceSessionDir = Paths.get(workDir == null ? "." : workDir, ".devecode/session");
-                        List<ContentReplacementRecord> forceRecords = ToolResultBudget.apply(conv, forceSessionDir, replacementState);
-                        if (!forceRecords.isEmpty()) {
-                            try {
-                                ReplacementRecordsIO.append(forceSessionDir, forceRecords);
-                            } catch (Exception ignored) {}
-                        }
                         int sizeBeforeForce = conv.size();
                         try {
                             String wdForce = workDir != null ? workDir : System.getProperty("user.dir");

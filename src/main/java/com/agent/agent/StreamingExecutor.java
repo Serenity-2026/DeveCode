@@ -43,7 +43,7 @@ public class StreamingExecutor {
     //工具名过滤器（激活 skill 白名单的并集）：null = 不过滤。
     //schema 侧由 Agent 在每轮迭代过滤，这里做执行侧硬拦截——
     //即使模型幻觉调用被过滤的工具名，也不会真正执行。
-    private final java.util.function.Predicate<String> toolFilter;
+    private final Predicate<String> toolFilter;
     /**
      * 取"这个 Agent 当前路径根"的供应商（一般是它的 workDir）。
      * 用 Supplier 而不是 String 快照：路径根可能在一次 agent 迭代中途被改（EnterWorktree 会改
