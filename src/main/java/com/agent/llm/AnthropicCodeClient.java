@@ -127,7 +127,7 @@ public class AnthropicCodeClient implements LlmClient {
         var request = HttpRequest.newBuilder()
                 .uri(URI.create("https://api.deepseek.com/anthropic/v1/messages"))
                 .header("Content-Type", "application/json")
-                .header("x-api-key", "sk-c39ba4ff31ac42ae8fa5d6a20451c66f")
+                .header("x-api-key", "")
                 .header("anthropic-version", "2023-06-01")
                 .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(body)))
                 .build();
