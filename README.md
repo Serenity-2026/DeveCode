@@ -254,17 +254,3 @@ mcp_servers:
   - name: "remote-tool"
     url: "http://localhost:3001"         # 有 url → Streamable HTTP
 ```
-
-
-
-## 已知限制
-
-这是一个持续演进中的项目，以下都是已知问题，欢迎 issue：
-
-- **自动压缩的上下文窗口取值不一致**：`Agent` 构造时读取未解析的 `context_window`（未配置时为 `0`），会导致自动路径频繁触发压缩；手动 `/compact` 与状态面板读取的是解析后的值。
-- **沙箱模式只有权限效果**：`/sandbox` 会放宽命令类工具裁决，但仓库内暂无 `Sandbox` 实现类，命令并未真正被 OS 级隔离；YAML 中的 `sandbox.enabled` 也尚未接入。
-- **沙箱模式下的空指针**：命令类且无法提取"关键内容"的工具（如 MCP 工具、`Agent`、`Skill`）在沙箱模式下会因 `content` 为 `null` 抛 NPE。
-- **权限裁决对 MCP 工具只能按工具名兜底**：YAML 规则与"总是允许"对 `mcp__*` 工具不生效。
-- **子 Agent 的工具过滤对 MCP 工具整体穿透**：`disallowedTools` 无法限制 MCP 工具。
-- **MCP 客户端只实现了 tools 能力**，resources / prompts / sampling 未接入；也没有重连与 `tools/list_changed` 订阅。
-- **Anthropic 协议路径尚未接通配置**：`AnthropicCodeClient` 构造时用 `cfg.getBaseUrl()` / `resolvedApiKey()` 建好了 SDK 客户端，但实际发请求走的是硬编码的兼容端点且 `x-api-key` 为空，因此该路径当前不可用（OpenAI 协议路径正常，SDK 客户端目前未被使用）。
